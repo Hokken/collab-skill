@@ -967,7 +967,9 @@ function cmdDiff(args) {
     try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
     const known = new Set(before);
     const fresh = untrackedFiles(r.path).filter((f) => !known.has(f)).sort();
-    const rel = (f) => path.relative(st.project_dir, path.join(r.path, f)).split(path.sep).join('/');
+    // Compare canonical paths: on Windows git and Node can spell the same folder differently
+    // (8.3 short names like RUNNER~1, or different letter case).
+    const rel = (f) => path.relative(realDir(st.project_dir), path.join(realDir(r.path), f)).split(path.sep).join('/');
     for (const f of git(r.path, ['diff', '--name-only', r.base]).out.split('\n').filter(Boolean)) touched.push(rel(f));
     for (const f of fresh) touched.push(rel(f));
     if (!changed && !fresh.length) continue;
