@@ -1,0 +1,36 @@
+{
+  "name": "collab-skill",
+  "version": "0.1.0",
+  "description": "Autonomous implementer ⇄ reviewer loop between two coding agents (Claude Code, Codex CLI) — no copy-pasting between terminals.",
+  "license": "MIT",
+  "author": "Hokken",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hokken/collab-skill.git"
+  },
+  "bin": {
+    "collab": "bin/collab.js"
+  },
+  "files": [
+    "bin/",
+    "SKILL.md",
+    "install.sh",
+    "install.ps1",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai-agents",
+    "code-review",
+    "agent-skills",
+    "cli"
+  ]
+}

@@ -1,85 +1,204 @@
-# Collab
+<p align="center">
+  <img src="docs/banner.png" alt="Collab: two coding agents, one implementing, one reviewing" width="100%">
+</p>
 
-An autonomous **implementer ⇄ reviewer** loop between two coding agents, such as Claude Code and
-Codex CLI running in two terminals. No more copy-pasting summaries and reviews between them.
+<h1 align="center">Collab</h1>
 
-- One agent **implements**, the other **reviews**. They hand off turns through a shared state
-  folder (`~/.collab/`) using the small `collab` CLI in this repo.
-- Waiting is a blocking shell command, so no model tokens are spent while an agent waits.
-- The loop ends by itself: the reviewer approves, the round limit is hit, someone escalates, or
-  you abort.
-- You stay in control: a live dashboard, steering notes, a plan-first mode, and a prompt when an
-  agent goes quiet.
+<p align="center">
+  <b>Let two AI coding agents pair-program with each other, one building and one reviewing, while you watch.</b><br>
+  No more copy-pasting summaries and reviews between terminals.
+</p>
 
-Zero dependencies: Node.js ≥ 18 (and git for `collab diff`). Works on macOS, Linux and Windows.
+<p align="center">
+  <a href="https://github.com/Hokken/collab-skill/actions/workflows/test.yml"><img src="https://github.com/Hokken/collab-skill/actions/workflows/test.yml/badge.svg" alt="tests"></a>
+  <img src="https://img.shields.io/badge/node-%E2%89%A518-339933" alt="node >= 18">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS | Linux | Windows">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
+
+---
+
+## Why
+
+If you use two coding agents, say **Claude Code** and **Codex CLI**, you've probably found that
+one writes better code when the other reviews it. The workflow is great. The plumbing is not:
+
+1. Ask the implementer for a summary of what it did.
+2. Copy it into the reviewer's terminal.
+3. Copy the review back.
+4. Repeat until they agree.
+
+**Collab automates the plumbing.** You give the task to one agent, start the other as the
+reviewer, and they hand the work back and forth by themselves until the reviewer approves it.
+You get a notification when it's done, or when they need you.
+
+## How it feels
+
+```text
+You ▸ /Collab implement            (in Claude Code)
+     "Add input validation to the signup form, with tests."
+
+You ▸ $Collab review               (in Codex, another terminal)
+
+  #000  implementer  brief     Add input validation to the signup form…
+  #001  implementer  ready     Added zod schema, 9 tests, all passing
+  #002  reviewer     changes   1. [blocking] email regex accepts "a@b" …
+  #003  implementer  ready     Fixed 1: switched to zod .email(), +2 tests
+  #004  reviewer     approve   Verdict: approved ✔
+
+  🔔 collab: DONE
+```
+
+The agents took four turns and nobody copy-pasted anything. Each step, in full, stays browsable
+in the dashboard and in the log.
+
+## Features
+
+- **Autonomous loop.** Implement → review → fix → review, until approval, a round limit, or an
+  escalation to you.
+- **Live dashboard.** `collab watch` shows whose turn it is, what they're doing right now, and
+  every step so far. Browse them with the arrow keys.
+- **Steer while it runs.** `collab note "don't touch the i18n files"` reaches the agents at their
+  next step, and they must address it.
+- **Plan first (optional).** With `--plan`, the reviewer approves the approach before any code is
+  written.
+- **Reviews the real changes.** Each task snapshots your git repos (even several nested ones),
+  so the reviewer sees exactly what changed, not just the implementer's summary.
+- **Never gets stuck silently.** Agents post short progress updates. If one goes quiet, the other
+  asks you: *stop, or keep waiting?*
+- **Cheap to run.** Waiting is a blocking shell command, so no tokens are spent while an agent waits.
+- **Tiny.** One Node.js file, no dependencies, works on macOS, Linux and Windows.
+
+## Requirements
+
+- **Node.js 18+**, and **git** (for reviewing diffs).
+- Two agents that can load [agent skills](https://docs.claude.com/en/docs/claude-code/skills) and
+  run shell commands. Tested with **Claude Code** and **Codex CLI**, in either role.
 
 ## Install
 
+**macOS / Linux**
+
 ```bash
-git clone https://github.com/Hokken/collab-skill.git ~/Documents/Work/collab-skill
-cd ~/Documents/Work/collab-skill
-./install.sh                     # macOS / Linux
+git clone https://github.com/Hokken/collab-skill.git
+cd collab-skill
+./install.sh
 ```
+
+**Windows** (PowerShell)
 
 ```powershell
-git clone https://github.com/Hokken/collab-skill.git $env:USERPROFILE\Documents\Work\collab-skill
-cd $env:USERPROFILE\Documents\Work\collab-skill
-powershell -ExecutionPolicy Bypass -File .\install.ps1     # Windows
+git clone https://github.com/Hokken/collab-skill.git
+cd collab-skill
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer links the skill into `~/.agents/skills/Collab` (read by Codex) and
-`~/.claude/skills/Collab` (Claude Code), and puts `collab` on your PATH. Updating is just
-`git pull`. On Windows, see [WINDOWS.md](WINDOWS.md) for the first-time checks.
+The installer links the skill into `~/.agents/skills/Collab` (Codex) and
+`~/.claude/skills/Collab` (Claude Code), and puts a `collab` command on your PATH. It only creates
+links, so **updating is just `git pull`**. Windows users: see [docs/windows.md](docs/windows.md)
+for a few tips.
 
-## Use
-
-| Terminal | Command |
-|---|---|
-| A: reviewer | Codex: `$Collab review` · Claude Code: `/Collab review` |
-| B: implementer | Claude Code: `/Collab implement`, then describe the task in your next message (add `--plan` to have the plan approved first) |
-| C: you | `collab watch`: interactive dashboard (↑↓ browse steps, space/b scroll, f follow latest, q quit) |
-
-While it runs:
+Check it worked:
 
 ```bash
-collab note "don't touch the i18n files"     # steer both agents
-collab note -r "be strict on accessibility"  # reviewer only (-i = implementer only)
-collab status | log | diff --stat
-collab abort                                  # stop both loops
-collab clean                                  # delete finished tasks
-collab help                                   # everything else
+collab help
 ```
+
+## Quick start
+
+Open your project in three terminals:
+
+| Terminal | What to type |
+|---|---|
+| **1: reviewer** | Codex: `$Collab review` (Claude Code: `/Collab review`) |
+| **2: implementer** | Claude Code: `/Collab implement`, then describe the task in your next message |
+| **3: you** | `collab watch` |
+
+That's it. The reviewer waits for the task and the implementer writes a short brief and starts.
+From there they take turns on their own.
+
+> 💡 Let the agents run without permission prompts (e.g. Claude Code's auto mode, or allow
+> `Bash(collab:*)`), otherwise every handoff stops to ask you.
+
+Want the approach agreed first? Start with `/Collab implement --plan`.
+
+## While it runs
+
+```bash
+collab watch                                  # interactive dashboard (↑↓ steps · space scroll · q quit)
+collab note "keep the public API unchanged"   # tell both agents something new
+collab note -r "be strict on accessibility"   # just the reviewer (-i = just the implementer)
+collab status                                 # one-line summary
+collab log                                    # the full conversation between the agents
+collab diff --stat                            # what actually changed in your code
+collab abort                                  # stop both agents
+```
+
+When it's finished, both agents give you a short report. `collab clean` tidies up old tasks.
+Everything else is in `collab help`.
+
+## FAQ
+
+**Which models do they use?**
+Whatever each CLI is set to. Collab never changes models. A strong reviewer with high reasoning
+effort is usually worth it: reviews are short and missed bugs are expensive.
+
+**Does it cost a lot of tokens?**
+Not for the coordination. Waiting is a plain shell command, so an agent spends nothing while the
+other works. You pay for the actual implementing and reviewing, as you would by hand.
+
+**What if they disagree forever?**
+They can't. After a round limit (default 4, `--max-rounds N`) the task escalates to you. Either
+agent can also escalate earlier, for example when the brief is ambiguous.
+
+**What if an agent crashes or hangs?**
+If the working agent goes quiet (no handoff, no progress update, no file changes for a while), the
+waiting agent asks you whether to stop or keep waiting. `collab abort` always stops both.
+
+**Can I still talk to the agents directly?**
+Yes. Typing into either CLI works for quick, agent-specific tweaks. Use `collab note` for anything
+both agents need to know, such as new requirements or scope changes, so the reviewer doesn't flag
+your instructions as scope creep.
+
+**Does it commit or push for me?**
+No. Collab never touches git history. The agents follow your usual rules (`CLAUDE.md`, `AGENTS.md`).
+
+**Can I run two pairs at once?**
+Yes. Each agent pins its own task id, so pairs in different projects don't interfere.
+
+## Configuration
+
+All optional, via environment variables:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `COLLAB_MAX_ROUNDS` | `4` | Review rounds before escalating to you |
+| `COLLAB_IDLE_SECS` | `1800` | Quiet time before "stop or keep waiting?" |
+| `COLLAB_QUIET_MINS` | `10` | …and no file changes for this long (implementer's turn) |
+| `COLLAB_STALL_SECS` | `7200` | Hard stop when nobody answers |
+| `COLLAB_POLL_SECS` | `5` | How often a waiting agent checks for its turn |
+| `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications |
+| `COLLAB_HOME` | `~/.collab` | Where task state is kept |
 
 ## How it works
 
-- `collab init` snapshots every git repo under the project (`git stash create`, which leaves
-  your working tree untouched), so `collab diff` shows only what changed during the task, even
-  in folders holding several nested repos.
-- While an agent has the turn, it posts short `collab progress "…"` updates at each step. They
-  show live in `collab watch`, in the other agent's `wait` output, and count as a sign of life.
-- Turns are enforced: an agent can't submit out of turn. A note from you that arrives mid-turn
-  blocks that agent's next handoff until it has dealt with the note.
-- If the other agent hasn't handed off for 30 min (and, while implementing, no project file has
-  changed for 10 min), the waiting agent asks you: stop the task or keep waiting?
-- State lives in `~/.collab/tasks/<task-id>/`: `state.json`, `log.md` (the full history) and
-  `entries/`.
+Each agent runs the same skill ([`SKILL.md`](SKILL.md)), and the two coordinate through a small
+state folder that the `collab` CLI manages. When it's not their turn, they block on
+`collab wait`. When it is, they work, post progress, and hand off with `collab submit`.
 
-| Env var | Default | |
-|---|---|---|
-| `COLLAB_HOME` | `~/.collab` | state folder |
-| `COLLAB_MAX_ROUNDS` | 4 | review rounds before escalating to you |
-| `COLLAB_IDLE_SECS` | 1800 | quiet time before "stop or keep waiting?" |
-| `COLLAB_QUIET_MINS` | 10 | …and no file changes for this long (implementer's turn) |
-| `COLLAB_STALL_SECS` | 7200 | hard stop when nobody answers |
-| `COLLAB_POLL_SECS` | 5 | polling interval |
-| `COLLAB_NOTIFY` | 1 | `0` disables desktop notifications |
+Want the details, or to adapt it to other agents? See [docs/how-it-works.md](docs/how-it-works.md).
 
-## Develop
+## Contributing
+
+Issues and pull requests are welcome. The whole tool is [`bin/collab.js`](bin/collab.js) plus
+[`SKILL.md`](SKILL.md).
 
 ```bash
-node --test          # full test suite, ~15 s
+npm test      # ~20 s, no dependencies to install
 ```
 
-- `bin/collab.js`: the CLI (single file, no dependencies)
-- `SKILL.md`: instructions both agents follow
-- `install.sh`, `install.ps1`: installers
+Please keep it dependency-free and cross-platform. CI runs the tests on macOS, Linux and Windows.
+
+## License
+
+[MIT](LICENSE)
