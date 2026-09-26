@@ -60,6 +60,8 @@ in the dashboard and in the log.
   every step so far. Browse them with the arrow keys.
 - **Steer while it runs.** `collab note "don't touch the i18n files"` reaches the agents at their
   next step, and they must address it.
+- **Queue up work.** Line up several tasks and the pair works through them one after another.
+  Each task can carry its own options: tests that must pass, a scope, a branch, a commit when done.
 - **Plan first (optional).** With `--plan`, the reviewer approves the approach before any code is
   written.
 - **Reviews the real changes.** Each task snapshots your git repos (even several nested ones),
@@ -112,7 +114,7 @@ Open your project in three terminals:
 |---|---|
 | **1: reviewer** | Codex: `$Collab review` (Claude Code: `/Collab review`) |
 | **2: implementer** | Claude Code: `/Collab implement`, then describe the task in your next message |
-| **3: you** | `collab watch` |
+| **3: you** | `collab watch` (↑↓ steps, ←→ earlier tasks, q quit) |
 
 That's it. The reviewer waits for the task and the implementer writes a short brief and starts.
 From there they take turns on their own.
@@ -122,10 +124,39 @@ From there they take turns on their own.
 
 Want the approach agreed first? Start with `/Collab implement --plan`.
 
+## Queue up a morning's work
+
+```bash
+collab queue add --branch feat/validation --check "npm test" --commit "Add signup form validation"
+collab queue add --plan --focus security --scope "src/auth/**" --check "npm test" "Refactor the auth middleware"
+collab queue add --confirm "Run the DB migration for user roles"
+```
+
+Then start the pair as usual, with `/Collab implement` and no task. The implementer takes the first
+queued task. When it's done, it moves on to the next one, and the reviewer follows. If a task gets
+escalated, the queue pauses until you've had a look. You can add tasks any time, even while they
+work.
+
+| Option | What it does |
+|---|---|
+| `--plan` | The reviewer approves a plan before any code is written |
+| `--check "npm test"` | Must pass before every handoff. Collab runs it and refuses to hand off on failure |
+| `--scope "src/auth/**"` | Files the task may change. `collab diff` flags anything outside, and the reviewer treats it as blocking |
+| `--focus "security"` | What the reviewer should look at hardest |
+| `--branch feat/x` | Work on this branch |
+| `--commit` | Commit the changes when the task is done (never pushes) |
+| `--confirm` | Ask you before this queued task starts |
+| `--max-rounds N` | Review rounds before escalating (default 4) |
+| `--first` | Put it at the front of the queue |
+
+The same options work for a single task: `/Collab implement --check "npm test" fix the login redirect`.
+Manage the queue with `collab queue` (list), `collab queue rm 2`, `collab queue move 3 1` and
+`collab queue clear`.
+
 ## While it runs
 
 ```bash
-collab watch                                  # interactive dashboard (↑↓ steps · space scroll · q quit)
+collab watch                                  # interactive dashboard (↑↓ steps · ←→ tasks · space scroll · q quit)
 collab note "keep the public API unchanged"   # tell both agents something new
 collab note -r "be strict on accessibility"   # just the reviewer (-i = just the implementer)
 collab status                                 # one-line summary
@@ -161,7 +192,8 @@ both agents need to know, such as new requirements or scope changes, so the revi
 your instructions as scope creep.
 
 **Does it commit or push for me?**
-No. Collab never touches git history. The agents follow your usual rules (`CLAUDE.md`, `AGENTS.md`).
+Only if you ask: with `--commit`, the implementer commits a task's changes once it's approved. Collab
+never pushes. Otherwise the agents follow your usual rules (`CLAUDE.md`, `AGENTS.md`).
 
 **Can I run two pairs at once?**
 Yes. Each agent pins its own task id, so pairs in different projects don't interfere.
@@ -177,6 +209,7 @@ All optional, via environment variables:
 | `COLLAB_QUIET_MINS` | `10` | …and no file changes for this long (implementer's turn) |
 | `COLLAB_STALL_SECS` | `7200` | Hard stop when nobody answers |
 | `COLLAB_POLL_SECS` | `5` | How often a waiting agent checks for its turn |
+| `COLLAB_CHECK_TIMEOUT` | `1800` | Seconds before a `--check` command is stopped |
 | `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications |
 | `COLLAB_HOME` | `~/.collab` | Where task state is kept |
 

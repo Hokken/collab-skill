@@ -5,7 +5,8 @@
 // Exit codes: 0 ok / your turn, 1 error, 10 task finished (DONE, ESCALATED,
 // ABORTED, STALLED), 11 wait timed out (not your turn yet — just run it again),
 // 12 submit refused because the user added a note during your turn,
-// 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting.
+// 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
+// 14 submit refused because the task's --check command failed, 15 the queue is empty.
 //
 // Zero dependencies; runs on macOS, Linux and Windows (Node >= 18).
 'use strict';
@@ -30,11 +31,14 @@ const STALL = envInt('COLLAB_STALL_SECS', 7200);       // 2 h without a handoff 
 const IDLE = envInt('COLLAB_IDLE_SECS', 1800);         // 30 min without a handoff => ask the user
 const QUIET_MINS = envInt('COLLAB_QUIET_MINS', 10);    // ...and no project file changed for this long
 const DEFAULT_MAX_ROUNDS = envInt('COLLAB_MAX_ROUNDS', 4);
+const CHECK_TIMEOUT = envInt('COLLAB_CHECK_TIMEOUT', 1800); // --check commands time out after 30 min
 
 const EXIT_TERMINAL = 10;
 const EXIT_TIMEOUT = 11;
 const EXIT_NOTES = 12;
 const EXIT_IDLE = 13;
+const EXIT_CHECK = 14;
+const EXIT_EMPTY = 15;
 
 const TERMINAL = new Set(['DONE', 'ESCALATED', 'ABORTED', 'STALLED']);
 const ROLES = ['implementer', 'reviewer'];
@@ -330,6 +334,132 @@ function progressLines(d, st) {
     .filter((p) => p && p.role === st.turn && p.epoch >= turnStart(st));
 }
 
+// --- task options -------------------------------------------------------------
+
+// Per-task options, accepted by `init` and `queue add`.
+const TASK_OPTS = {
+  values: { '--max-rounds': 'max_rounds', '--check': 'check', '--scope': 'scope', '--focus': 'focus', '--branch': 'branch' },
+  flags: { '--plan': { plan: true }, '--commit': { commit: true }, '--confirm': { confirm: true } },
+};
+
+function normTaskOpts(o) {
+  const res = {};
+  if (o.plan) res.plan = true;
+  if (o.max_rounds !== undefined) res.max_rounds = toSecs(o.max_rounds, DEFAULT_MAX_ROUNDS);
+  if (o.check) res.check = String(o.check).trim();
+  if (o.scope) res.scope = String(o.scope).split(',').map((g) => g.trim().replace(/^\.\//, '')).filter(Boolean);
+  if (o.focus) res.focus = String(o.focus).trim();
+  if (o.branch) res.branch = String(o.branch).trim();
+  if (o.commit) res.commit = true;
+  if (o.confirm) res.confirm = true;
+  return res;
+}
+
+function describeOpts(o = {}) {
+  const bits = [];
+  if (o.plan) bits.push('plan first');
+  if (o.max_rounds) bits.push(`max ${o.max_rounds} rounds`);
+  if (o.check) bits.push(`check \`${o.check}\``);
+  if (o.scope) bits.push(`scope ${o.scope.join(', ')}`);
+  if (o.focus) bits.push(`focus: ${o.focus}`);
+  if (o.branch) bits.push(`branch ${o.branch}`);
+  if (o.commit) bits.push('commit on DONE');
+  if (o.confirm) bits.push('confirm before starting');
+  return bits;
+}
+
+// Markdown appended to the brief so both agents (and the log) see the task's options.
+function optionsSection(o = {}) {
+  const lines = [];
+  if (o.check) lines.push(`- **Check:** \`${o.check}\` must pass before every handoff. \`collab submit\` runs it and refuses on failure; run \`collab check\` to try it first.`);
+  if (o.scope) lines.push(`- **Scope:** only change files matching ${o.scope.map((g) => `\`${g}\``).join(', ')}. \`collab diff\` flags anything outside; the reviewer treats that as blocking unless it's clearly justified.`);
+  if (o.focus) lines.push(`- **Review focus:** ${o.focus}. The reviewer looks hardest at this.`);
+  if (o.branch) lines.push(`- **Branch:** work on \`${o.branch}\`. Create or switch to it before changing anything.`);
+  if (o.commit) lines.push('- **Commit:** when the task is DONE, the implementer commits its changes on the current branch with a message summarising the task. Never push.');
+  return lines.length ? `\n## Task options (set by collab)\n${lines.join('\n')}\n` : '';
+}
+
+// Normalised absolute path, so the same project always matches (symlinks, /private/tmp, …).
+function realDir(p) {
+  try { return fs.realpathSync.native(path.resolve(p)); } catch { return path.resolve(p); }
+}
+
+// --- queue ------------------------------------------------------------------------
+
+const queuePath = () => path.join(COLLAB_HOME, 'queue.json');
+
+function readQueue() {
+  if (!fs.existsSync(queuePath())) return { next_id: 1, items: [] };
+  const q = retry(() => JSON.parse(fs.readFileSync(queuePath(), 'utf8')));
+  return { next_id: q.next_id || 1, items: q.items || [] };
+}
+
+// Read-modify-write the queue under a lock on COLLAB_HOME.
+function withQueue(fn) {
+  fs.mkdirSync(COLLAB_HOME, { recursive: true });
+  return withLock(COLLAB_HOME, () => {
+    const q = readQueue();
+    const res = fn(q);
+    const tmp = `${queuePath()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(q, null, 2)}\n`);
+    retry(() => fs.renameSync(tmp, queuePath()));
+    return res;
+  });
+}
+
+const forProject = (q, dir) => q.items.filter((it) => it.project_dir === realDir(dir));
+const queueCount = (dir) => forProject(readQueue(), dir).length;
+
+function queueLine(dir) {
+  const n = queueCount(dir);
+  return n ? `QUEUE: ${n} more task(s) waiting for this project. Implementer: start the next one ('collab queue next'). Reviewer: run 'collab join' to wait for it.` : '';
+}
+
+// --- --check and --scope ---------------------------------------------------------------
+
+function runCheck(st) {
+  const cmd = st.options && st.options.check;
+  const started = Date.now();
+  const r = spawnSync(cmd, {
+    cwd: st.project_dir, shell: true, encoding: 'utf8', timeout: CHECK_TIMEOUT * 1000,
+    maxBuffer: 64 * 1024 * 1024, env: process.env, windowsHide: true,
+  });
+  const secs = Math.round((Date.now() - started) / 1000);
+  const output = `${r.stdout || ''}${r.stderr || ''}`.replace(/\s+$/, '');
+  const tail = output.split('\n').slice(-60).join('\n');
+  let why = '';
+  if (r.error && r.error.code === 'ETIMEDOUT') why = `timed out after ${CHECK_TIMEOUT}s`;
+  else if (r.error) why = r.error.message;
+  else if (r.status !== 0) why = `exit code ${r.status}`;
+  return { ok: !why, cmd, secs, why, tail };
+}
+
+function printCheck(res) {
+  if (res.ok) {
+    out(`CHECK PASSED: \`${res.cmd}\` (${res.secs}s)`);
+    return;
+  }
+  out(`CHECK FAILED: \`${res.cmd}\` — ${res.why} (${res.secs}s). Last lines of output:`);
+  out(res.tail || '(no output)');
+}
+
+function globRegex(glob) {
+  const g = glob.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, '');
+  if (!/[*?]/.test(g)) return new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, '\\$&')}(?:/.*)?$`);
+  let re = '';
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === '*') {
+      if (g[i + 1] === '*') {
+        i += 1;
+        if (g[i + 1] === '/') { i += 1; re += '(?:.*/)?'; } else re += '.*';
+      } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
 // --- argument parsing ------------------------------------------------------------
 
 // Pulls "--name value" / "--flag" options out of args; returns remaining positionals.
@@ -363,14 +493,13 @@ const toSecs = (v, def) => {
 
 function cmdInit(args) {
   const { opts, rest } = takeOpts(args, {
-    values: { '--max-rounds': 'max', '--dir': 'dir', '--file': 'file', '-f': 'file' },
-    flags: { '--force': { force: true }, '--plan': { plan: true } },
+    values: { ...TASK_OPTS.values, '--dir': 'dir', '--file': 'file', '-f': 'file', '--confirmed': 'confirmed' },
+    flags: { ...TASK_OPTS.flags, '--force': { force: true }, '--from-queue': { fromQueue: true } },
   }, { strict: true });
-  const usage = "usage: collab init <slug> [--plan] [--max-rounds N] [--dir PATH] [--force] (brief on stdin or --file PATH)";
+  const usage = "usage: collab init <slug> [--from-queue] [--plan] [--max-rounds N] [--check CMD] [--scope GLOBS] [--focus TEXT] [--branch NAME] [--commit] [--dir PATH] [--force] (brief on stdin or --file PATH)";
   if (!rest[0]) die(usage);
   const slug = rest[0].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (!slug) die(usage);
-  const max = toSecs(opts.max, DEFAULT_MAX_ROUNDS);
   const dir = path.resolve(opts.dir || process.cwd());
   if (!fs.existsSync(dir)) die(`no such directory: ${dir}`);
 
@@ -380,7 +509,27 @@ function cmdInit(args) {
     if (!isTerminal(st.status)) die(`task '${cur}' is still active (${st.status}). Finish/abort it or pass --force.`);
   }
 
-  const brief = readBody(opts.file);
+  let brief = readBody(opts.file);
+
+  // --from-queue takes the next queued task for this project; flags given here override its options.
+  let item = null;
+  if (opts.fromQueue) {
+    item = withQueue((q) => {
+      const i = q.items.findIndex((it) => it.project_dir === realDir(dir));
+      if (i < 0) return null;
+      // A --confirm task only starts with the user's recorded go-ahead.
+      if (q.items[i].options && q.items[i].options.confirm && !(opts.confirmed || '').trim()) {
+        die(`queued task #${q.items[i].id} needs the user's go-ahead first: ask them, then pass --confirmed "<their answer>"`);
+      }
+      return q.items.splice(i, 1)[0];
+    });
+    if (!item) die(`the queue has no task for ${dir}`);
+  }
+  const options = { ...(item ? item.options : {}), ...normTaskOpts(opts) };
+  delete options.confirm;
+  const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
+  brief += optionsSection(options);
+
   const id = `${slug}-${localStamp()}`;
   const d = path.join(TASKS, id);
   fs.mkdirSync(entriesDir(d), { recursive: true });
@@ -397,7 +546,7 @@ function cmdInit(args) {
     repos.push({ index: repos.length, path: r, base });
   }
 
-  const plan = !!opts.plan;
+  const plan = !!options.plan;
   const now = nowIso();
   const ep = epoch();
   const st = {
@@ -406,11 +555,16 @@ function cmdInit(args) {
     turn: 'implementer', round: 1, plan_round: 1, max_rounds: max, seq: 0,
     seen: { implementer: 0, reviewer: -1 },
     created_at: now, created_epoch: ep, updated_at: now, updated_epoch: ep, updated_by: 'implementer',
-    turn_since: ep,
+    turn_since: ep, options,
   };
+  if (item) st.queue_item = item.id;
   fs.writeFileSync(path.join(d, 'log.md'), `# collab task: ${id}\nproject: ${dir}\n`);
   addEntry(d, st, 'implementer', 'brief', brief);
   st.seq = 1;
+  if (item && item.options && item.options.confirm) {
+    addEntry(d, st, 'human', 'confirm', `The user approved starting queued task #${item.id}: "${opts.confirmed.trim()}"\n`);
+    st.seq = 2;
+  }
   writeState(d, st);
   fs.mkdirSync(COLLAB_HOME, { recursive: true });
   fs.writeFileSync(path.join(COLLAB_HOME, 'current'), `${id}\n`);
@@ -420,6 +574,8 @@ function cmdInit(args) {
   out(`repos snapshotted: ${repos.length}`);
   out(`max rounds: ${max}`);
   out(`phase:   ${st.phase}`);
+  if (describeOpts(options).length) out(`options: ${describeOpts(options).join(' · ')}`);
+  if (item) out(`from queue: #${item.id} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   if (plan) out("Next: write a plan (no code yet), then 'collab submit implementer plan' with it on stdin.");
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
@@ -463,6 +619,7 @@ async function cmdWait(args) {
     if (isTerminal(st.status)) {
       out(`TASK FINISHED: ${st.status} (round ${st.round})`);
       printEntry(d, latestEntry(d));
+      if (st.status === 'DONE' && queueLine(st.project_dir)) out(queueLine(st.project_dir));
       exit(EXIT_TERMINAL);
     }
     if (st.turn === role) {
@@ -536,6 +693,19 @@ function cmdSubmit(args) {
   const d = taskDir();
   let body = readBody(opts.file);
 
+  // The task's --check must pass before the implementer hands off its work.
+  const pre = readState(d);
+  if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build' && pre.turn === role
+      && !isTerminal(pre.status) && pre.options && pre.options.check) {
+    const res = runCheck(pre);
+    if (!res.ok) {
+      out('NOT SUBMITTED: the task check failed. Fix it and submit again (or escalate if it cannot pass).');
+      printCheck(res);
+      exit(EXIT_CHECK);
+    }
+    body += `\n\n> collab: check passed: \`${res.cmd}\` (${res.secs}s)\n`;
+  }
+
   const result = withLock(d, () => {
     const st = readState(d);
     if (isTerminal(st.status)) die(`task already finished (${st.status})`);
@@ -566,6 +736,7 @@ function cmdSubmit(args) {
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
   notify(`${st.id}: ${st.status}`);
+  if (st.status === 'DONE' && queueLine(st.project_dir)) out(queueLine(st.project_dir));
   if (isTerminal(st.status)) exit(EXIT_TERMINAL);
 }
 
@@ -612,6 +783,124 @@ function cmdProgress(args) {
     out('The user added note(s) during your turn. Handle them before you hand off:');
     for (const f of res.pending) printEntry(d, f);
   }
+}
+
+function cmdCheck() {
+  const d = taskDir();
+  const st = readState(d);
+  if (!st.options || !st.options.check) {
+    out('This task has no check command (add one with --check "…" on init or queue add).');
+    return;
+  }
+  const res = runCheck(st);
+  printCheck(res);
+  if (!res.ok) exit(EXIT_CHECK);
+}
+
+function cmdQueue(args) {
+  const [sub = 'list', ...rest] = args;
+  const firstLine = (t) => t.split('\n').find((l) => l.trim()) || '';
+  const show = (it) => {
+    const bits = describeOpts(it.options);
+    return `#${it.id}  [${path.basename(it.project_dir)}]  ${[...firstLine(it.text)].slice(0, 70).join('')}${bits.length ? `\n        ${bits.join(' · ')}` : ''}`;
+  };
+
+  if (sub === 'list') {
+    const q = readQueue();
+    if (!q.items.length) { out('the queue is empty'); return; }
+    const here = realDir(process.cwd());
+    out(`queue: ${q.items.length} task(s)`);
+    q.items.forEach((it, i) => out(`${it.project_dir === here ? '*' : ' '} ${String(i + 1).padStart(2)}. ${show(it)}`));
+    out('(* = this project; the implementer takes the first task for its own project)');
+    return;
+  }
+
+  if (sub === 'add') {
+    const { opts, rest: words } = takeOpts(rest, {
+      values: { ...TASK_OPTS.values, '--dir': 'dir', '--file': 'file', '-f': 'file' },
+      flags: { ...TASK_OPTS.flags, '--first': { first: true } },
+    }, { strict: true });
+    const dir = path.resolve(opts.dir || process.cwd());
+    if (!fs.existsSync(dir)) die(`no such directory: ${dir}`);
+    const text = words.length && !opts.file ? `${words.join(' ')}\n` : readBody(opts.file);
+    const res = withQueue((q) => {
+      const item = { id: q.next_id, added_at: nowIso(), project_dir: realDir(dir), text, options: normTaskOpts(opts) };
+      q.next_id += 1;
+      if (opts.first) q.items.unshift(item); else q.items.push(item);
+      return { item, position: q.items.indexOf(item) + 1, waiting: forProject(q, dir).length };
+    });
+    out(`queued #${res.item.id} at position ${res.position} (${res.waiting} waiting for ${path.basename(dir)})`);
+    return;
+  }
+
+  if (sub === 'next') {
+    const { opts } = takeOpts(rest, { values: { '--dir': 'dir' } });
+    const dir = path.resolve(opts.dir || process.cwd());
+    const items = forProject(readQueue(), dir);
+    if (!items.length) {
+      out(`the queue has no task for ${dir}`);
+      exit(EXIT_EMPTY);
+    }
+    const it = items[0];
+    out(`NEXT QUEUED TASK #${it.id} (1 of ${items.length} for this project)`);
+    out(`project: ${it.project_dir}`);
+    out(`options: ${describeOpts(it.options).join(' · ') || 'none'}`);
+    if (it.options && it.options.confirm) out('CONFIRM FIRST: ask the user before starting this task (start / skip / stop).');
+    out('----- task -----');
+    process.stdout.write(it.text.endsWith('\n') ? it.text : `${it.text}\n`);
+    out('----- end -----');
+    out("Start it with 'collab init <slug> --from-queue' (brief on stdin); skip it with 'collab queue skip'.");
+    return;
+  }
+
+  if (sub === 'skip') {
+    const { opts } = takeOpts(rest, { values: { '--dir': 'dir' } });
+    const dir = path.resolve(opts.dir || process.cwd());
+    const it = withQueue((q) => {
+      const i = q.items.findIndex((x) => x.project_dir === realDir(dir));
+      return i < 0 ? null : q.items.splice(i, 1)[0];
+    });
+    if (!it) { out(`the queue has no task for ${dir}`); exit(EXIT_EMPTY); }
+    out(`skipped #${it.id}: ${firstLine(it.text)}`);
+    return;
+  }
+
+  const position = (v, n) => {
+    if (!/^\d+$/.test(v || '') || +v < 1 || +v > n) die(`no queue position ${v === undefined ? '' : v} (see 'collab queue')`);
+    return +v - 1;
+  };
+
+  if (sub === 'rm') {
+    const it = withQueue((q) => q.items.splice(position(rest[0], q.items.length), 1)[0]);
+    out(`removed #${it.id}: ${firstLine(it.text)}`);
+    return;
+  }
+
+  if (sub === 'move') {
+    const it = withQueue((q) => {
+      const from = position(rest[0], q.items.length);
+      const to = position(rest[1], q.items.length);
+      const [x] = q.items.splice(from, 1);
+      q.items.splice(to, 0, x);
+      return x;
+    });
+    out(`moved #${it.id} to position ${rest[1]}`);
+    return;
+  }
+
+  if (sub === 'clear') {
+    const { opts } = takeOpts(rest, { flags: { '--all': { all: true } } });
+    const here = realDir(process.cwd());
+    const n = withQueue((q) => {
+      const before = q.items.length;
+      q.items = opts.all ? [] : q.items.filter((it) => it.project_dir !== here);
+      return before - q.items.length;
+    });
+    out(`removed ${n} task(s) ${opts.all ? 'from the queue' : `for ${path.basename(here)}`}`);
+    return;
+  }
+
+  die('usage: collab queue [list | add [options] "task" | next | skip | rm N | move N M | clear [--all]]');
 }
 
 function cmdSnooze(args) {
@@ -670,6 +959,7 @@ function cmdDiff(args) {
     out(`No git repos in ${st.project_dir} — rely on the file list in the implementer's summary.`);
     return;
   }
+  const touched = [];
   for (const [i, r] of st.repos.entries()) {
     const idx = Number.isInteger(r.index) ? r.index : i;
     const changed = git(r.path, ['diff', '--stat', r.base]).out.replace(/\n+$/, '');
@@ -677,6 +967,9 @@ function cmdDiff(args) {
     try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
     const known = new Set(before);
     const fresh = untrackedFiles(r.path).filter((f) => !known.has(f)).sort();
+    const rel = (f) => path.relative(st.project_dir, path.join(r.path, f)).split(path.sep).join('/');
+    for (const f of git(r.path, ['diff', '--name-only', r.base]).out.split('\n').filter(Boolean)) touched.push(rel(f));
+    for (const f of fresh) touched.push(rel(f));
     if (!changed && !fresh.length) continue;
     out(`=== ${r.path} (since ${r.base.slice(0, 10)})`);
     if (changed) out(changed);
@@ -696,6 +989,17 @@ function cmdDiff(args) {
     }
     out();
   }
+  const scope = st.options && st.options.scope;
+  if (scope && scope.length) {
+    const res = scope.map(globRegex);
+    const outside = touched.filter((f) => !res.some((re) => re.test(f)));
+    if (outside.length) {
+      out(`⚠ OUTSIDE SCOPE (${scope.join(', ')}):`);
+      for (const f of outside) out(`  ${f}`);
+    } else if (touched.length) {
+      out(`scope: all changes are inside ${scope.join(', ')}`);
+    }
+  }
 }
 
 function cmdStatus() {
@@ -708,6 +1012,8 @@ function cmdStatus() {
   out(`round:   ${st.round}/${st.max_rounds}`);
   out(`updated: ${st.updated_at} by ${st.updated_by}`);
   out(`latest:  ${latestEntry(d)}`);
+  if (describeOpts(st.options).length) out(`options: ${describeOpts(st.options).join(' · ')}`);
+  out(`queue:   ${queueCount(st.project_dir)} waiting for this project`);
   out(`folder:  ${d}`);
 }
 
@@ -741,6 +1047,16 @@ function cmdAbort() {
 
 // --- watch ------------------------------------------------------------------
 
+// Task ids that belong to the same project folder, oldest first.
+function projectTasks(dir) {
+  const want = realDir(dir);
+  return taskIds()
+    .map((id) => { try { return readState(path.join(TASKS, id)); } catch { return null; } })
+    .filter((t) => t && realDir(t.project_dir) === want)
+    .sort((a, b) => (a.created_epoch || 0) - (b.created_epoch || 0) || a.id.localeCompare(b.id))
+    .map((t) => t.id);
+}
+
 // Fit coloured segments into a fixed width: [[text, colour], ...] -> string of exactly `width` columns.
 function fitSegments(parts, width, reset) {
   let left = width;
@@ -754,14 +1070,42 @@ function fitSegments(parts, width, reset) {
   return res + ' '.repeat(Math.max(0, left));
 }
 
+// Word-wrap text to `width` columns; words longer than a line are split.
 function wrapText(text, width) {
   const lines = [];
   for (const line of text.replace(/\n$/, '').split('\n')) {
-    const chars = [...line.replace(/\t/g, '  ')];
-    if (!chars.length) { lines.push(''); continue; }
-    for (let i = 0; i < chars.length; i += width) lines.push(chars.slice(i, i + width).join(''));
+    const indent = (line.match(/^\s*/) || [''])[0].replace(/\t/g, '  ');
+    let cur = '';
+    for (const word of line.replace(/\t/g, '  ').trim().split(/ +/)) {
+      if (!word) continue;
+      const candidate = cur ? `${cur} ${word}` : `${indent}${word}`;
+      if ([...candidate].length <= width) { cur = candidate; continue; }
+      if (cur) lines.push(cur);
+      let rest = [...`${cur ? indent : ''}${word}`];
+      while (rest.length > width) { lines.push(rest.slice(0, width).join('')); rest = rest.slice(width); }
+      cur = rest.join('');
+    }
+    lines.push(cur);
   }
   return lines;
+}
+
+// Cut a line that may contain colour codes to `width` visible columns.
+function clipAnsi(str, width) {
+  let seen = 0;
+  let res = '';
+  for (let i = 0; i < str.length;) {
+    if (str[i] === '\x1b') {
+      const m = /^\x1b\[[0-9;?]*[a-zA-Z]/.exec(str.slice(i));
+      if (m) { res += m[0]; i += m[0].length; continue; }
+    }
+    const ch = String.fromCodePoint(str.codePointAt(i));
+    if (seen >= width) { if (res.includes('\x1b[')) res += '\x1b[0m'; break; }
+    res += ch;
+    seen += 1;
+    i += ch.length;
+  }
+  return res;
 }
 
 // One frame of `collab watch`. view = { sel, follow, scroll, fileChange } (mutated to keep
@@ -770,12 +1114,15 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   const c = (code) => (color ? `\x1b[${code}m` : '');
   const B = c(1), D = c(2), R = c(0), G = c(32), Y = c(33), RD = c(31), CY = c(36), MG = c(35), INV = c(7);
   const roleColor = (r) => (r === 'implementer' ? CY : r === 'reviewer' ? MG : Y);
-  const id = rawTaskId();
+  const id = view.pinned || rawTaskId();
   const d = id && path.join(TASKS, id);
   if (!d || !fs.existsSync(statePath(d))) return [`${B}collab watch${R} — no task yet, waiting for 'collab init'…`];
   if (view.task !== id) Object.assign(view, { task: id, sel: 0, follow: true, scroll: 0, lastCount: 0 });
 
   const st = readState(d);
+  // Tasks of the same project, oldest first, for ←/→ switching.
+  view.siblings = projectTasks(st.project_dir);
+  const pos = view.siblings.indexOf(st.id);
   const now = epoch();
   const created = st.created_epoch || Math.floor(fs.statSync(d).birthtimeMs / 1000);
   const active = !isTerminal(st.status);
@@ -786,7 +1133,9 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
 
   // Header
   const lines = [];
-  lines.push(`${B}collab watch${R}  ${st.id}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
+  const waiting = queueCount(st.project_dir);
+  const taskPos = view.siblings.length > 1 ? `  ${D}task ${pos + 1}/${view.siblings.length}${view.pinned ? ' (←→)' : ''}${R}` : '';
+  lines.push(`${B}collab watch${R}  ${st.id}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
   lines.push(`${D}project${R} ${st.project_dir}`);
   const live = active ? liveProgress(st) : null;
   if (active) {
@@ -866,20 +1215,20 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   for (const l of body.slice(view.scroll, view.scroll + bodyH)) lines.push([...l].slice(0, cols).join(''));
   while (pad && lines.length < rows - footerRows) lines.push('');
   lines.push(keys
-    ? `${D}↑↓/jk step · space/b scroll · g/G first/latest · f follow: ${view.follow ? 'on' : 'off'} · q quit${R}`
+    ? `${D}↑↓ step · ←→ task · space/b scroll · g/G first/latest · f follow: ${view.follow ? 'on' : 'off'} · q quit${R}`
     : `${D}steer: collab note "…"  ·  stop: collab abort${R}`);
-  return lines.slice(0, rows);
+  return lines.slice(0, rows).map((l) => clipAnsi(l, cols));
 }
 
 async function cmdWatch(args) {
   const { opts } = takeOpts(args, { values: { '--interval': 'interval' }, flags: { '--once': { once: true } } });
   const interval = toSecs(opts.interval, 2);
-  const view = { sel: 0, follow: true, scroll: 0, fileChange: 0 };
+  const view = { sel: 0, follow: true, scroll: 0, fileChange: 0, pinned: TASK_OVERRIDE || null };
   let fileChecked = 0;
   const refreshFileChange = () => {
     if (Date.now() - fileChecked < 5000) return;
     fileChecked = Date.now();
-    const id = rawTaskId();
+    const id = view.pinned || rawTaskId();
     try {
       const st = id && readState(path.join(TASKS, id));
       view.fileChange = st && !isTerminal(st.status) ? lastFileChange(st.project_dir) : 0;
@@ -888,7 +1237,7 @@ async function cmdWatch(args) {
 
   if (opts.once) {
     refreshFileChange();
-    for (const l of renderWatch(view, process.stdout.columns || 100, process.stdout.rows || 40, { color: !!process.stdout.isTTY, keys: false, pad: false })) out(l);
+    for (const l of renderWatch(view, process.stdout.columns || envInt('COLUMNS', 100), process.stdout.rows || envInt('LINES', 40), { color: !!process.stdout.isTTY, keys: false, pad: false })) out(l);
     return;
   }
 
@@ -924,6 +1273,15 @@ async function cmdWatch(args) {
         case 'down': case 'j': view.sel += 1; view.follow = false; view.scroll = 0; break;
         case 'home': case 'g': view.sel = key.shift ? Infinity : 0; view.follow = !!key.shift; view.scroll = 0; break;
         case 'end': view.follow = true; view.scroll = 0; break;
+        case 'left': case 'right': case 'h': case 'l': {
+          // Switch between tasks of this project; reaching the newest one follows the current task again.
+          const list = view.siblings || [];
+          const i = list.indexOf(view.task);
+          const j = i + (k === 'left' || k === 'h' ? -1 : 1);
+          if (i < 0 || j < 0 || j >= list.length) return undefined;
+          view.pinned = j === list.length - 1 && list[j] === rawTaskId() ? null : list[j];
+          break;
+        }
         case 'f': view.follow = !view.follow; view.scroll = 0; break;
         case 'space': case 'pagedown': view.scroll += page; break;
         case 'b': case 'pageup': view.scroll -= page; break;
@@ -950,8 +1308,8 @@ function usage() {
   out(`${B}collab${R} — autonomous implementer ⇄ reviewer loop between two coding agents
 
 ${B}FOR YOU (the human)${R}
-  ${C}watch${R} [--interval S]        Interactive dashboard: browse every step (↑↓), live progress
-  ${C}note${R} "text" [-i | -r]      Steer a running task (default: both agents;
+  ${C}watch${R} [--interval S]        Interactive dashboard: steps (↑↓), tasks (←→), live progress
+  ${C}note${R} "text" [-i | -r]       Steer a running task (default: both agents;
                               -i/--implementer or -r/--reviewer for just one)
   ${C}status${R}                      One-shot summary of the current task
   ${C}log${R}                         Full history: brief, summaries, reviews, notes
@@ -959,14 +1317,29 @@ ${B}FOR YOU (the human)${R}
   ${C}diff${R} [--stat]               What changed in the project since the task started
   ${C}list${R}                        All tasks (* = current) with status and round
   ${C}abort${R}                       Stop the current task; both agents exit their loop
+  ${C}queue${R}                       List queued tasks (* = this project)
+  ${C}queue add${R} [options] "task"  Queue a task; the implementer starts it after the current one
+  ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
   ${C}snooze${R} [MIN]                Keep waiting on a slow agent (no idle prompt for MIN, default 30)
   ${C}clean${R} [--older-than D] [-n] Delete finished tasks (asks first; -n = dry run, -y = no prompt)
   ${C}path${R}                        Folder holding the current task's files
   ${C}help${R}                        This screen
 
+${B}TASK OPTIONS${R} ${D}(for queue add, init, or /Collab implement …)${R}
+  --plan                      Reviewer approves a plan before any code
+  --check "npm test"          Must pass before every handoff (collab runs it)
+  --scope "src/auth/**"       Files the task may change; collab diff flags the rest
+  --focus "security"          What the reviewer should look at hardest
+  --branch feat/x             Work on this branch
+  --commit                    Commit when DONE (never pushes)
+  --confirm                   Ask you before this queued task starts
+  --max-rounds N · --first    Round limit · put it at the front of the queue
+
 ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
-  ${C}init${R} <slug> [--plan] [--max-rounds N]
-                              Start a task (brief on stdin or --file); --plan = plan approved first
+  ${C}init${R} <slug> [options] [--from-queue [--confirmed "answer"]]
+                              Start a task (brief on stdin or --file)
+  ${C}queue next${R} · ${C}queue skip${R}     Show / drop the next queued task for this project
+  ${C}check${R}                       Run the task's --check command
   ${C}join${R}                        Reviewer: wait until a task exists, print its brief
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
   ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
@@ -979,14 +1352,14 @@ ${B}START A SESSION${R}
   Codex:        $Collab implement   ·  $Collab review
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
-Exit codes: 0 ok · 10 finished · 11 wait timed out (re-run) · 12 new note · 13 other agent idle · 1 error${R}`);
+Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 1 error${R}`);
 }
 
 // --- main -------------------------------------------------------------------
 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
-  snooze: cmdSnooze, progress: cmdProgress, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
+  snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
   show: cmdShow, list: cmdList, abort: cmdAbort,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),

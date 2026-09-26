@@ -21,13 +21,25 @@ Read the argument from the user's message:
 Anything after the role (e.g. `collab implement add dark mode to the tarot app`) is the
 task for the implementer. If the role is missing, ask the user once, then continue on your own.
 
-If you are the implementer and no task was given, reply only with "Collab implementer ready,
-what should I build?" and end your turn. Treat the user's next message as the task and start
-the implementer loop from step 1. This is the only point where the implementer waits for the user.
+If you are the implementer and no task was given, first run `collab queue next` from the project
+directory. If it shows a queued task, take it (see *Queued tasks*). If the queue is empty
+(exit 15), reply only with "Collab implementer ready, what should I build?" and end your turn.
+Treat the user's next message as the task and start the implementer loop from step 1.
 
-**Plan mode:** if the user asks for a plan first (`--plan`, "plan", "plan first", e.g.
-`/Collab implement --plan`), start with `collab init … --plan`. The reviewer then approves a
-plan before any code is written (see *Plan phase* below).
+**Task options** can come with the request, e.g. `/Collab implement --plan --check "npm test" add
+dark mode`. Pass them straight to `collab init`:
+
+| Option | Meaning |
+|---|---|
+| `--plan` | the reviewer approves a plan before any code (see *Plan phase*) |
+| `--max-rounds N` | review rounds before escalating |
+| `--check "CMD"` | must pass before every handoff; `collab submit` runs it |
+| `--scope "GLOBS"` | files the task may change (comma-separated); `collab diff` flags the rest |
+| `--focus "TEXT"` | what the reviewer should look at hardest |
+| `--branch NAME` | work on this branch |
+| `--commit` | commit the task's changes when it's DONE (never push) |
+
+`collab init` adds a *Task options* section to the brief, so the reviewer sees them too.
 
 ## The CLI
 
@@ -49,7 +61,8 @@ plan before any code is written (see *Plan phase* below).
 - Exit codes: `0` = OK / your turn, `10` = task finished (DONE, ESCALATED, ABORTED, STALLED),
   `11` = wait timed out and it's still not your turn (just run the same command again),
   `12` = submit refused because the user added a note during your turn (see below),
-  `13` = the other agent looks unresponsive (see below), `1` = error.
+  `13` = the other agent looks unresponsive (see below),
+  `14` = submit refused because the task's `--check` failed, `15` = the queue is empty, `1` = error.
 - If a submit fails with "task already finished", the user stopped the task: stop looping and
   give them a short report of where you were.
 
@@ -129,7 +142,9 @@ turn while the task is active.** Keep waiting until you see exit 10.
    and that they can watch live with `collab watch` and steer with `collab note "…"`.
    In plan mode, go through the *Plan phase* first, then continue at step 2.
 2. **Implement.** Follow the project's own rules (CLAUDE.md / AGENTS.md: commits, dev servers
-   and so on). Run the relevant lint, type-check or tests yourself before handing off.
+   and so on). If the task has a `--branch`, create or switch to it before changing anything.
+   Run the relevant lint, type-check or tests yourself before handing off, plus `collab check`
+   if the task has a check command.
 3. **Hand off** with `collab submit implementer ready`, using this summary:
    ```
    ## Summary
@@ -143,11 +158,35 @@ turn while the task is active.** Keep waiting until you see exit 10.
    2. Declined — reason …
    ## Known limitations / open questions
    ```
+   **Exit 14** means the task's check failed and nothing was submitted: fix the problem and submit
+   again. If the check can't pass for reasons outside the task, escalate.
 4. **Wait** with `collab wait implementer`. On exit 0 the output is the reviewer's feedback.
    Address every numbered item, either by fixing it or by declining with a reason, then go back to step 3.
-5. On **exit 10**, stop looping and give the user a short final report: the outcome, the
-   files changed, and anything left open. If the status is ESCALATED or STALLED, explain what
-   needs a human decision.
+5. On **exit 10**:
+   - **DONE:** if the task has `--commit`, commit its changes now (in each repo you changed, on the
+     current branch, with a message summarising the task; never push). Give the user a short report
+     of the task, then run `collab queue next`. If it shows a task, start it (see *Queued tasks*)
+     and continue the loop. If the queue is empty (exit 15), stop with a final report.
+   - **ESCALATED, STALLED or ABORTED:** stop. Give the user a short report and explain what needs
+     a decision. **Don't start queued tasks**: the queue waits until the user runs
+     `/Collab implement` again.
+
+## Queued tasks
+
+The user can queue tasks ahead of time with `collab queue add "…"`. Each queued task belongs to
+the project folder it was added from. `collab queue next` shows the first one for the current
+folder, with its options.
+
+1. If the output says **CONFIRM FIRST**, ask the user before starting: start, skip, or stop.
+   (Claude Code: AskUserQuestion; Codex: plain text, then end your turn.) *Skip* runs
+   `collab queue skip` and moves on to the next one; *stop* ends the loop.
+2. Turn the task text into a brief as usual, then start it with
+   `collab init <short-slug> --from-queue` (brief on stdin or `--file`). This removes the task
+   from the queue and applies its options. Pin the new task id with `-t`. For a CONFIRM FIRST
+   task, add `--confirmed "<the user's answer>"`. The CLI refuses without it, and records the
+   answer in the task's timeline.
+3. Tell the user which queued task you started and how many are left, then continue the
+   implementer loop from step 2 (or the *Plan phase*).
 
 ## Plan phase (only for tasks started with `--plan`)
 
@@ -180,6 +219,10 @@ turn while the task is active.** Keep waiting until you see exit 10.
    - You can run read-only checks (lint, type-check, tests). **Don't edit project files**;
      your only output is the review.
    - Stay within the brief's scope. Don't ask for unrelated refactors.
+   - Respect the brief's *Task options*. Look hardest at the **review focus**. If `collab diff`
+     shows `⚠ OUTSIDE SCOPE`, treat it as blocking unless the change is clearly required. A
+     `check passed` line in the summary means the check command succeeded; you can run
+     `collab check` yourself too.
    - If the status is `PLAN_REVIEW`, follow the *Plan phase* rules instead.
 4. **Decide:**
    - Blocking issues found → `collab submit reviewer changes`:
@@ -192,7 +235,10 @@ turn while the task is active.** Keep waiting until you see exit 10.
      Then go back to step 2.
    - Nothing blocking → `collab submit reviewer approve` with a short verdict and any nits.
      In the build phase, this ends the task for both agents.
-5. On **exit 10**, stop looping and give the user a short final report.
+5. On **exit 10** (from `wait`, or from your own `approve`):
+   - If the status is **DONE** and the output has a `QUEUE:` line, more tasks are waiting: go back
+     to step 1 (`collab join`, without `-t`) to pick up the next task, then pin its new id.
+   - Otherwise stop looping and give the user a short final report.
 
 ## Escalation (either role)
 
@@ -205,8 +251,9 @@ The round limit (default 4) escalates automatically. After escalating, stop and 
 
 ## Human controls
 
-- `collab watch`: interactive dashboard: ↑↓ to browse every step in full, live progress, timers
+- `collab watch`: interactive dashboard: ↑↓ steps in full, ←→ earlier tasks, live progress, timers
 - `collab note "…"`: steer a running task (add `--implementer` or `--reviewer` to target one agent)
 - `collab status`, `collab log`, `collab list`, `collab abort` (stops both loops)
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks
+- `collab queue add [options] "…"`, `collab queue`, `collab queue rm N`: manage the task queue
 State lives in `~/.collab/tasks/<task-id>/` (`state.json`, `log.md`, `entries/`).

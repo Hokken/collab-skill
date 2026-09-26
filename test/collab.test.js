@@ -381,6 +381,150 @@ test('watch --once renders every step, the live row and the selected step', () =
   assert.match(r.out, /now .*in progress .*⟳ running tests/);
   assert.match(r.out, /▶ 002 .*reviewer .*approve/, 'follows the latest entry by default');
   assert.match(r.out, /#002 · reviewer · approve[\s\S]*## Verdict: approved\nfine/, 'full content of the selected step');
+
+  s.run(['progress', 'a very long progress update '.repeat(8)]);
+  s.run(['note', 'word '.repeat(40)]);
+  const narrow = s.run(['watch', '--once'], { env: { COLUMNS: '60', LINES: '30' } }).out;
+  for (const line of narrow.split('\n')) assert.ok([...line].length <= 60, `line wider than 60: ${line}`);
+  assert.doesNotMatch(narrow, /wor\nd/, 'wraps at spaces, not inside words');
+});
+
+test('queue: add, list, next, skip, rm, move, clear and per-project filtering', () => {
+  const s = sandbox();
+  const other = path.join(s.root, 'other');
+  fs.mkdirSync(other);
+  assert.equal(s.run(['queue', 'next']).code, 15, 'empty queue');
+  let r = s.run(['queue', 'add', '--check', 'npm test', '--commit', 'first task']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /queued #1 at position 1 \(1 waiting/);
+  s.run(['queue', 'add', '--dir', other, 'task for another project']);
+  s.run(['queue', 'add', '--plan', '--confirm', 'second task']);
+  s.run(['queue', 'add', '--first', 'urgent task']);
+
+  r = s.run(['queue']);
+  assert.match(r.out, /queue: 4 task/);
+  assert.match(r.out, /\* {2}1\. #4 .*urgent task/);
+  assert.match(r.out, / {3}3\. #2 +\[other\] +task for another project/);
+  assert.match(r.out, /check `npm test` · commit on DONE/);
+
+  r = s.run(['queue', 'next']);
+  assert.match(r.out, /^NEXT QUEUED TASK #4 \(1 of 3 for this project\)/);
+  assert.match(r.out, /----- task -----\nurgent task\n----- end -----/);
+  assert.match(s.run(['queue', 'skip']).out, /skipped #4: urgent task/);
+
+  s.run(['queue', 'move', '3', '1']);
+  r = s.run(['queue', 'next']);
+  assert.match(r.out, /#3 .*\n[\s\S]*CONFIRM FIRST/, 'moved the confirm task to the front');
+  assert.match(s.run(['queue', 'rm', '1']).out, /removed #3: second task/);
+  assert.equal(s.run(['queue', 'rm', '9']).code, 1);
+
+  assert.match(s.run(['queue', 'next', '--dir', other]).out, /task for another project/);
+  assert.match(s.run(['queue', 'clear']).out, /removed 1 task\(s\) for project/);
+  assert.match(s.run(['queue']).out, /#2 +\[other\]/, 'clear only touches this project');
+  assert.match(s.run(['queue', 'clear', '--all']).out, /removed 1 task/);
+  assert.match(s.run(['queue']).out, /the queue is empty/);
+});
+
+test('init --from-queue pops the task and applies its options', () => {
+  const s = sandbox();
+  s.run(['queue', 'add', '--plan', '--max-rounds', '2', '--focus', 'security', '--branch', 'feat/x', '--scope', 'src/**', 'queued job']);
+  s.run(['queue', 'add', 'later job']);
+  let r = s.run(['init', 'job', '--from-queue', '--focus', 'performance'], { input: '## Goal\nqueued job, as a brief\n' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /phase: +plan/);
+  assert.match(r.out, /options: plan first · max 2 rounds · scope src\/\*\* · focus: performance · branch feat\/x/);
+  assert.match(r.out, /from queue: #1 \(1 more waiting/);
+  const st = s.state();
+  assert.equal(st.max_rounds, 2);
+  assert.equal(st.queue_item, 1);
+  assert.equal(st.options.focus, 'performance', 'explicit flags override the queued options');
+  const brief = s.run(['show', '0']).out;
+  assert.match(brief, /## Task options \(set by collab\)/);
+  assert.match(brief, /\*\*Branch:\*\* work on `feat\/x`/);
+  assert.match(s.run(['queue', 'next']).out, /later job/);
+  s.run(['abort']);
+  s.run(['queue', 'clear']);
+  r = s.run(['init', 'none', '--from-queue'], { input: 'b' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /the queue has no task/);
+});
+
+test('--confirm tasks need the recorded go-ahead, which lands in the timeline', () => {
+  const s = sandbox();
+  s.run(['queue', 'add', '--confirm', 'risky migration']);
+  let r = s.run(['init', 'mig', '--from-queue'], { input: 'b' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /needs the user's go-ahead first/);
+  assert.match(s.run(['queue', 'next']).out, /risky migration/, 'still queued after the refusal');
+  r = s.run(['init', 'mig', '--from-queue', '--confirmed', 'Start'], { input: 'b' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(s.run(['show', '1']).out, /001-human-confirm\.md[\s\S]*approved starting queued task #1: "Start"/);
+  assert.equal(s.state().seq, 2);
+  assert.match(s.run(['watch', '--once']).out, /001 .*human .*confirm/);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0, 'a confirm entry is not a note and does not gate');
+});
+
+test('--check must pass before the implementer hands off', () => {
+  const s = sandbox();
+  const flag = path.join(s.project, 'pass.flag');
+  const check = `node -e "process.exit(require('fs').existsSync('pass.flag') ? 0 : 3)"`;
+  s.run(['init', 'chk', '--check', check], { input: 'b' });
+  let r = s.run(['check']);
+  assert.equal(r.code, 14);
+  assert.match(r.out, /CHECK FAILED: .* exit code 3/);
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 14);
+  assert.match(r.out, /^NOT SUBMITTED: the task check failed/);
+  assert.equal(s.state().status, 'IMPLEMENTING');
+
+  fs.writeFileSync(flag, '');
+  assert.match(s.run(['check']).out, /CHECK PASSED/);
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(s.run(['show']).out, /collab: check passed: `node -e/);
+  assert.equal(s.run(['submit', 'reviewer', 'escalate'], { input: 'x' }).code, 10);
+  assert.match(s.run(['-t', s.state().id, 'status']).out, /options: check `node -e/);
+});
+
+test('--scope flags changes outside the allowed files', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  fs.mkdirSync(path.join(s.project, 'src', 'auth'), { recursive: true });
+  s.run(['init', 'scoped', '--scope', 'src/auth/**, README.md'], { input: 'b' });
+  fs.writeFileSync(path.join(s.project, 'src', 'auth', 'login.js'), 'x\n');
+  fs.writeFileSync(path.join(s.project, 'README.md'), 'readme\n');
+  let r = s.run(['diff', '--stat']);
+  assert.match(r.out, /scope: all changes are inside src\/auth\/\*\*, README\.md/);
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'outside\n');
+  r = s.run(['diff', '--stat']);
+  assert.match(r.out, /⚠ OUTSIDE SCOPE \(src\/auth\/\*\*, README\.md\):\n {2}f\.txt/);
+  assert.doesNotMatch(r.out, / {2}src\/auth\/login\.js\n.*OUTSIDE/);
+});
+
+test('DONE tells both agents when more queued tasks are waiting', () => {
+  const s = sandbox();
+  s.run(['queue', 'add', 'next one']);
+  s.run(['init', 'q1'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 10);
+  assert.match(r.out, /^QUEUE: 1 more task\(s\) waiting for this project/m);
+  r = s.run(['wait', 'implementer', '--timeout', '1']);
+  assert.match(r.out, /TASK FINISHED: DONE[\s\S]*QUEUE: 1 more/);
+  s.run(['queue', 'clear']);
+  assert.doesNotMatch(s.run(['wait', 'implementer', '--timeout', '1']).out, /QUEUE:/);
+});
+
+test('watch shows the task position within its project and -t pins an older task', () => {
+  const s = sandbox();
+  s.run(['init', 'one'], { input: 'first brief' });
+  const one = s.state().id;
+  s.run(['abort']);
+  s.run(['init', 'two'], { input: 'second brief' });
+  assert.match(s.run(['watch', '--once']).out, /collab watch {2}two-\S+ {2}task 2\/2 /);
+  const r = s.run(['-t', one, 'watch', '--once']);
+  assert.match(r.out, /collab watch {2}one-\S+ {2}task 1\/2 \(←→\)/);
+  assert.match(r.out, /first brief/);
 });
 
 test('help and unknown commands', () => {

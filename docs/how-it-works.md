@@ -29,6 +29,22 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   Approving the plan moves to `IMPLEMENTING` and doesn't end the task.
 - **Round limits:** a `changes` beyond `max_rounds` becomes `ESCALATED` instead.
 
+## Queue and task options
+
+- `collab queue add [options] "task"` appends to `~/.collab/queue.json`. Each item remembers the
+  project folder it was added from, and an implementer only takes items for its own folder.
+- `collab queue next` shows the first item for the current folder. `collab init <slug> --from-queue`
+  removes it and applies its options (flags given to `init` override them).
+- When a task ends `DONE` and more items are waiting, `wait` and the reviewer's `approve` print a
+  `QUEUE:` line. The implementer starts the next item, and the reviewer runs `collab join` again.
+  Any other ending (`ESCALATED`, `STALLED`, `ABORTED`) pauses the queue.
+- Options are stored in `state.json` and summarised in a *Task options* section of the brief:
+  - `--check` is enforced: `submit implementer ready` runs it in the project folder and refuses with
+    exit 14 on failure. On success, a `check passed` line is appended to the summary.
+  - `--scope` is flagged: `collab diff` lists changed files outside the globs.
+  - `--focus`, `--branch` and `--commit` are instructions the agents follow (and the reviewer checks).
+  - `--confirm` makes the implementer ask you before starting that queued task.
+
 ## States
 
 | Status | Whose turn | Meaning |
@@ -54,6 +70,8 @@ Agents branch on these, so they are part of the protocol:
 | `11` | `wait` timed out and it's still not your turn; run it again |
 | `12` | submit refused: the user added a note during your turn |
 | `13` | the other agent looks unresponsive; ask the user whether to stop or keep waiting |
+| `14` | submit refused: the task's `--check` command failed |
+| `15` | the queue has no task for this project |
 
 ## Human notes
 
@@ -87,6 +105,7 @@ during the task, even when you started with uncommitted work.
 ```text
 ~/.collab/
   current                          id of the most recent task
+  queue.json                       queued tasks, each with its project folder and options
   tasks/<slug>-<YYYYMMDD-HHMMSS>/
     state.json                     status, turn, rounds, repos, progress, …
     log.md                         the whole conversation, human-readable
