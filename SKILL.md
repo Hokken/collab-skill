@@ -75,6 +75,27 @@ The user can add a note at any time with `collab note "…"`. Notes show up as
 - On exit 12, nothing was submitted. Handle the note, then submit again with your **full,
   updated** message (not just a diff of it).
 
+## Progress updates while it's your turn
+
+While you hold the turn, post a one-line status at each real step, so the user (in `collab watch`)
+and the waiting agent can see that the pause is normal:
+
+```
+collab -t <id> progress "reading the review, 3 items to address"
+collab -t <id> progress "running npm test"
+collab -t <id> progress "fixing item 2: missing null check in parser.ts"
+```
+
+- Post one when your turn starts, before anything long (tests, builds, large reads), and when you
+  move to the next item. Typically 3–8 per turn. **Never on a timer**, and never in a loop.
+- Keep it short and concrete (under ~80 characters): *what* you're doing, not how you feel.
+- It isn't a handoff: it doesn't pass the turn or add a timeline entry. It does count as a sign
+  of life, so a long but active turn won't be flagged as unresponsive.
+- If its output shows a `!!! HUMAN NOTE`, the user added a note during your turn. Handle it
+  like any other note (see *Human notes*).
+- When `wait` times out (exit 11), its output includes the other agent's latest progress. A
+  recent update means the wait is normal, so just keep waiting.
+
 ## How to wait (depends on which CLI you are)
 
 Waiting is a blocking shell command, so polling doesn't use model tokens. **Never end your
@@ -184,7 +205,7 @@ The round limit (default 4) escalates automatically. After escalating, stop and 
 
 ## Human controls
 
-- `collab watch`: live dashboard (status, whose turn, timers, timeline, latest message)
+- `collab watch`: interactive dashboard: ↑↓ to browse every step in full, live progress, timers
 - `collab note "…"`: steer a running task (add `--implementer` or `--reviewer` to target one agent)
 - `collab status`, `collab log`, `collab list`, `collab abort` (stops both loops)
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks

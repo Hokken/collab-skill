@@ -328,6 +328,61 @@ test('output piped into a reader that exits early does not crash or lose state',
   assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10, 'notes shown before the pipe closed count as seen');
 });
 
+test('progress: attribution, notes hand-over, wait output and finished tasks', () => {
+  const s = sandbox();
+  s.run(['init', 'prog'], { input: 'b' });
+  const before = s.state();
+  let r = s.run(['progress', 'reading', 'the', 'brief']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^progress \(implementer\): reading the brief/);
+  assert.equal(s.state().progress.role, 'implementer');
+  assert.equal(s.state().updated_at, before.updated_at, 'progress is not a handoff');
+  assert.equal(s.state().seq, before.seq, 'progress adds no timeline entry');
+
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.equal(r.code, 11);
+  assert.match(r.out, /^still waiting — .*latest implementer progress: "reading the brief" \(\d+s ago\)/);
+
+  s.run(['note', '-i', 'use 2 decimals']);
+  r = s.run(['progress', 'writing code']);
+  assert.match(r.out, /HUMAN NOTE[\s\S]*use 2 decimals/);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0, 'a note shown via progress no longer blocks the submit');
+
+  r = s.run(['wait', 'implementer', '--timeout', '1']);
+  assert.match(r.out, /no progress update from the reviewer yet/);
+  assert.match(s.run(['progress', 'reviewing diff']).out, /progress \(reviewer\)/);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  r = s.run(['progress', 'late']);
+  assert.equal(r.code, 1);
+  assert.equal(s.run(['progress']).code, 1, 'empty progress refused');
+});
+
+test('progress keeps a slow agent from looking unresponsive', async () => {
+  const s = sandbox({ COLLAB_IDLE_SECS: '2', COLLAB_QUIET_MINS: '1' });
+  s.run(['init', 'slow'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  await pause(2500);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13, 'silent reviewer looks unresponsive');
+  s.run(['progress', 'still reviewing, big diff']);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '1']).code, 11, 'a fresh progress post counts as activity');
+});
+
+test('watch --once renders every step, the live row and the selected step', () => {
+  const s = sandbox();
+  s.run(['init', 'dash', '--plan'], { input: '## Goal\nbuild the thing' });
+  s.run(['submit', 'implementer', 'plan'], { input: '## Approach\nplain module' });
+  s.run(['submit', 'reviewer', 'approve'], { input: '## Verdict: approved\nfine' });
+  s.run(['progress', 'running tests']);
+  const r = s.run(['watch', '--once'], { env: { COLUMNS: '100', LINES: '30' } });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /IMPLEMENTING/);
+  assert.match(r.out, /implementer is implementing for .*⟳ running tests/);
+  assert.match(r.out, /000 .*brief .*build the thing/);
+  assert.match(r.out, /now .*in progress .*⟳ running tests/);
+  assert.match(r.out, /▶ 002 .*reviewer .*approve/, 'follows the latest entry by default');
+  assert.match(r.out, /#002 · reviewer · approve[\s\S]*## Verdict: approved\nfine/, 'full content of the selected step');
+});
+
 test('help and unknown commands', () => {
   const s = sandbox();
   let r = s.run(['help']);

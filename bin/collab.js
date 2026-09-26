@@ -266,37 +266,68 @@ function findRepos(root) {
 const untrackedFiles = (repo) =>
   git(repo, ['ls-files', '--others', '--exclude-standard']).out.split('\n').filter(Boolean);
 
-// True if any project file changed in the last QUIET_MINS minutes.
-function recentChanges(root) {
-  const cutoff = Date.now() - QUIET_MINS * 60 * 1000;
+// Newest mtime (ms) of any project file, skipping dependency/build folders.
+// Stops early once a file at least as new as stopAt is found; capped so a huge tree can't hang.
+function lastFileChange(root, stopAt = Infinity) {
   const stack = [root];
   let visited = 0;
+  let newest = 0;
   while (stack.length) {
     const dir = stack.pop();
     let items;
     try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const it of items) {
-      if (++visited > 50000) return false;
+      if (++visited > 50000) return newest;
       const p = path.join(dir, it.name);
       if (it.isDirectory()) {
         if (!SKIP_DIRS.has(it.name)) stack.push(p);
       } else if (it.isFile()) {
-        try { if (fs.statSync(p).mtimeMs >= cutoff) return true; } catch { /* vanished */ }
+        try {
+          const m = fs.statSync(p).mtimeMs;
+          if (m > newest) newest = m;
+          if (newest >= stopAt) return newest;
+        } catch { /* vanished */ }
       }
     }
   }
-  return false;
+  return newest;
 }
+
+// True if any project file changed in the last QUIET_MINS minutes.
+function recentChanges(root) {
+  const cutoff = Date.now() - QUIET_MINS * 60 * 1000;
+  return lastFileChange(root, cutoff) >= cutoff;
+}
+
+// When the current turn started (older state files only have updated_epoch).
+const turnStart = (st) => st.turn_since || st.updated_epoch;
+
+// The working agent's latest progress update for the current turn, or null.
+function liveProgress(st) {
+  const p = st.progress;
+  return p && p.role === st.turn && p.epoch >= turnStart(st) ? p : null;
+}
+
+// Last sign of life from the agent whose turn it is: a handoff/update or a progress post.
+const lastActivity = (st) => Math.max(st.updated_epoch, (liveProgress(st) || {}).epoch || 0);
 
 // Why the agent whose turn it is looks unresponsive, or ''.
 function idleReason(st) {
   const now = epoch();
-  const since = now - st.updated_epoch;
+  const since = now - lastActivity(st);
   if (since < IDLE || now < (st.snooze_until || 0)) return '';
   if (st.turn === 'implementer' && recentChanges(st.project_dir)) return '';
-  let why = `the ${st.turn} has not handed off for ${Math.floor(since / 60)} min`;
+  let why = `the ${st.turn} has not handed off for ${Math.floor((now - st.updated_epoch) / 60)} min`;
+  if (liveProgress(st)) why += `, its last progress update was ${Math.floor(since / 60)} min ago`;
   if (st.turn === 'implementer') why += ` and no project file changed in the last ${QUIET_MINS} min`;
   return why;
+}
+
+function progressLines(d, st) {
+  let raw = '';
+  try { raw = fs.readFileSync(path.join(d, 'progress.log'), 'utf8'); } catch { return []; }
+  return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((p) => p && p.role === st.turn && p.epoch >= turnStart(st));
 }
 
 // --- argument parsing ------------------------------------------------------------
@@ -375,6 +406,7 @@ function cmdInit(args) {
     turn: 'implementer', round: 1, plan_round: 1, max_rounds: max, seq: 0,
     seen: { implementer: 0, reviewer: -1 },
     created_at: now, created_epoch: ep, updated_at: now, updated_epoch: ep, updated_by: 'implementer',
+    turn_since: ep,
   };
   fs.writeFileSync(path.join(d, 'log.md'), `# collab task: ${id}\nproject: ${dir}\n`);
   addEntry(d, st, 'implementer', 'brief', brief);
@@ -452,14 +484,18 @@ async function cmdWait(args) {
       out("Ask the user: stop the task ('collab abort') or keep waiting ('collab snooze [MIN]', default 30)?");
       exit(EXIT_IDLE);
     }
-    if (epoch() - st.updated_epoch >= STALL && epoch() >= (st.snooze_until || 0)) {
+    if (epoch() - lastActivity(st) >= STALL && epoch() >= (st.snooze_until || 0)) {
       withLock(d, () => update(d, (s) => { s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; }));
       notify(`${st.id}: STALLED (no handoff for ${Math.floor(STALL / 60)} min)`);
       out(`TASK FINISHED: STALLED — the other agent has not handed off for ${Math.floor(STALL / 60)} min`);
       exit(EXIT_TERMINAL);
     }
     if (epoch() - start >= timeout) {
-      out(`still waiting — status: ${st.status}, turn: ${st.turn}. Run 'collab wait ${role}' again.`);
+      const p = liveProgress(st);
+      const info = p
+        ? `latest ${st.turn} progress: "${p.text}" (${fmtDur(epoch() - p.epoch)} ago)`
+        : `no progress update from the ${st.turn} yet (turn started ${fmtDur(epoch() - turnStart(st))} ago)`;
+      out(`still waiting — status: ${st.status}, turn: ${st.turn}; ${info}. Run 'collab wait ${role}' again.`);
       exit(EXIT_TIMEOUT);
     }
     await sleep(POLL * 1000);
@@ -518,7 +554,7 @@ function cmdSubmit(args) {
     if (t.note) body += `\n\n> collab: ${t.note} — escalated to the human.\n`;
     addEntry(d, st, role, kind, body);
     return {
-      st: update(d, (s) => { t.apply(s); s.seq += 1; s.updated_by = role; }),
+      st: update(d, (s) => { t.apply(s); s.seq += 1; s.updated_by = role; s.turn_since = epoch(); }),
     };
   });
 
@@ -553,6 +589,29 @@ function cmdNote(args) {
     return { seq, turn: nst.turn };
   });
   out(`note #${res.seq} added for ${to} (turn: ${res.turn}). It is delivered at that agent's next turn start, or blocks its next handoff until handled.`);
+}
+
+function cmdProgress(args) {
+  let text = args.join(' ').replace(/\s+/g, ' ').trim();
+  if (!text) die('usage: collab progress "what you are doing now"');
+  if ([...text].length > 200) text = `${[...text].slice(0, 199).join('')}…`;
+  const d = taskDir();
+  const res = withLock(d, () => {
+    const st = readState(d);
+    if (isTerminal(st.status)) die(`task already finished (${st.status})`);
+    if (!ROLES.includes(st.turn)) die('no agent has the turn');
+    const p = { role: st.turn, round: st.round, text, at: nowIso(), epoch: epoch() };
+    fs.appendFileSync(path.join(d, 'progress.log'), `${JSON.stringify(p)}\n`);
+    // Notes that arrived mid-turn are handed over right away instead of at the next submit.
+    const pending = pendingNotes(d, st, st.turn);
+    update(d, (s) => { s.progress = p; if (pending.length) markSeen(s, st.turn); }, { touch: false });
+    return { p, pending };
+  });
+  out(`progress (${res.p.role}): ${res.p.text}`);
+  if (res.pending.length) {
+    out('The user added note(s) during your turn. Handle them before you hand off:');
+    for (const f of res.pending) printEntry(d, f);
+  }
 }
 
 function cmdSnooze(args) {
@@ -682,76 +741,202 @@ function cmdAbort() {
 
 // --- watch ------------------------------------------------------------------
 
-function watchFrame(cols) {
-  const tty = process.stdout.isTTY;
-  const c = (code) => (tty ? `\x1b[${code}m` : '');
-  const B = c(1), D = c(2), R = c(0), G = c(32), Y = c(33), RD = c(31), CY = c(36), MG = c(35);
+// Fit coloured segments into a fixed width: [[text, colour], ...] -> string of exactly `width` columns.
+function fitSegments(parts, width, reset) {
+  let left = width;
+  let res = '';
+  for (const [text, color] of parts) {
+    if (left <= 0) break;
+    const chars = [...text].slice(0, left);
+    left -= chars.length;
+    res += `${color || ''}${chars.join('')}${color ? reset : ''}`;
+  }
+  return res + ' '.repeat(Math.max(0, left));
+}
+
+function wrapText(text, width) {
   const lines = [];
+  for (const line of text.replace(/\n$/, '').split('\n')) {
+    const chars = [...line.replace(/\t/g, '  ')];
+    if (!chars.length) { lines.push(''); continue; }
+    for (let i = 0; i < chars.length; i += width) lines.push(chars.slice(i, i + width).join(''));
+  }
+  return lines;
+}
+
+// One frame of `collab watch`. view = { sel, follow, scroll, fileChange } (mutated to keep
+// selection and scroll in range); returns the lines to draw.
+function renderWatch(view, cols, rows, { color = true, keys = true, pad = true } = {}) {
+  const c = (code) => (color ? `\x1b[${code}m` : '');
+  const B = c(1), D = c(2), R = c(0), G = c(32), Y = c(33), RD = c(31), CY = c(36), MG = c(35), INV = c(7);
+  const roleColor = (r) => (r === 'implementer' ? CY : r === 'reviewer' ? MG : Y);
   const id = rawTaskId();
   const d = id && path.join(TASKS, id);
-  if (!d || !fs.existsSync(statePath(d))) {
-    return [`${B}collab watch${R} — no task yet, waiting for 'collab init'…`];
-  }
+  if (!d || !fs.existsSync(statePath(d))) return [`${B}collab watch${R} — no task yet, waiting for 'collab init'…`];
+  if (view.task !== id) Object.assign(view, { task: id, sel: 0, follow: true, scroll: 0, lastCount: 0 });
+
   const st = readState(d);
   const now = epoch();
-  let created = st.created_epoch || 0;
-  if (!created) created = Math.floor(fs.statSync(d).birthtimeMs / 1000);
-
+  const created = st.created_epoch || Math.floor(fs.statSync(d).birthtimeMs / 1000);
+  const active = !isTerminal(st.status);
   let sc = CY;
   if (st.status === 'DONE') sc = G;
   else if (['ESCALATED', 'STALLED', 'ABORTED'].includes(st.status)) sc = RD;
   else if (['CHANGES_REQUESTED', 'PLAN_CHANGES'].includes(st.status)) sc = Y;
 
-  lines.push(`${B}collab watch${R}  ${D}${localTime(Date.now())} · Ctrl-C to quit${R}`, '');
-  lines.push(`${B}task${R}     ${st.id}`);
-  lines.push(`${B}project${R}  ${st.project_dir}`);
-  lines.push(`${B}status${R}   ${sc}${B}${st.status}${R}   round ${st.round}/${st.max_rounds}   total ${fmtDur(now - created)}`);
-  if (isTerminal(st.status)) {
-    lines.push(`${B}turn${R}     — finished`);
-  } else {
+  // Header
+  const lines = [];
+  lines.push(`${B}collab watch${R}  ${st.id}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
+  lines.push(`${D}project${R} ${st.project_dir}`);
+  const live = active ? liveProgress(st) : null;
+  if (active) {
     let verb = st.turn === 'reviewer' ? 'reviewing' : 'implementing';
     if (['PLANNING', 'PLAN_CHANGES'].includes(st.status)) verb = 'planning';
     if (st.status === 'PLAN_REVIEW') verb = 'reviewing the plan';
-    const left = Math.max(0, STALL - (now - st.updated_epoch));
-    lines.push(`${B}turn${R}     ${B}${st.turn}${R} is ${verb} for ${fmtDur(now - st.updated_epoch)}   ${D}(stalls in ${fmtDur(left)})${R}`);
+    const bits = [`${roleColor(st.turn)}${B}${st.turn}${R} is ${verb} for ${fmtDur(now - turnStart(st))}`];
+    bits.push(live ? `⟳ ${live.text} ${D}(${fmtDur(now - live.epoch)} ago)${R}` : `${D}no progress update yet${R}`);
+    if (view.fileChange) bits.push(`${D}last file change ${fmtDur(Math.max(0, Math.floor((Date.now() - view.fileChange) / 1000)))} ago${R}`);
+    lines.push(bits.join('  ·  '));
     const idle = idleReason(st);
     if (idle) lines.push(`${RD}${B}⚠  looks unresponsive:${R}${RD} ${idle} — collab abort / collab snooze${R}`);
+  } else {
+    lines.push(`${D}finished${R}`);
   }
-  lines.push('', `${B}timeline${R}`);
-  const width = Math.max(cols - 48, 20);
-  for (const f of listEntries(d)) {
-    const who = roleOf(f);
-    const rc = who === 'implementer' ? CY : who === 'reviewer' ? MG : Y;
+  const rule = `${D}${'─'.repeat(cols)}${R}`;
+  lines.push(rule);
+
+  // Items: every entry, plus a live "now" row while an agent is working
+  const items = listEntries(d).map((f) => {
     const p = path.join(entriesDir(d), f);
     const first = fs.readFileSync(p, 'utf8').split('\n').find((l) => !/^\s*(#|$|---)/.test(l)) || '';
-    const preview = [...first.replace(/^[-*\s]+/, '')].slice(0, width).join('');
-    lines.push(`  ${f.split('-')[0]} ${localTime(fs.statSync(p).mtimeMs)}  ${rc}${who.padEnd(11)}${R} ${kindOf(f).padEnd(16)} ${D}${preview}${R}`);
+    return { file: f, seq: f.split('-')[0], time: localTime(fs.statSync(p).mtimeMs), role: roleOf(f), kind: kindOf(f), preview: first.replace(/^[-*\s]+/, '') };
+  });
+  const entryCount = items.length;
+  if (active) {
+    items.push({
+      live: true, seq: 'now', time: localTime((live ? live.epoch : turnStart(st)) * 1000), role: st.turn,
+      kind: 'in progress', preview: live ? `⟳ ${live.text}` : '(no progress update yet)',
+    });
   }
-  const last = latestEntry(d);
-  const body = fs.readFileSync(path.join(entriesDir(d), last), 'utf8').split('\n');
-  if (body[body.length - 1] === '') body.pop();
-  lines.push('', `${B}latest: ${last}${R}`);
-  for (const l of body.slice(0, 15)) lines.push([...l].slice(0, cols).join(''));
-  if (body.length > 15) lines.push(`${D}… (collab show for the full entry)${R}`);
-  lines.push('', `${D}steer: collab note "…"   ·   stop: collab abort${R}`);
-  return lines;
+  if (view.follow || view.sel >= items.length) view.sel = entryCount - 1;
+  if (view.follow && entryCount !== view.lastCount) view.scroll = 0;
+  view.lastCount = entryCount;
+  view.sel = Math.max(0, Math.min(view.sel, items.length - 1));
+
+  // Timeline window around the selection
+  const footerRows = 1;
+  const budget = rows - lines.length - footerRows - 2; // rule + detail header
+  const listH = Math.max(1, Math.min(items.length, Math.max(3, Math.floor(budget * 0.35))));
+  const start = Math.max(0, Math.min(view.sel - Math.floor(listH / 2), items.length - listH));
+  for (let i = start; i < start + listH; i++) {
+    const it = items[i];
+    const selected = i === view.sel;
+    const prefix = selected ? '▶ ' : '  ';
+    const parts = [
+      [`${prefix}${it.seq.padEnd(4)}${it.time}  `, ''],
+      [`${it.role.padEnd(12)}`, selected ? '' : roleColor(it.role)],
+      [`${it.kind.padEnd(17)}`, ''],
+      [it.preview, selected ? '' : D],
+    ];
+    const row = fitSegments(parts, cols, R);
+    lines.push(selected && color ? `${INV}${row.replace(/\x1b\[[0-9;]*m/g, '')}${R}` : row);
+  }
+  lines.push(rule);
+
+  // Detail pane for the selected step
+  const it = items[view.sel];
+  let body;
+  let title;
+  if (it.live) {
+    const log = progressLines(d, st);
+    title = `now · ${it.role} · in progress since ${localTime(turnStart(st) * 1000)}`;
+    body = log.length
+      ? log.map((p) => `${localTime(p.epoch * 1000)}  ${p.text}`)
+      : ['(no progress updates yet — agents post one at each step with `collab progress`)'];
+  } else {
+    title = `#${it.seq} · ${it.role} · ${it.kind} · ${it.time}`;
+    body = wrapText(fs.readFileSync(path.join(entriesDir(d), it.file), 'utf8'), Math.max(10, cols - 1));
+  }
+  const bodyH = Math.max(1, rows - lines.length - 1 - footerRows);
+  const maxScroll = Math.max(0, body.length - bodyH);
+  view.scroll = Math.max(0, Math.min(view.scroll, maxScroll));
+  view.page = bodyH;
+  const range = body.length > bodyH ? `  [${view.scroll + 1}-${Math.min(body.length, view.scroll + bodyH)}/${body.length}]` : '';
+  lines.push(`${roleColor(it.role)}${B}${title}${R}${D}${range}${R}`);
+  for (const l of body.slice(view.scroll, view.scroll + bodyH)) lines.push([...l].slice(0, cols).join(''));
+  while (pad && lines.length < rows - footerRows) lines.push('');
+  lines.push(keys
+    ? `${D}↑↓/jk step · space/b scroll · g/G first/latest · f follow: ${view.follow ? 'on' : 'off'} · q quit${R}`
+    : `${D}steer: collab note "…"  ·  stop: collab abort${R}`);
+  return lines.slice(0, rows);
 }
 
 async function cmdWatch(args) {
-  const { opts } = takeOpts(args, { values: { '--interval': 'interval' } });
+  const { opts } = takeOpts(args, { values: { '--interval': 'interval' }, flags: { '--once': { once: true } } });
   const interval = toSecs(opts.interval, 2);
+  const view = { sel: 0, follow: true, scroll: 0, fileChange: 0 };
+  let fileChecked = 0;
+  const refreshFileChange = () => {
+    if (Date.now() - fileChecked < 5000) return;
+    fileChecked = Date.now();
+    const id = rawTaskId();
+    try {
+      const st = id && readState(path.join(TASKS, id));
+      view.fileChange = st && !isTerminal(st.status) ? lastFileChange(st.project_dir) : 0;
+    } catch { view.fileChange = 0; }
+  };
+
+  if (opts.once) {
+    refreshFileChange();
+    for (const l of renderWatch(view, process.stdout.columns || 100, process.stdout.rows || 40, { color: !!process.stdout.isTTY, keys: false, pad: false })) out(l);
+    return;
+  }
+
   // Full-screen alternate buffer, redrawn in place (like top): no scrollback spam,
   // and the terminal is restored exactly as it was on exit.
-  const restore = () => process.stdout.write('\x1b[?25h\x1b[?1049l');
-  process.stdout.write('\x1b[?1049h\x1b[?25l');
-  process.on('exit', restore);
-  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
-  for (;;) {
+  const interactive = !!process.stdin.isTTY;
+  const draw = () => {
     const rows = process.stdout.rows || 40;
     const cols = process.stdout.columns || 100;
     let lines;
-    try { lines = watchFrame(cols); } catch (e) { lines = [`collab watch: ${e.message}`]; }
-    process.stdout.write(`\x1b[H${lines.slice(0, rows).map((l) => `${l}\x1b[K`).join('\n')}\n\x1b[J`);
+    try { lines = renderWatch(view, cols, rows, { color: !!process.stdout.isTTY, keys: interactive }); } catch (e) { lines = [`collab watch: ${e.message}`]; }
+    process.stdout.write(`\x1b[H${lines.map((l) => `${l}\x1b[K`).join('\n')}\x1b[J`);
+  };
+  const quit = () => {
+    if (interactive) { try { process.stdin.setRawMode(false); } catch { /* not a tty */ } }
+    process.stdout.write('\x1b[?25h\x1b[?1049l');
+    process.exit(0);
+  };
+  process.stdout.write('\x1b[?1049h\x1b[?25l');
+  process.on('SIGINT', quit);
+  process.on('SIGTERM', quit);
+  process.stdout.on('resize', draw);
+
+  if (interactive) {
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.on('keypress', (str, key = {}) => {
+      const k = key.name || str;
+      if ((key.ctrl && k === 'c') || k === 'q' || k === 'escape') return quit();
+      const page = Math.max(1, (view.page || 10) - 1);
+      switch (k) {
+        case 'up': case 'k': view.sel -= 1; view.follow = false; view.scroll = 0; break;
+        case 'down': case 'j': view.sel += 1; view.follow = false; view.scroll = 0; break;
+        case 'home': case 'g': view.sel = key.shift ? Infinity : 0; view.follow = !!key.shift; view.scroll = 0; break;
+        case 'end': view.follow = true; view.scroll = 0; break;
+        case 'f': view.follow = !view.follow; view.scroll = 0; break;
+        case 'space': case 'pagedown': view.scroll += page; break;
+        case 'b': case 'pageup': view.scroll -= page; break;
+        default: return undefined;
+      }
+      if (str === 'G') { view.follow = true; view.scroll = 0; }
+      return draw();
+    });
+  }
+
+  for (;;) {
+    refreshFileChange();
+    draw();
     await sleep(interval * 1000);
   }
 }
@@ -765,7 +950,7 @@ function usage() {
   out(`${B}collab${R} — autonomous implementer ⇄ reviewer loop between two coding agents
 
 ${B}FOR YOU (the human)${R}
-  ${C}watch${R} [--interval S]        Live dashboard: status, whose turn, timers, timeline
+  ${C}watch${R} [--interval S]        Interactive dashboard: browse every step (↑↓), live progress
   ${C}note${R} "text" [-i | -r]      Steer a running task (default: both agents;
                               -i/--implementer or -r/--reviewer for just one)
   ${C}status${R}                      One-shot summary of the current task
@@ -784,6 +969,7 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
                               Start a task (brief on stdin or --file); --plan = plan approved first
   ${C}join${R}                        Reviewer: wait until a task exists, print its brief
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
+  ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
   ${C}submit${R} implementer <plan|ready|escalate>
   ${C}submit${R} reviewer <changes|approve|escalate>
                               Hand off the turn (message on stdin or --file PATH)
@@ -800,7 +986,7 @@ Exit codes: 0 ok · 10 finished · 11 wait timed out (re-run) · 12 new note · 
 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
-  snooze: cmdSnooze, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
+  snooze: cmdSnooze, progress: cmdProgress, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
   show: cmdShow, list: cmdList, abort: cmdAbort,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),

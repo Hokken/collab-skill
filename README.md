@@ -37,7 +37,7 @@ The installer links the skill into `~/.agents/skills/Collab` (read by Codex) and
 |---|---|
 | A: reviewer | Codex: `$Collab review` · Claude Code: `/Collab review` |
 | B: implementer | Claude Code: `/Collab implement`, then describe the task in your next message (add `--plan` to have the plan approved first) |
-| C: you | `collab watch` for the live dashboard |
+| C: you | `collab watch`: interactive dashboard (↑↓ browse steps, space/b scroll, f follow latest, q quit) |
 
 While it runs:
 
@@ -55,6 +55,8 @@ collab help                                   # everything else
 - `collab init` snapshots every git repo under the project (`git stash create`, which leaves
   your working tree untouched), so `collab diff` shows only what changed during the task, even
   in folders holding several nested repos.
+- While an agent has the turn, it posts short `collab progress "…"` updates at each step. They
+  show live in `collab watch`, in the other agent's `wait` output, and count as a sign of life.
 - Turns are enforced: an agent can't submit out of turn. A note from you that arrives mid-turn
   blocks that agent's next handoff until it has dealt with the note.
 - If the other agent hasn't handed off for 30 min (and, while implementing, no project file has

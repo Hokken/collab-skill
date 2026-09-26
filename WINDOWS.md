@@ -5,7 +5,7 @@
 > **Goal:** install Collab from this repo, verify the parts that could only be tested on macOS,
 > and fix whatever is Windows-specific.
 >
-> Collab is a Node.js CLI plus a skill. The CLI and its 16 automated tests pass on macOS, where it
+> Collab is a Node.js CLI plus a skill. The CLI and its 19 automated tests pass on macOS, where it
 > has also been used end to end (Claude Code implementing, Codex reviewing). **Nothing has been
 > run on Windows yet**, and `install.ps1` has not been executed anywhere.
 
@@ -42,7 +42,7 @@ If the script fails, fix it (it has never been run) and re-run it.
 
 ## 3. Automated tests
 
-- [ ] `node --test` in the repo: all 16 tests pass.
+- [ ] `node --test` in the repo: all 19 tests pass.
 
 These tests exercise git snapshots, file renames under concurrent reads, mtimes and UTF-8 bodies,
 which are exactly the areas where Windows differs. Fix any failures in `bin/collab.js`, not in the
@@ -64,6 +64,9 @@ In **new** terminals, after the PATH change:
       ```
       Also try piping a here-string (`@' … '@ | collab note`) and report whether accents survive.
       This depends on the PowerShell version; `--file` is the documented safe path.
+- [ ] **`collab watch` keys** in the VS Code terminal: ↑/↓ (and j/k) move between steps with the
+      full content shown below, space/b scroll, `f` toggles follow, `G` jumps to the latest, and
+      `q` quits. Keypresses must work in both PowerShell and Git Bash.
 - [ ] **`collab watch`** in the VS Code terminal redraws in place (no repeated frames in the
       scrollback), and Ctrl-C restores the terminal.
 - [ ] **Notification:** a `submit` shows a Windows toast (or at least rings the bell). If no
