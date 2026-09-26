@@ -33,6 +33,10 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 function Set-Junction([string]$Target, [string]$Path) {
   New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  # Already the target itself (e.g. installed with `npx skills add`; names may differ only in case).
+  if ($item -and -not $item.LinkType -and ($item.FullName.TrimEnd('\') -eq (Resolve-Path -LiteralPath $Target).Path.TrimEnd('\'))) {
+    Write-Host "ok      $Path"; return
+  }
   if ($item) {
     if ($item.LinkType -in @('Junction', 'SymbolicLink')) {
       $current = @($item.Target)[0]

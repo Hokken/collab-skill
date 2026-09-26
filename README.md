@@ -95,7 +95,17 @@ cd collab-skill
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer links the skill into `~/.agents/skills/Collab` (Codex) and
+**Or with the [skills](https://skills.sh) installer:**
+
+```bash
+npx skills add Hokken/collab-skill -g --agent claude-code codex
+~/.agents/skills/collab/install.sh      # puts the `collab` command on your PATH
+```
+
+On Windows, run `~\.agents\skills\collab\install.ps1` for the second step. Update later with
+`npx skills update`.
+
+The git installer links the skill into `~/.agents/skills/Collab` (Codex) and
 `~/.claude/skills/Collab` (Claude Code), and puts a `collab` command on your PATH. It only creates
 links, so **updating is just `git pull`**. Windows users: see [docs/windows.md](docs/windows.md)
 for a few tips.

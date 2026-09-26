@@ -43,7 +43,8 @@ dark mode`. Pass them straight to `collab init`:
 
 ## The CLI
 
-`collab` is on PATH (fallback: `node ~/.agents/skills/Collab/bin/collab.js`). Run `collab help` for details.
+`collab` is on PATH. If it isn't, run `node <this skill's folder>/bin/collab.js` instead (the folder that
+contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help` for details.
 
 - **Pin your task:** once `collab init` (implementer) or `collab join` (reviewer) prints the
   task id, pass `-t <task-id>` as the first argument on **every** later call, e.g.

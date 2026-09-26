@@ -20,6 +20,10 @@ mkdir -p "$(dirname "$SKILL_LINK")" "$(dirname "$CLAUDE_LINK")" "$BIN"
 # link <target> <path>: make <path> a symlink to <target>; a real folder/file is backed up first
 link() {
   local target="$1" dest="$2"
+  # Already the target itself (e.g. installed with `npx skills add`, and names differ only in case).
+  if [ -d "$dest" ] && [ ! -L "$dest" ] && [ "$(cd "$dest" && pwd -P)" = "$(cd "$target" && pwd -P)" ]; then
+    echo "ok      $dest"; return
+  fi
   if [ -L "$dest" ]; then
     if [ "$(readlink "$dest")" = "$target" ]; then echo "ok      $dest"; return; fi
     rm "$dest"
@@ -33,7 +37,11 @@ link() {
   echo "linked  $dest -> $target"
 }
 
-link "$REPO" "$SKILL_LINK"
+# Installed with `npx skills add`? Then this folder already is the skill; only link what's missing.
+case "$(cd "$REPO/.." && pwd -P)" in
+  "$(mkdir -p "$HOME/.agents/skills" && cd "$HOME/.agents/skills" && pwd -P)") echo "ok      $REPO (installed by npx skills)" ;;
+  *) link "$REPO" "$SKILL_LINK" ;;
+esac
 link "$REPO" "$CLAUDE_LINK"
 link "$REPO/bin/collab.js" "$BIN/collab"
 
