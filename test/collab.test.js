@@ -358,13 +358,14 @@ test('progress: attribution, notes hand-over, wait output and finished tasks', (
 });
 
 test('progress keeps a slow agent from looking unresponsive', async () => {
-  const s = sandbox({ COLLAB_IDLE_SECS: '2', COLLAB_QUIET_MINS: '1' });
+  // Generous idle limit and a single-pass wait, so slow CI machines can't turn "fresh" into "stale".
+  const s = sandbox({ COLLAB_IDLE_SECS: '4', COLLAB_QUIET_MINS: '1' });
   s.run(['init', 'slow'], { input: 'b' });
   s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-  await pause(2500);
+  await pause(4500);
   assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13, 'silent reviewer looks unresponsive');
   s.run(['progress', 'still reviewing, big diff']);
-  assert.equal(s.run(['wait', 'implementer', '--timeout', '1']).code, 11, 'a fresh progress post counts as activity');
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '0']).code, 11, 'a fresh progress post counts as activity');
 });
 
 test('watch --once renders every step, the live row and the selected step', () => {
