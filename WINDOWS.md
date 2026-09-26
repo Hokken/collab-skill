@@ -5,7 +5,7 @@
 > **Goal:** install Collab from this repo, verify the parts that could only be tested on macOS,
 > and fix whatever is Windows-specific.
 >
-> Collab is a Node.js CLI plus a skill. The CLI and its 15 automated tests pass on macOS, where it
+> Collab is a Node.js CLI plus a skill. The CLI and its 16 automated tests pass on macOS, where it
 > has also been used end to end (Claude Code implementing, Codex reviewing). **Nothing has been
 > run on Windows yet**, and `install.ps1` has not been executed anywhere.
 
@@ -42,7 +42,7 @@ If the script fails, fix it (it has never been run) and re-run it.
 
 ## 3. Automated tests
 
-- [ ] `node --test` in the repo: all 15 tests pass.
+- [ ] `node --test` in the repo: all 16 tests pass.
 
 These tests exercise git snapshots, file renames under concurrent reads, mtimes and UTF-8 bodies,
 which are exactly the areas where Windows differs. Fix any failures in `bin/collab.js`, not in the

@@ -434,14 +434,15 @@ async function cmdWait(args) {
       exit(EXIT_TERMINAL);
     }
     if (st.turn === role) {
-      out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
-      out(`project: ${st.project_dir}`);
       // Everything since my last own entry: the other agent's message plus any human notes.
+      // Mark it seen before printing, so a reader that closes the pipe early can't lose that.
       const mine = listEntries(d).filter((f) => roleOf(f) === role).slice(-1)[0];
       let fresh = entriesAfter(d, mine ? seqOf(mine) : -1).filter((f) => !f.endsWith(`-human-note-${other}.md`));
       if (!fresh.length) fresh = [latestEntry(d)];
-      for (const f of fresh) printEntry(d, f);
       withLock(d, () => update(d, (s) => markSeen(s, role)));
+      out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
+      out(`project: ${st.project_dir}`);
+      for (const f of fresh) printEntry(d, f);
       return;
     }
     const idle = idleReason(st);
@@ -818,6 +819,12 @@ async function main(argv) {
   if (!fn) { usage(); exit(1); }
   return fn(rest);
 }
+
+// A reader that closes the pipe early (e.g. `collab log | head`) is not an error.
+process.stdout.on('error', (e) => {
+  if (e.code === 'EPIPE') process.exit(process.exitCode || 0);
+  throw e;
+});
 
 main(process.argv.slice(2)).catch((e) => {
   if (e instanceof ExitCode) {

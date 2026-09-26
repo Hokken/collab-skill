@@ -312,6 +312,22 @@ test('state written by the bash version (no phase/seen/plan_round) still works',
   assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
 });
 
+test('output piped into a reader that exits early does not crash or lose state', { skip: process.platform === 'win32' }, () => {
+  const s = sandbox();
+  s.run(['init', 'pipe'], { input: 'b' });
+  s.run(['note', 'a note for everyone']);
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1 (note handled)' });
+  const big = 'line\n'.repeat(20000);
+  s.run(['note', '-r', big]);
+  const r = spawnSync('sh', ['-c', `"${process.execPath}" "${CLI}" wait reviewer --timeout 1 | head -1`], {
+    cwd: s.project, encoding: 'utf8', env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0' },
+  });
+  assert.equal(r.stderr, '');
+  assert.match(r.stdout, /^YOUR TURN/);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10, 'notes shown before the pipe closed count as seen');
+});
+
 test('help and unknown commands', () => {
   const s = sandbox();
   let r = s.run(['help']);
