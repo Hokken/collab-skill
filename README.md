@@ -181,7 +181,63 @@ collab abort                                  # stop both agents
 ```
 
 When it's finished, both agents give you a short report. `collab clean` tidies up old tasks.
-Everything else is in `collab help`.
+
+## Command reference
+
+The same list as `collab help`, grouped by what you'd use it for. 🤖 marks commands the agents
+also run themselves.
+
+**Watch and steer**
+
+| Command | What it does |
+|---|---|
+| `collab watch [--interval S]` | Interactive dashboard: steps (↑↓), tasks (←→), live progress |
+| `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer) |
+| `collab snooze [MIN]` | Keep waiting on a slow agent: no idle prompt for MIN minutes (default 30). 🤖 when you answer *keep waiting* |
+| `collab abort` | Stop the current task; both agents exit their loop. 🤖 when you answer *stop* |
+
+**Look at a task**
+
+| Command | What it does |
+|---|---|
+| `collab status` | One-shot summary of the current task. 🤖 after an unexpected exit code |
+| `collab log` | Full history: brief, summaries, reviews, notes |
+| `collab show [N]` | Print entry #N (default: the latest one) |
+| `collab diff [--stat]` | What changed in the project since the task started. 🤖 the reviewer, on every review |
+| `collab list` | All tasks (`*` = current) with status and round |
+| `collab path` | Folder holding the current task's files |
+
+**Queue and housekeeping**
+
+| Command | What it does |
+|---|---|
+| `collab queue` | List queued tasks (`*` = this project) |
+| `collab queue add [options] "task"` | Queue a task; the implementer starts it after the current one (options [above](#queue-up-a-mornings-work)) |
+| `collab queue rm N` · `move N M` · `clear [--all]` | Edit the queue |
+| `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks (asks first; `-n` dry run, `-y` no prompt) |
+| `collab help` | Print this list |
+
+Add `-t <task-id>` to any command to target a task other than the current one.
+
+<details>
+<summary><b>Commands the agents run</b> (the skill handles these, you normally don't need them)</summary>
+
+| Command | What it does |
+|---|---|
+| `collab init <slug> [options] [--from-queue [--confirmed "answer"]]` | Start a task (brief on stdin or `--file`) |
+| `collab queue next` · `queue skip` | Show / drop the next queued task for this project |
+| `collab queue split [--reason TEXT]` | Implementer: split the current task (parts on stdin, separated by `=== part ===` lines); part 1 stays, the rest queue next |
+| `collab check` | Run the task's `--check` command |
+| `collab join` | Reviewer: wait until a task exists, print its brief |
+| `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |
+| `collab progress "text"` | Post what you're doing now (shown to the other side) |
+| `collab submit implementer <plan\|ready\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
+| `collab submit reviewer <changes\|approve\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
+
+Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` new note · `13` other agent idle ·
+`14` check failed · `15` queue empty · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
+
+</details>
 
 ## FAQ
 
