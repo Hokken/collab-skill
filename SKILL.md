@@ -113,13 +113,17 @@ collab -t <id> progress "fixing item 2: missing null check in parser.ts"
 ## How to wait (depends on which CLI you are)
 
 Waiting is a blocking shell command, so polling doesn't use model tokens. **Never end your
-turn while the task is active.** Keep waiting until you see exit 10.
+turn while you are in the loop**, and that includes the reviewer waiting in `collab join` for a
+task that doesn't exist yet. Exit 11 from `wait` or `join` only means "not yet": run the same
+command again. Keep waiting until you see exit 10 (or exit 13, see above). If the user wants you
+to stop, they will interrupt you.
 
 - **Claude Code:** run `collab wait <role> --timeout 3300` (or `collab join --timeout 3300`)
   with the Bash tool's `run_in_background: true`. You are re-invoked when it exits. Read its
   output, then act on the exit code.
-- **Codex CLI:** run `collab wait <role> --timeout 540` in the foreground with a shell timeout
-  of at least 600000 ms. On exit 11, run it again immediately. Don't stop to ask the user.
+- **Codex CLI:** run `collab wait <role> --timeout 540` (or `collab join --timeout 540`) in the
+  foreground with a shell timeout of at least 600000 ms. Don't pick a shorter `--timeout`. On
+  exit 11, run it again immediately. Don't stop to ask the user and don't end your turn.
 
 ## Implementer loop
 
@@ -141,6 +145,7 @@ turn while the task is active.** Keep waiting until you see exit 10.
    what changed during this task. Tell the user the task id and that the reviewer can now
    be started with `collab review` (Claude Code: `/Collab review`, Codex: `$Collab review`),
    and that they can watch live with `collab watch` and steer with `collab note "…"`.
+   If the task is too big for one review, split it now (see *Splitting a task*).
    In plan mode, go through the *Plan phase* first, then continue at step 2.
 2. **Implement.** Follow the project's own rules (CLAUDE.md / AGENTS.md: commits, dev servers
    and so on). If the task has a `--branch`, create or switch to it before changing anything.
@@ -179,6 +184,8 @@ the project folder it was added from. `collab queue next` shows the first one fo
 folder, with its options.
 
 1. If the output says **CONFIRM FIRST**, ask the user before starting: start, skip, or stop.
+   If it also says **HELD**, an earlier part of the same split task didn't get approved. Say so
+   in your question.
    (Claude Code: AskUserQuestion; Codex: plain text, then end your turn.) *Skip* runs
    `collab queue skip` and moves on to the next one; *stop* ends the loop.
 2. Turn the task text into a brief as usual, then start it with
@@ -188,6 +195,36 @@ folder, with its options.
    answer in the task's timeline.
 3. Tell the user which queued task you started and how many are left, then continue the
    implementer loop from step 2 (or the *Plan phase*).
+
+## Splitting a task (implementer)
+
+Use `collab queue split` when a task from the user is too big to review well in one pass, for
+example when it has several independent changes, or a refactor followed by a feature on top of it.
+Don't split small tasks. Each part must be something the reviewer can approve on its own, and
+it must leave the project working.
+
+Split **right after `collab init`**, before your first `plan` or `ready`. The CLI refuses later
+on, refuses to split twice, and refuses to split a task that is already a part. Always use
+`queue split`, never a series of `queue add` calls: it keeps the parts in order, at the front of
+the queue, with the task's options (`--check`, `--scope`, `--branch`, `--commit`, …).
+
+```
+collab -t <id> queue split --reason "3 independent changes; easier to review one by one" <<'EOF'
+Part 1: what this task now covers, and its acceptance criteria
+=== part ===
+Part 2: goal, scope and acceptance criteria, written so it can be started on its own
+=== part ===
+Part 3: …
+EOF
+```
+
+- Part 1 stays the current task. The CLI adds a `split` entry to its timeline, so the
+  reviewer sees that only part 1 is in scope.
+- Parts 2..N are queued next for this project. Each will be its own task with its own review,
+  and its brief says which part it is. You start them later through *Queued tasks*, as usual.
+- Tell the user how you split the work (one line per part). They can edit the queue with
+  `collab queue rm` / `move`.
+- In plan mode, split before submitting the plan, and make the plan cover part 1 only.
 
 ## Plan phase (only for tasks started with `--plan`)
 
@@ -205,12 +242,15 @@ folder, with its options.
   Once the status is `IMPLEMENTING`, the plan is approved and you start coding (step 2).
 - **Reviewer:** when the status is `PLAN_REVIEW`, judge the plan against the brief and the
   codebase: whether it's the right approach, fits existing patterns, misses a step, carries a
-  risk, or is over-engineered. Use `changes` (numbered items) or `approve`. In this phase,
+  risk, or is over-engineered. If the implementer split the task, judge the split too. Use
+  `changes` (numbered items) or `approve`. In this phase,
   `approve` starts the implementation; it does **not** end the task.
 
 ## Reviewer loop
 
 1. **Join** with `collab join`. It blocks until an active task exists, then prints the brief.
+   The implementer may take several minutes to write the brief. On exit 11, run `collab join`
+   again, as many times as it takes (see *How to wait*). Never end your turn with "no active task".
 2. **Wait** with `collab wait reviewer`.
 3. **Review** (on exit 0):
    - Treat the implementer's summary as a guide, not proof. Run `collab diff --stat`, then
@@ -224,6 +264,10 @@ folder, with its options.
      shows `⚠ OUTSIDE SCOPE`, treat it as blocking unless the change is clearly required. A
      `check passed` line in the summary means the check command succeeded; you can run
      `collab check` yourself too.
+   - If the task was split (a `split` entry, or a *Part of a split task* section in the brief),
+     review only this part. Don't flag work that belongs to the other parts as missing. If the
+     split itself is wrong (a part can't stand on its own, or leaves the project broken), say
+     so as a blocking item.
    - If the status is `PLAN_REVIEW`, follow the *Plan phase* rules instead.
 4. **Decide:**
    - Blocking issues found → `collab submit reviewer changes`:
@@ -257,4 +301,5 @@ The round limit (default 4) escalates automatically. After escalating, stop and 
 - `collab status`, `collab log`, `collab list`, `collab abort` (stops both loops)
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks
 - `collab queue add [options] "…"`, `collab queue`, `collab queue rm N`: manage the task queue
+- `collab queue split [--reason TEXT]`: implementer only, split the current task (see *Splitting a task*)
 State lives in `~/.collab/tasks/<task-id>/` (`state.json`, `log.md`, `entries/`).

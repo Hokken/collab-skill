@@ -32,6 +32,7 @@ const IDLE = envInt('COLLAB_IDLE_SECS', 1800);         // 30 min without a hando
 const QUIET_MINS = envInt('COLLAB_QUIET_MINS', 10);    // ...and no project file changed for this long
 const DEFAULT_MAX_ROUNDS = envInt('COLLAB_MAX_ROUNDS', 4);
 const CHECK_TIMEOUT = envInt('COLLAB_CHECK_TIMEOUT', 1800); // --check commands time out after 30 min
+const LOCK_WAIT = envInt('COLLAB_LOCK_SECS', 10);      // wait this long before checking a lock's owner (tests lower it)
 
 const EXIT_TERMINAL = 10;
 const EXIT_TIMEOUT = 11;
@@ -131,7 +132,10 @@ function currentId() {
   try { return fs.readFileSync(path.join(COLLAB_HOME, 'current'), 'utf8').trim(); } catch { return ''; }
 }
 
-const rawTaskId = () => TASK_OVERRIDE || process.env.COLLAB_TASK || currentId();
+// Default task: the newest one for the project folder we're in, else the most recent one anywhere.
+// So two pairs working in different projects never pick up each other's task.
+const projectTaskId = () => projectTasks(process.cwd()).slice(-1)[0] || '';
+const rawTaskId = () => TASK_OVERRIDE || process.env.COLLAB_TASK || projectTaskId() || currentId();
 
 function taskDir() {
   const id = rawTaskId();
@@ -163,18 +167,49 @@ function update(d, fn, { touch = true } = {}) {
   return st;
 }
 
+// The lock is a directory holding an 'owner' file ("<pid> <token>"). Locks are held for
+// milliseconds, so one still there after LOCK_WAIT is stale only if its owner process is gone.
+const lockOwner = (l) => { try { return fs.readFileSync(path.join(l, 'owner'), 'utf8').trim(); } catch { return ''; } };
+
+function ownerAlive(owner) {
+  const pid = parseInt(owner, 10);
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function lockIsStale(l, owner) {
+  if (owner) return !ownerAlive(owner);
+  // No owner file: either being created right now, or its creator died in between.
+  try { return Date.now() - fs.statSync(l).mtimeMs > 30000; } catch { return false; }
+}
+
+// Move a stale lock out of the way. The rename is atomic, so of several waiters only one
+// wins; if the lock changed hands since we looked, put it back.
+function breakLock(l, owner) {
+  const grave = `${l}.stale-${process.pid}-${Date.now()}`;
+  try { fs.renameSync(l, grave); } catch { return; }
+  if (lockOwner(grave) === owner) {
+    process.stderr.write(`collab: broke stale lock ${l}\n`);
+    fs.rmSync(grave, { recursive: true, force: true });
+  } else {
+    try { fs.renameSync(grave, l); } catch { fs.rmSync(grave, { recursive: true, force: true }); }
+  }
+}
+
 function withLock(d, fn) {
   const l = path.join(d, '.lock');
+  const me = `${process.pid} ${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   let start = Date.now();
   for (;;) {
     try {
       fs.mkdirSync(l);
+      fs.writeFileSync(path.join(l, 'owner'), me);
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      if (Date.now() - start > 10000) {
-        process.stderr.write(`collab: breaking stale lock ${l}\n`);
-        try { fs.rmdirSync(l); } catch { /* someone else did */ }
+      if (Date.now() - start > LOCK_WAIT * 1000) {
+        const owner = lockOwner(l);
+        if (lockIsStale(l, owner)) breakLock(l, owner);
         start = Date.now();
       } else {
         sleepSync(100);
@@ -184,7 +219,7 @@ function withLock(d, fn) {
   try {
     return fn();
   } finally {
-    try { fs.rmdirSync(l); } catch { /* already gone */ }
+    if (lockOwner(l) === me) fs.rmSync(l, { recursive: true, force: true });
   }
 }
 
@@ -408,6 +443,20 @@ function withQueue(fn) {
 }
 
 const forProject = (q, dir) => q.items.filter((it) => it.project_dir === realDir(dir));
+const partLabel = (p) => `part ${p.index}/${p.total} of ${p.parent}`;
+
+// A split part that ends without approval holds back its later parts: each one then needs
+// the user's go-ahead (the --confirm flow) instead of starting on top of unfinished work.
+function holdParts(st) {
+  if (!st.part || !isTerminal(st.status) || st.status === 'DONE') return;
+  withQueue((q) => {
+    for (const it of q.items) {
+      if (!it.part || it.part.parent !== st.part.parent || it.part.index <= st.part.index) continue;
+      it.options = { ...it.options, confirm: true };
+      it.held = `${partLabel(st.part)} (${st.id}) ended ${st.status}`;
+    }
+  });
+}
 const queueCount = (dir) => forProject(readQueue(), dir).length;
 
 function queueLine(dir) {
@@ -417,21 +466,55 @@ function queueLine(dir) {
 
 // --- --check and --scope ---------------------------------------------------------------
 
+// Stop a check and everything it started (a shell's children would outlive a plain kill).
+function killTree(child) {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  } else {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+  }
+}
+
 function runCheck(st) {
   const cmd = st.options && st.options.check;
   const started = Date.now();
-  const r = spawnSync(cmd, {
-    cwd: st.project_dir, shell: true, encoding: 'utf8', timeout: CHECK_TIMEOUT * 1000,
-    maxBuffer: 64 * 1024 * 1024, env: process.env, windowsHide: true,
+  return new Promise((resolve) => {
+    // Own process group on Unix, so killTree reaches the whole group.
+    const child = spawn(cmd, {
+      cwd: st.project_dir, shell: true, env: process.env, windowsHide: true,
+      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    const keep = (buf) => { output = (output + buf.toString('utf8')).slice(-256 * 1024); };
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+    let timedOut = false;
+    let error = null;
+    let code = null;
+    let done = false;
+    let grace = null;
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, CHECK_TIMEOUT * 1000);
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      const secs = Math.round((Date.now() - started) / 1000);
+      const tail = output.replace(/\s+$/, '').split('\n').slice(-60).join('\n');
+      let why = '';
+      if (timedOut) why = `timed out after ${CHECK_TIMEOUT}s`;
+      else if (error) why = error.message;
+      else if (code !== 0) why = `exit code ${code}`;
+      resolve({ ok: !why, cmd, secs, why, tail });
+    };
+    child.on('error', (e) => { error = e; finish(); });
+    // 'close' waits for the output pipes; a background process that keeps them open
+    // must not hang the handoff, so give up on them shortly after the shell exits.
+    child.on('exit', (c) => { code = c; grace = setTimeout(finish, 2000); });
+    child.on('close', (c) => { if (code === null) code = c; finish(); });
   });
-  const secs = Math.round((Date.now() - started) / 1000);
-  const output = `${r.stdout || ''}${r.stderr || ''}`.replace(/\s+$/, '');
-  const tail = output.split('\n').slice(-60).join('\n');
-  let why = '';
-  if (r.error && r.error.code === 'ETIMEDOUT') why = `timed out after ${CHECK_TIMEOUT}s`;
-  else if (r.error) why = r.error.message;
-  else if (r.status !== 0) why = `exit code ${r.status}`;
-  return { ok: !why, cmd, secs, why, tail };
 }
 
 function printCheck(res) {
@@ -503,10 +586,10 @@ function cmdInit(args) {
   const dir = path.resolve(opts.dir || process.cwd());
   if (!fs.existsSync(dir)) die(`no such directory: ${dir}`);
 
-  const cur = currentId();
-  if (cur && fs.existsSync(statePath(path.join(TASKS, cur))) && !opts.force) {
-    const st = readState(path.join(TASKS, cur));
-    if (!isTerminal(st.status)) die(`task '${cur}' is still active (${st.status}). Finish/abort it or pass --force.`);
+  // One active task per project; other projects can run their own pair at the same time.
+  if (!opts.force) {
+    const busy = projectTasks(dir).map((id) => readState(path.join(TASKS, id))).find((t) => !isTerminal(t.status));
+    if (busy) die(`task '${busy.id}' is still active in this project (${busy.status}). Finish/abort it or pass --force.`);
   }
 
   let brief = readBody(opts.file);
@@ -529,6 +612,11 @@ function cmdInit(args) {
   delete options.confirm;
   const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
   brief += optionsSection(options);
+  const part = item && item.part;
+  if (part) {
+    brief += `\n## Part of a split task (set by collab)\nThis is ${partLabel(part)}, split up by the implementer. `
+      + 'Only this part is in scope. The other parts are separate tasks with their own reviews, so work they will do is not missing here.\n';
+  }
 
   const id = `${slug}-${localStamp()}`;
   const d = path.join(TASKS, id);
@@ -558,6 +646,7 @@ function cmdInit(args) {
     turn_since: ep, options,
   };
   if (item) st.queue_item = item.id;
+  if (part) st.part = part;
   fs.writeFileSync(path.join(d, 'log.md'), `# collab task: ${id}\nproject: ${dir}\n`);
   addEntry(d, st, 'implementer', 'brief', brief);
   st.seq = 1;
@@ -575,7 +664,7 @@ function cmdInit(args) {
   out(`max rounds: ${max}`);
   out(`phase:   ${st.phase}`);
   if (describeOpts(options).length) out(`options: ${describeOpts(options).join(' · ')}`);
-  if (item) out(`from queue: #${item.id} (${queueCount(dir)} more waiting for this project)`);
+  if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   if (plan) out("Next: write a plan (no code yet), then 'collab submit implementer plan' with it on stdin.");
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
@@ -599,7 +688,8 @@ async function cmdJoin(args) {
       }
     }
     if (epoch() - start >= timeout) {
-      out("no active task yet — run 'collab join' again");
+      out(`no active task yet (waited ${fmtDur(epoch() - start)}). This is normal: the implementer may still be writing the brief.`);
+      out("Run 'collab join' again right away. Keep waiting; don't end your turn.");
       exit(EXIT_TIMEOUT);
     }
     await sleep(POLL * 1000);
@@ -642,7 +732,7 @@ async function cmdWait(args) {
       exit(EXIT_IDLE);
     }
     if (epoch() - lastActivity(st) >= STALL && epoch() >= (st.snooze_until || 0)) {
-      withLock(d, () => update(d, (s) => { s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; }));
+      holdParts(withLock(d, () => update(d, (s) => { s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; })));
       notify(`${st.id}: STALLED (no handoff for ${Math.floor(STALL / 60)} min)`);
       out(`TASK FINISHED: STALLED — the other agent has not handed off for ${Math.floor(STALL / 60)} min`);
       exit(EXIT_TERMINAL);
@@ -687,7 +777,7 @@ function transition(st, role, kind) {
   }
 }
 
-function cmdSubmit(args) {
+async function cmdSubmit(args) {
   const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' } });
   const [role, kind] = rest;
   const d = taskDir();
@@ -697,7 +787,7 @@ function cmdSubmit(args) {
   const pre = readState(d);
   if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build' && pre.turn === role
       && !isTerminal(pre.status) && pre.options && pre.options.check) {
-    const res = runCheck(pre);
+    const res = await runCheck(pre);
     if (!res.ok) {
       out('NOT SUBMITTED: the task check failed. Fix it and submit again (or escalate if it cannot pass).');
       printCheck(res);
@@ -736,6 +826,7 @@ function cmdSubmit(args) {
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
   notify(`${st.id}: ${st.status}`);
+  holdParts(st);
   if (st.status === 'DONE' && queueLine(st.project_dir)) out(queueLine(st.project_dir));
   if (isTerminal(st.status)) exit(EXIT_TERMINAL);
 }
@@ -785,14 +876,14 @@ function cmdProgress(args) {
   }
 }
 
-function cmdCheck() {
+async function cmdCheck() {
   const d = taskDir();
   const st = readState(d);
   if (!st.options || !st.options.check) {
     out('This task has no check command (add one with --check "…" on init or queue add).');
     return;
   }
-  const res = runCheck(st);
+  const res = await runCheck(st);
   printCheck(res);
   if (!res.ok) exit(EXIT_CHECK);
 }
@@ -801,7 +892,7 @@ function cmdQueue(args) {
   const [sub = 'list', ...rest] = args;
   const firstLine = (t) => t.split('\n').find((l) => l.trim()) || '';
   const show = (it) => {
-    const bits = describeOpts(it.options);
+    const bits = [...(it.part ? [partLabel(it.part)] : []), ...describeOpts(it.options)];
     return `#${it.id}  [${path.basename(it.project_dir)}]  ${[...firstLine(it.text)].slice(0, 70).join('')}${bits.length ? `\n        ${bits.join(' · ')}` : ''}`;
   };
 
@@ -844,7 +935,9 @@ function cmdQueue(args) {
     const it = items[0];
     out(`NEXT QUEUED TASK #${it.id} (1 of ${items.length} for this project)`);
     out(`project: ${it.project_dir}`);
+    if (it.part) out(`split:   ${partLabel(it.part)} (queued by the implementer; don't split it again)`);
     out(`options: ${describeOpts(it.options).join(' · ') || 'none'}`);
+    if (it.held) out(`HELD: ${it.held}, so this part may build on unfinished work.`);
     if (it.options && it.options.confirm) out('CONFIRM FIRST: ask the user before starting this task (start / skip / stop).');
     out('----- task -----');
     process.stdout.write(it.text.endsWith('\n') ? it.text : `${it.text}\n`);
@@ -862,6 +955,51 @@ function cmdQueue(args) {
     });
     if (!it) { out(`the queue has no task for ${dir}`); exit(EXIT_EMPTY); }
     out(`skipped #${it.id}: ${firstLine(it.text)}`);
+    return;
+  }
+
+  // The implementer splits its current task: part 1 stays this task, the rest are queued
+  // right after it with the same options. Only once, before the first handoff.
+  if (sub === 'split') {
+    const { opts } = takeOpts(rest, { values: { '--file': 'file', '-f': 'file', '--reason': 'reason' } }, { strict: true });
+    const parts = readBody(opts.file).split(/^[ \t]*=== *part *===[ \t]*$/im).map((p) => p.trim()).filter(Boolean);
+    if (parts.length < 2) die("queue split needs at least 2 parts, separated by '=== part ===' lines (on stdin or --file)");
+    const d = taskDir();
+    const res = withLock(d, () => {
+      const st = readState(d);
+      if (isTerminal(st.status)) die(`task already finished (${st.status})`);
+      if (st.turn !== 'implementer') die(`not your turn (implementer); current turn: ${st.turn}, status: ${st.status}`);
+      if (st.part) die(`this task is already ${partLabel(st.part)}; a part can't be split again`);
+      if (listEntries(d).some((f) => roleOf(f) === 'implementer' && ['plan', 'ready'].includes(kindOf(f)))) {
+        die('too late to split: you already handed off. Split only before your first plan or ready.');
+      }
+      const total = parts.length;
+      const options = { ...(st.options || {}) };
+      delete options.confirm;
+      const queued = withQueue((q) => {
+        const dir = realDir(st.project_dir);
+        const at = q.items.findIndex((it) => it.project_dir === dir);
+        const items = parts.slice(1).map((text, i) => ({
+          id: q.next_id + i, added_at: nowIso(), added_by: 'implementer', project_dir: dir,
+          text: `${text}\n`, options, part: { index: i + 2, total, parent: st.id },
+        }));
+        q.next_id += items.length;
+        q.items.splice(at < 0 ? q.items.length : at, 0, ...items);
+        return items;
+      });
+      const body = [
+        `## Task split into ${total} parts`,
+        ...(opts.reason ? ['', `Why: ${opts.reason.trim()}`] : []),
+        '', 'This task now covers **part 1 only**:', '', parts[0], '',
+        "Queued as separate tasks, each with its own review. Don't flag their work as missing here:",
+        ...queued.map((it) => `- #${it.id} part ${it.part.index}/${total}: ${firstLine(it.text)}`),
+        '',
+      ].join('\n');
+      addEntry(d, st, 'implementer', 'split', body);
+      update(d, (s) => { s.seq += 1; s.part = { index: 1, total, parent: st.id }; s.updated_by = 'implementer'; });
+      return { total, queued };
+    });
+    out(`split into ${res.total} parts: this task is part 1; queued ${res.queued.map((it) => `#${it.id}`).join(', ')} next for this project`);
     return;
   }
 
@@ -900,7 +1038,7 @@ function cmdQueue(args) {
     return;
   }
 
-  die('usage: collab queue [list | add [options] "task" | next | skip | rm N | move N M | clear [--all]]');
+  die('usage: collab queue [list | add [options] "task" | next | skip | split [--reason TEXT] | rm N | move N M | clear [--all]]');
 }
 
 function cmdSnooze(args) {
@@ -1044,19 +1182,30 @@ function cmdList() {
 function cmdAbort() {
   const d = taskDir();
   const st = withLock(d, () => update(d, (s) => { s.status = 'ABORTED'; s.turn = 'none'; s.updated_by = 'human'; }));
+  holdParts(st);
   out(`aborted ${st.id}`);
 }
 
 // --- watch ------------------------------------------------------------------
 
-// Task ids that belong to the same project folder, oldest first.
+// Task ids that belong to the same project folder, oldest first. A task's project and
+// creation time never change, so each state file is read once per process, not on every poll.
+const taskMeta = new Map();
 function projectTasks(dir) {
   const want = realDir(dir);
-  return taskIds()
-    .map((id) => { try { return readState(path.join(TASKS, id)); } catch { return null; } })
-    .filter((t) => t && realDir(t.project_dir) === want)
-    .sort((a, b) => (a.created_epoch || 0) - (b.created_epoch || 0) || a.id.localeCompare(b.id))
-    .map((t) => t.id);
+  const metas = [];
+  for (const id of taskIds()) {
+    if (!taskMeta.has(id)) {
+      try {
+        const t = readState(path.join(TASKS, id));
+        taskMeta.set(id, { id, dir: realDir(t.project_dir), created: t.created_epoch || 0 });
+      } catch { continue; }
+    }
+    metas.push(taskMeta.get(id));
+  }
+  return metas.filter((m) => m.dir === want)
+    .sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))
+    .map((m) => m.id);
 }
 
 // Fit coloured segments into a fixed width: [[text, colour], ...] -> string of exactly `width` columns.
@@ -1137,7 +1286,8 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   const lines = [];
   const waiting = queueCount(st.project_dir);
   const taskPos = view.siblings.length > 1 ? `  ${D}task ${pos + 1}/${view.siblings.length}${view.pinned ? ' (←→)' : ''}${R}` : '';
-  lines.push(`${B}collab watch${R}  ${st.id}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
+  const partPos = st.part ? `  ${Y}part ${st.part.index}/${st.part.total}${R}` : '';
+  lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
   lines.push(`${D}project${R} ${st.project_dir}`);
   const live = active ? liveProgress(st) : null;
   if (active) {
@@ -1341,6 +1491,8 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}init${R} <slug> [options] [--from-queue [--confirmed "answer"]]
                               Start a task (brief on stdin or --file)
   ${C}queue next${R} · ${C}queue skip${R}     Show / drop the next queued task for this project
+  ${C}queue split${R} [--reason TEXT] Implementer: split the current task (parts on stdin, separated
+                              by '=== part ===' lines); part 1 stays, the rest queue next
   ${C}check${R}                       Run the task's --check command
   ${C}join${R}                        Reviewer: wait until a task exists, print its brief
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)

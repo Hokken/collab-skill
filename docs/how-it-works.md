@@ -38,6 +38,13 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
 - When a task ends `DONE` and more items are waiting, `wait` and the reviewer's `approve` print a
   `QUEUE:` line. The implementer starts the next item, and the reviewer runs `collab join` again.
   Any other ending (`ESCALATED`, `STALLED`, `ABORTED`) pauses the queue.
+- `collab queue split` (implementer, once, before its first `plan` or `ready`) splits the current
+  task. The parts come on stdin, separated by `=== part ===` lines. Part 1 stays the current task
+  and gets a `split` timeline entry. Parts 2..N are inserted ahead of this project's other queued
+  items, with the task's options and a `part` marker (`index`, `total`, `parent`). A task started
+  from a part gets a *Part of a split task* section in its brief and can't be split again. If a
+  part ends `ESCALATED`, `ABORTED` or `STALLED`, its later parts are held: `queue next` shows
+  `HELD:` and `CONFIRM FIRST`, and they need the user's go-ahead.
 - Options are stored in `state.json` and summarised in a *Task options* section of the brief:
   - `--check` is enforced: `submit implementer ready` runs it in the project folder and refuses with
     exit 14 on failure. On success, a `check passed` line is appended to the summary.

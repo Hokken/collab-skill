@@ -261,7 +261,9 @@ test('join waits for a new task when the current one is finished', () => {
   const s = sandbox();
   s.run(['init', 'old'], { input: 'b' });
   s.run(['abort']);
-  assert.equal(s.run(['join', '--timeout', '1']).code, 11);
+  const idle = s.run(['join', '--timeout', '1']);
+  assert.equal(idle.code, 11);
+  assert.match(idle.out, /run 'collab join' again right away.*don't end your turn/i);
   s.run(['init', 'new'], { input: 'fresh brief' });
   const r = s.run(['join', '--timeout', '1']);
   assert.equal(r.code, 0);
@@ -487,6 +489,40 @@ test('--check must pass before the implementer hands off', () => {
   assert.match(s.run(['-t', s.state().id, 'status']).out, /options: check `node -e/);
 });
 
+test('a --check that times out is stopped with everything it started', async () => {
+  const s = sandbox({ COLLAB_CHECK_TIMEOUT: '1' });
+  // The shell has to stay around for the '&&', so node is its child, not the shell itself.
+  const check = `node -e "setTimeout(() => require('fs').writeFileSync('late.flag', 'x'), 3000)" && echo done`;
+  s.run(['init', 'slow', '--check', check], { input: 'b' });
+  const r = s.run(['check']);
+  assert.equal(r.code, 14);
+  assert.match(r.out, /CHECK FAILED: .* timed out after 1s/);
+  await pause(3500);
+  assert.ok(!fs.existsSync(path.join(s.project, 'late.flag')), 'the grandchild was stopped too');
+});
+
+test('a stale lock is broken only when its owner is gone', () => {
+  const s = sandbox({ COLLAB_LOCK_SECS: '1' });
+  s.run(['init', 'lock'], { input: 'b' });
+  const lock = path.join(s.taskDir(), '.lock');
+  // Owned by a live process (this test runner): never broken, so the note times out.
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} live`);
+  let r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'collab.js'), 'note', 'hi'], {
+    cwd: s.project, encoding: 'utf8', timeout: 4000,
+    env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0', COLLAB_TASK: '', COLLAB_LOCK_SECS: '1' },
+  });
+  assert.ok(r.error && r.error.code === 'ETIMEDOUT', 'still waiting on a live owner');
+  assert.ok(fs.existsSync(lock));
+  // Owned by a process that is gone: broken after the wait, and the note goes through.
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
+  fs.writeFileSync(path.join(lock, 'owner'), `${dead} gone`);
+  r = s.run(['note', 'hi']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.err, /broke stale lock/);
+  assert.ok(!fs.existsSync(lock), 'the note released its own lock');
+});
+
 test('--scope flags changes outside the allowed files', () => {
   const s = sandbox();
   gitRepo(s.project);
@@ -500,6 +536,85 @@ test('--scope flags changes outside the allowed files', () => {
   r = s.run(['diff', '--stat']);
   assert.match(r.out, /⚠ OUTSIDE SCOPE \(src\/auth\/\*\*, README\.md\):\n {2}f\.txt/);
   assert.doesNotMatch(r.out, / {2}src\/auth\/login\.js\n.*OUTSIDE/);
+});
+
+test('queue split: part 1 stays, the rest queue next with the options, once and only up front', () => {
+  const s = sandbox();
+  s.run(['queue', 'add', 'user task already queued']);
+  s.run(['init', 'big', '--check', 'node -e 0', '--branch', 'feat/x'], { input: 'the whole job' });
+  const id = s.state().id;
+  const parts = 'refactor the parser\n=== part ===\nadd the new syntax\nwith tests\n=== Part ===\nupdate the docs\n';
+
+  assert.match(s.run(['queue', 'split'], { input: 'just one part' }).err, /at least 2 parts/);
+  let r = s.run(['queue', 'split', '--reason', 'three independent changes'], { input: parts });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /split into 3 parts: this task is part 1; queued #2, #3/);
+  assert.deepEqual(s.state().part, { index: 1, total: 3, parent: id });
+
+  const entry = s.run(['show', '1']).out;
+  assert.match(entry, /001-implementer-split\.md/);
+  assert.match(entry, /Why: three independent changes/);
+  assert.match(entry, /part 1 only[\s\S]*refactor the parser/);
+  assert.match(entry, /#2 part 2\/3: add the new syntax\n- #3 part 3\/3: update the docs/);
+  assert.match(s.run(['watch', '--once']).out, /^collab watch +big-\S+ +part 1\/3 +IMPLEMENTING/);
+
+  r = s.run(['queue']);
+  assert.match(r.out, /1\. #2 .*add the new syntax\n +part 2\/3 of big-\S+ · check `node -e 0` · branch feat\/x/);
+  assert.match(r.out, /3\. #1 .*user task already queued/, 'parts go ahead of the user\'s queued tasks');
+
+  assert.match(s.run(['queue', 'split'], { input: parts }).err, /already part 1\/3/, 'only once');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.match(r.out, /000-implementer-brief[\s\S]*001-implementer-split[\s\S]*v1/, 'the reviewer sees the split');
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+
+  r = s.run(['queue', 'next']);
+  assert.match(r.out, /NEXT QUEUED TASK #2[\s\S]*split: +part 2\/3 of big-/);
+  r = s.run(['init', 'syntax', '--from-queue'], { input: 'brief for part 2' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /from queue: #2 \(part 2\/3 of big-/);
+  assert.deepEqual(s.state().part, { index: 2, total: 3, parent: id });
+  assert.equal(s.state().options.check, 'node -e 0', 'parts inherit the options');
+  assert.match(s.run(['show', '0']).out, /## Part of a split task[\s\S]*part 2\/3 of big-/);
+  assert.match(s.run(['queue', 'split'], { input: parts }).err, /a part can't be split again/);
+});
+
+test('queue split is refused after the first handoff and on the reviewer\'s turn', () => {
+  const s = sandbox();
+  s.run(['init', 'late'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  const parts = 'a\n=== part ===\nb\n';
+  assert.match(s.run(['queue', 'split'], { input: parts }).err, /not your turn \(implementer\)/);
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+  assert.match(s.run(['queue', 'split'], { input: parts }).err, /too late to split/);
+  assert.match(s.run(['queue']).out, /the queue is empty/);
+});
+
+test('a split part that ends early holds its later parts for the user', () => {
+  const s = sandbox();
+  s.run(['init', 'big'], { input: 'b' });
+  s.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n=== part ===\nthree\n' });
+  s.run(['submit', 'implementer', 'escalate'], { input: 'blocked' });
+  const r = s.run(['queue', 'next']);
+  assert.match(r.out, /HELD: part 1\/3 of big-\S+ \(big-\S+\) ended ESCALATED/);
+  assert.match(r.out, /CONFIRM FIRST/);
+  assert.match(s.run(['init', 'two', '--from-queue'], { input: 'b' }).err, /needs the user's go-ahead/);
+  assert.equal(s.run(['init', 'two', '--from-queue', '--confirmed', 'go on'], { input: 'b' }).code, 0);
+});
+
+test('pairs in different projects keep to their own task', () => {
+  const s = sandbox();
+  const other = path.join(s.root, 'other');
+  fs.mkdirSync(other);
+  assert.equal(s.run(['init', 'here'], { input: 'brief here' }).code, 0);
+  let r = s.run(['init', 'there'], { input: 'brief there', cwd: other });
+  assert.equal(r.code, 0, 'another project can start its own task');
+  assert.match(s.run(['join', '--timeout', '1']).out, /joined task: here-/);
+  assert.match(s.run(['join', '--timeout', '1'], { cwd: other }).out, /joined task: there-/);
+  assert.match(s.run(['status']).out, /task: +here-/, 'unpinned commands follow the project');
+  r = s.run(['init', 'again'], { input: 'b' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /still active in this project/);
 });
 
 test('DONE tells both agents when more queued tasks are waiting', () => {

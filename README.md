@@ -163,6 +163,11 @@ The same options work for a single task: `/Collab implement --check "npm test" f
 Manage the queue with `collab queue` (list), `collab queue rm 2`, `collab queue move 3 1` and
 `collab queue clear`.
 
+You don't have to split big jobs yourself. If a task is too big to review well in one go, the
+implementer can split it with `collab queue split`. The current task becomes part 1, and the other
+parts are queued right after it, with the same options. It tells you how it split the work, and
+you can still edit the queue.
+
 ## While it runs
 
 ```bash
@@ -237,7 +242,7 @@ Issues and pull requests are welcome. The whole tool is [`bin/collab.js`](bin/co
 [`SKILL.md`](SKILL.md).
 
 ```bash
-npm test      # ~20 s, no dependencies to install
+npm test      # ~30 s, no dependencies to install
 ```
 
 Please keep it dependency-free and cross-platform. CI runs the tests on macOS, Linux and Windows.
