@@ -70,14 +70,17 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
 ## The other agent looks unresponsive (exit 13)
 
 `wait` returns 13 when the other agent has not handed off for 30 min. While the implementer is
-working, it also needs no project file to have changed for 10 min. This is the one case where
-you **ask the user and end your turn**:
+working, it also needs no project file to have changed for 10 min. The user already got a desktop
+notification.
 - **Claude Code:** use the AskUserQuestion tool: "The <other role> has not handed off for
   N min. Stop the task?", with the options **Keep waiting (30 min)** and **Stop the task**.
-- **Codex CLI:** ask the same question in plain text and end your turn.
-
-On *keep waiting*, run `collab -t <id> snooze 30` (or the minutes the user gives), then go back
-to waiting. On *stop*, run `collab -t <id> abort` and give the user a short final report.
+  On *keep waiting*, run `collab -t <id> snooze 30` (or the minutes the user gives), then go back
+  to waiting. On *stop*, run `collab -t <id> abort` and give the user a short final report.
+- **Codex CLI:** **don't end your turn.** If you ended it, the other agent's handoff would go
+  unnoticed until the user spoke to you again. Instead, post a short message: "The <other role>
+  has not handed off for N min. I'll keep waiting; interrupt me and say *stop* to end the task."
+  Then run `collab -t <id> snooze 30` and go back to waiting. After 2 hours without a handoff, the
+  task ends by itself (`STALLED`).
 
 ## Human notes (the user steering a running task)
 
@@ -122,8 +125,13 @@ to stop, they will interrupt you.
   with the Bash tool's `run_in_background: true`. You are re-invoked when it exits. Read its
   output, then act on the exit code.
 - **Codex CLI:** run `collab wait <role> --timeout 540` (or `collab join --timeout 540`) in the
-  foreground with a shell timeout of at least 600000 ms. Don't pick a shorter `--timeout`. On
-  exit 11, run it again immediately. Don't stop to ask the user and don't end your turn.
+  foreground with a shell timeout of at least 600000 ms. On exit 11, run it again immediately.
+  Don't stop to ask the user and don't end your turn.
+- **If the shell tool stops the command before it exits** (a tool timeout, "command timed out",
+  an interrupted or killed process, no exit code), that is not an error in the task. Run the same
+  command again, with a `--timeout` below the shell tool's limit (e.g. `--timeout 240` for a
+  5-minute limit). The same goes for any exit code other than 0, 10, 13 and the ones listed for
+  `submit`: check `collab -t <id> status`, then go back to waiting.
 
 ## Implementer loop
 
