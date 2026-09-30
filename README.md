@@ -118,21 +118,51 @@ collab help
 
 ## Quick start
 
-Open your project in three terminals:
+After [installing Collab](#install), follow these steps. This example uses Codex as the reviewer
+and Claude Code as the implementer.
 
-| Terminal | What to type |
-|---|---|
-| **1: reviewer** | Codex: `$Collab review` (Claude Code: `/Collab review`) |
-| **2: implementer** | Claude Code: `/Collab implement`, then describe the task in your next message |
-| **3: you** | `collab watch` (↑↓ steps, ←→ earlier tasks, q quit) |
+1. **Open three terminals in the same project folder.** Use the project you want the agents to
+   work on, such as your app's repository.
 
-That's it. The reviewer waits for the task and the implementer writes a short brief and starts.
-From there they take turns on their own.
+2. **Start the reviewer in terminal 1.** Launch Codex CLI, then send this message in its chat:
+
+   ```text
+   $Collab review
+   ```
+
+   The reviewer will wait for the implementer to create a task. Leave it running.
+
+3. **Give the implementer a task in terminal 2.** Launch Claude Code, then send this message in
+   its chat, replacing the example task with your own:
+
+   ```text
+   /Collab implement Add input validation to the signup form, with tests.
+   ```
+
+   You don't have to include the task in the initial command. You can send `/Collab implement`
+   on its own, wait for the agent to ask what to build, then describe your task in your next
+   message. (If you already have queued tasks, it starts the first one instead.)
+
+   The implementer writes a short brief and starts working. The two agents then take turns
+   implementing, reviewing, and fixing the changes automatically.
+
+4. **Watch progress in terminal 3.** Run this command at the shell prompt:
+
+   ```bash
+   collab watch
+   ```
+
+   Use ↑↓ to browse steps, ←→ for earlier tasks, and `q` to leave the dashboard. When the task
+   finishes or needs your input, Collab notifies you and the agents report back.
+
+You can swap the roles: use `/Collab review` in Claude Code and `$Collab implement` followed by
+your task in Codex.
 
 > 💡 Let the agents run without permission prompts (e.g. Claude Code's auto mode, or allow
 > `Bash(collab:*)`), otherwise every handoff stops to ask you.
 
-Want the approach agreed first? Start with `/Collab implement --plan`.
+Want the approach agreed first? Add `--plan` before your task in step 3, for example:
+`/Collab implement --plan Add input validation to the signup form, with tests.`
 
 ## Queue up a morning's work
 
