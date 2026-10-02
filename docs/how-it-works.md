@@ -139,7 +139,16 @@ itself, plus nested repos up to three levels down, including ones the outer repo
 (e.g. separate module repos). The snapshot comes from `git stash create`, which
 records the working tree **without touching it**, plus the list of untracked files at that
 moment. `collab diff` compares against that snapshot, so the reviewer sees only what changed
-during the task, even when you started with uncommitted work.
+during the task, even when you started with uncommitted work. It also lists new `*.md` files
+that git ignores (e.g. in a gitignored plans folder), so a document written there is not missed.
+
+## Files the agents write
+
+Handoff-only files (message drafts for `--file`, notes, logs) go in the task's `scratch/` folder,
+which `init` and `join` print and `collab scratch` returns. Before a task exists, `collab scratch`
+returns the shared `drafts/` folder instead. Neither is ever in the project. `collab clean` deletes
+a task's scratch folder with the task, and drafts older than a day. Documents that are part of the
+work go where the brief's `## Deliverables` line says.
 
 ## On disk
 
@@ -147,12 +156,15 @@ during the task, even when you started with uncommitted work.
 ~/.collab/
   current                          id of the most recent task
   queue.json                       queued tasks, each with its project folder and options
+  drafts/                          agents' drafts written before a task exists (e.g. a brief)
   tasks/<slug>-<YYYYMMDD-HHMMSS>/
     state.json                     status, turn, rounds, repos, progress, …
     log.md                         the whole conversation, human-readable
     entries/NNN-<role>-<kind>.md   one file per message (brief, plan, ready, changes, note-…)
     progress.log                   JSON lines of progress updates
     untracked/<n>.txt              untracked files per repo at the start
+    untracked/<n>-ignored-md.txt   ignored *.md files per repo at the start
+    scratch/                       the agents' message drafts, notes and logs for this task
 ```
 
 State changes are made under a lock (an exclusive `.lock` directory) and written atomically

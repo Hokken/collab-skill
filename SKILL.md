@@ -63,8 +63,10 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
 - **Passing messages** (brief, summary, review), depending on your shell:
   - *bash / zsh / Git Bash:* a quoted heredoc on stdin:
     `collab -t <id> submit implementer ready <<'EOF' … EOF`
-  - *PowerShell (e.g. Codex on Windows):* prefer **`--file`**. Write the message to a temp file,
-    then run `collab -t <id> submit implementer ready --file "$env:TEMP\collab-msg.md"`.
+  - *PowerShell (e.g. Codex on Windows):* prefer **`--file`**. Write the message to a file in
+    the scratch folder (see *Files you write*), then run
+    `collab -t <id> submit implementer ready --file "<scratch>\msg.md"`. Reuse the same name each
+    time; collab keeps its own copy of every message.
     Windows PowerShell 5.1 mangles non-ASCII text piped into programs; in PowerShell 7, piping
     a single-quoted here-string (`@' … '@ | collab …`) also works.
   - `init` and `note` accept `--file` too.
@@ -83,6 +85,17 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   relative to the folder the task was started from.
 - If a submit fails with "task already finished", the user stopped the task: stop looping and
   give them a short report of where you were.
+
+## Files you write
+
+- **Handoff-only files** (message drafts, notes to yourself, command logs) go in the **scratch
+  folder**: `init` and `join` print it as `scratch:`, and `collab scratch` prints it any time
+  (before `init`, it is a shared drafts folder; use that one for the brief). **Never** put them in
+  the project (not even in a plans or docs folder) or in the system temp folder. Collab already
+  keeps every brief, summary and review in the task's log, and deletes the scratch folder with
+  the task.
+- **Deliverable documents** (a plan, an investigation, a verification checklist) are part of
+  the work. They go where the brief's `## Deliverables` line says, and nowhere else.
 
 ## The other agent looks unresponsive (exit 13)
 
@@ -166,6 +179,10 @@ you to stop, they will interrupt you.
    - …
    ## Constraints
    (project rules, things not to touch)
+   ## Deliverables
+   (only if the task produces documents) where they go: the project's convention if it has one
+   (CLAUDE.md / AGENTS.md, or an existing folder such as `.agents/plans/<slug>/`), otherwise
+   `docs/` in the project folder
    EOF
    ```
    The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
@@ -303,6 +320,9 @@ EOF
    - You can run read-only checks (lint, type-check, tests). **Don't edit project files**;
      your only output is the review.
    - Stay within the brief's scope. Don't ask for unrelated refactors.
+   - A new document outside the brief's `## Deliverables` location, or a handoff draft (brief,
+     summary, review copy) written into the project, is a blocking item: it belongs in the
+     scratch folder (see *Files you write*).
    - Respect the brief's *Task options*. Look hardest at the **review focus**. If `collab diff`
      shows `⚠ OUTSIDE SCOPE`, treat it as blocking unless the change is clearly required. A
      `check passed` line in the summary means the check command succeeded; you can run

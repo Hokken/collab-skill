@@ -679,6 +679,21 @@ test('watch shows the task position within its project and -t pins an older task
   assert.match(r.out, /first brief/);
 });
 
+test('watch: a finished task\'s total time stops when it ended', async () => {
+  const s = sandbox();
+  s.run(['init', 'timer'], { input: 'b' });
+  approveCurrent(s);
+  const st = s.state();
+  assert.ok(st.finished_epoch >= st.created_epoch, 'finish time recorded');
+  const before = s.run(['watch', '--once']).out.match(/total (\S+)/)[1];
+  await pause(2200);
+  s.run(['end'], { input: 'done' });
+  const r = s.run(['watch', '--once']).out;
+  assert.equal(r.match(/total (\S+)/)[1], before, 'total frozen, even after a later write (end)');
+  assert.match(r, /finished at \d\d:\d\d:\d\d/);
+  assert.equal(s.state().finished_epoch, st.finished_epoch);
+});
+
 test('help and unknown commands', () => {
   const s = sandbox();
   let r = s.run(['help']);
@@ -822,6 +837,19 @@ test('a repo root and a folder inside it are the same project; nested repos are 
   assert.match(r.out, /repos snapshotted: 2/);
   fs.appendFileSync(path.join(mod, 'f.txt'), 'module change\n');
   assert.match(s.run(['diff', '--stat']).out, /mod-x[\s\S]*f\.txt/, 'changes in the ignored nested repo show up');
+
+  // Documents written into a gitignored folder show up too, but not ones that were already there.
+  fs.mkdirSync(path.join(s.project, 'plans'), { recursive: true });
+  fs.appendFileSync(path.join(s.project, '.gitignore'), 'plans/\n');
+  fs.writeFileSync(path.join(s.project, 'plans', 'old.PLAN.md'), 'old');
+  s.run(['abort']);
+  s.run(['init', 'docs'], { input: 'b' });
+  fs.writeFileSync(path.join(s.project, 'plans', 'handoff-r1.md'), 'draft');
+  fs.writeFileSync(path.join(s.project, 'plans', 'notes.txt'), 'not markdown');
+  r = s.run(['diff']);
+  assert.match(r.out, /new documents git ignores \(\*\.md\):\n {2}plans\/handoff-r1\.md\n/);
+  assert.match(r.out, /\+\+\+ new file: plans\/handoff-r1\.md\ndraft/);
+  assert.doesNotMatch(r.out, /old\.PLAN\.md|notes\.txt/);
   s.run(['abort']);
 
   r = s.run(['init', 'from-module'], { input: 'module brief', cwd: mod });
@@ -835,4 +863,33 @@ test('a repo root and a folder inside it are the same project; nested repos are 
   const sibling = path.join(s.root, 'elsewhere');
   fs.mkdirSync(sibling);
   assert.equal(s.run(['queue', 'next'], { cwd: sibling }).code, 15, 'unrelated folders stay separate');
+});
+
+test('scratch: drafts folder before init, the task folder after, cleaned with the task', () => {
+  const s = sandbox();
+  const drafts = path.join(s.home, 'drafts');
+  assert.equal(s.run(['scratch']).out.trim(), drafts, 'no task yet: shared drafts folder');
+  assert.ok(fs.existsSync(drafts));
+
+  let r = s.run(['init', 'scr'], { input: 'b' });
+  const scratch = path.join(s.taskDir(), 'scratch');
+  assert.ok(r.out.includes(`scratch: ${scratch}`), r.out);
+  assert.ok(fs.existsSync(scratch));
+  assert.ok(s.run(['join', '--timeout', '1']).out.includes(`scratch:     ${scratch}`));
+  assert.equal(s.run(['scratch']).out.trim(), scratch, 'active task: its own folder');
+  const id = s.state().id;
+  s.run(['abort']);
+  assert.equal(s.run(['scratch']).out.trim(), drafts, 'finished task: back to drafts');
+  assert.equal(s.run(['-t', id, 'scratch']).out.trim(), scratch, '-t: that task, finished or not');
+
+  const old = path.join(drafts, 'old-brief.md');
+  const fresh = path.join(drafts, 'fresh-brief.md');
+  fs.writeFileSync(old, 'x');
+  fs.writeFileSync(fresh, 'x');
+  const past = new Date(Date.now() - 3 * 86400000);
+  fs.utimesSync(old, past, past);
+  r = s.run(['clean', '-y']);
+  assert.match(r.out, /deleted 1 task\(s\) and 1 draft file\(s\)/);
+  assert.ok(!fs.existsSync(old) && fs.existsSync(fresh), 'only drafts older than a day go');
+  assert.match(s.run(['clean', '-y']).out, /nothing to clean/);
 });

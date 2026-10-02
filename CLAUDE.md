@@ -71,6 +71,10 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Diffs**: `cmdInit` snapshots every git repo under the project (its own repo + nested ones up to
   3 levels, even if the outer repo ignores them, `findRepos`) with `git stash create` plus the untracked-file list, without touching the working tree.
   `cmdDiff` diffs against that snapshot and flags files outside `--scope` globs (`globRegex`).
+  It also lists new gitignored `*.md` files (`ignoredDocs`, snapshotted as `untracked/<n>-ignored-md.txt`).
+- **Scratch**: agents keep handoff-only files in `tasks/<id>/scratch/` (`scratchDir`, printed by
+  `init`/`join`, returned by `collab scratch`), or in `$COLLAB_HOME/drafts/` before a task exists.
+  `cmdClean` deletes drafts older than a day.
 - **Queue**: `$COLLAB_HOME/queue.json`, edited via `withQueue`; items are filtered by project folder
   (`realDir`). `init --from-queue` pops an item and applies its options (`TASK_OPTS`/`normTaskOpts`).
   `queue split` lets the implementer split its current task: parts 2..N are queued with a `part`

@@ -247,7 +247,7 @@ also run themselves.
 | `collab queue` | List queued tasks (`*` = this project) |
 | `collab queue add [options] "task"` | Queue a task; the implementer starts it after the current one (options [above](#queue-up-a-mornings-work)) |
 | `collab queue rm N` · `move N M` · `clear [--all]` | Edit the queue |
-| `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks (asks first; `-n` dry run, `-y` no prompt) |
+| `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks and drafts older than a day (asks first; `-n` dry run, `-y` no prompt) |
 | `collab help` | Print this list |
 
 Add `-t <task-id>` to any command to target a task other than the current one.
@@ -261,6 +261,7 @@ Add `-t <task-id>` to any command to target a task other than the current one.
 | `collab queue next` · `queue skip` | Show / drop the next queued task for this project |
 | `collab queue split [--reason TEXT]` | Implementer: split the current task (parts on stdin, separated by `=== part ===` lines); part 1 stays, the rest queue next |
 | `collab check` | Run the task's `--check` command |
+| `collab scratch` | Folder for message drafts, notes and logs: the task's own, or a shared drafts folder before `init`. Keeps them out of your project |
 | `collab join [--after ID]` | Reviewer: wait until a task exists, print its brief. With `--after` (the task it just finished), it also stops when the run ends |
 | `collab end` | Implementer: the whole request is done. Ends the run for both agents (final report on stdin or `--file`) |
 | `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |

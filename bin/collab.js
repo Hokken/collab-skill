@@ -28,6 +28,7 @@ const envInt = (name, def) => {
 
 const COLLAB_HOME = process.env.COLLAB_HOME || path.join(os.homedir(), '.collab');
 const TASKS = path.join(COLLAB_HOME, 'tasks');
+const DRAFTS = path.join(COLLAB_HOME, 'drafts');
 const POLL = envInt('COLLAB_POLL_SECS', 5);
 const STALL = envInt('COLLAB_STALL_SECS', 7200);       // 2 h without a handoff => STALLED
 const IDLE = envInt('COLLAB_IDLE_SECS', 1800);         // 30 min without a handoff => ask the user
@@ -154,6 +155,8 @@ function taskDir() {
 }
 
 const statePath = (d) => path.join(d, 'state.json');
+// The task's folder for handoff-only files; created on demand (older tasks don't have one).
+const scratchDir = (d) => { const s = path.join(d, 'scratch'); fs.mkdirSync(s, { recursive: true }); return s; };
 const readState = (d) => retry(() => JSON.parse(fs.readFileSync(statePath(d), 'utf8')));
 
 function writeState(d, st) {
@@ -167,6 +170,8 @@ function writeState(d, st) {
 function update(d, fn, { touch = true } = {}) {
   const st = readState(d);
   fn(st);
+  // When the task ended, so its total time stops there (later writes, e.g. 'end', don't move it).
+  if (isTerminal(st.status) && !st.finished_epoch) st.finished_epoch = epoch();
   if (touch) {
     st.updated_at = nowIso();
     st.updated_epoch = epoch();
@@ -320,6 +325,10 @@ function findRepos(root) {
 
 const untrackedFiles = (repo) =>
   git(repo, ['ls-files', '--others', '--exclude-standard']).out.split('\n').filter(Boolean);
+// Markdown files git ignores (e.g. in a gitignored plans folder): documents an agent writes there
+// would otherwise never show up in collab diff.
+const ignoredDocs = (repo) =>
+  git(repo, ['ls-files', '--others', '--ignored', '--exclude-standard', '--', '*.md']).out.split('\n').filter(Boolean);
 
 // Newest mtime (ms) of any project file, skipping dependency/build folders.
 // Stops early once a file at least as new as stopAt is found; capped so a huge tree can't hang.
@@ -656,6 +665,8 @@ function cmdInit(args) {
     if (!base) continue;
     const list = untrackedFiles(r).sort();
     fs.writeFileSync(path.join(d, 'untracked', `${repos.length}.txt`), list.length ? `${list.join('\n')}\n` : '');
+    const docs = ignoredDocs(r).sort();
+    fs.writeFileSync(path.join(d, 'untracked', `${repos.length}-ignored-md.txt`), docs.length ? `${docs.join('\n')}\n` : '');
     repos.push({ index: repos.length, path: r, base });
   }
 
@@ -691,6 +702,7 @@ function cmdInit(args) {
   if (describeOpts(options).length) out(`options: ${describeOpts(options).join(' · ')}`);
   if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
+  out(`scratch: ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
   if (plan) out("Next: write a plan (no code yet), then 'collab submit implementer plan' with it on stdin.");
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
 }
@@ -717,6 +729,7 @@ async function cmdJoin(args) {
         out(`joined task: ${id}`);
         out(`project:     ${st.project_dir}`);
         out(`status:      ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+        out(`scratch:     ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
         printEntry(d, listEntries(d)[0]);
         return;
       }
@@ -1176,7 +1189,14 @@ async function cmdClean(args) {
     victims.push(id);
     out(`  ${id.padEnd(45)} ${st.status.padEnd(10)} ${fmtDur(now - st.updated_epoch)} ago`);
   }
-  if (!victims.length) { out(`nothing to clean (${active} active task(s) kept)`); return; }
+  // Drafts written before a task existed (briefs, queue texts): kept for a day, then cleaned too.
+  let drafts = [];
+  try {
+    drafts = fs.readdirSync(DRAFTS).map((f) => path.join(DRAFTS, f))
+      .filter((p) => Date.now() - fs.statSync(p).mtimeMs > Math.max(days, 1) * 86400000);
+  } catch { /* no drafts folder */ }
+  if (drafts.length) out(`  ${drafts.length} draft file(s) in ${DRAFTS} older than ${Math.max(days, 1)} day(s)`);
+  if (!victims.length && !drafts.length) { out(`nothing to clean (${active} active task(s) kept)`); return; }
   out(`${victims.length} finished task(s) above; ${active} active task(s) are never touched.`);
   if (opts.dry) { out('(dry run — nothing deleted)'); return; }
   if (!opts.yes) {
@@ -1191,7 +1211,22 @@ async function cmdClean(args) {
     fs.rmSync(path.join(TASKS, id), { recursive: true, force: true });
     if (id === cur) fs.rmSync(path.join(COLLAB_HOME, 'current'), { force: true });
   }
-  out(`deleted ${victims.length} task(s)`);
+  for (const p of drafts) fs.rmSync(p, { recursive: true, force: true });
+  out(`deleted ${victims.length} task(s)${drafts.length ? ` and ${drafts.length} draft file(s)` : ''}`);
+}
+
+// Where agents keep files that only exist for the handoff (message drafts, notes, logs), so they
+// never end up in the project or the system temp folder: the task's own scratch folder (deleted
+// with the task), or the shared drafts folder while no task is active yet (e.g. for a brief).
+function cmdScratch() {
+  const id = TASK_OVERRIDE || process.env.COLLAB_TASK || latestTask(process.cwd());
+  const d = id && path.join(TASKS, id);
+  if (d && fs.existsSync(statePath(d)) && (TASK_OVERRIDE || !isTerminal(readState(d).status))) {
+    out(scratchDir(d));
+    return;
+  }
+  fs.mkdirSync(DRAFTS, { recursive: true });
+  out(DRAFTS);
 }
 
 function cmdDiff(args) {
@@ -1210,21 +1245,31 @@ function cmdDiff(args) {
     try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
     const known = new Set(before);
     const fresh = untrackedFiles(r.path).filter((f) => !known.has(f)).sort();
+    // Tasks from before ignored documents were snapshotted have no list: skip them there.
+    let docs = [];
+    try {
+      const had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean));
+      docs = ignoredDocs(r.path).filter((f) => !had.has(f)).sort();
+    } catch { /* no snapshot */ }
     // Compare canonical paths: on Windows git and Node can spell the same folder differently
     // (8.3 short names like RUNNER~1, or different letter case).
     const rel = (f) => path.relative(realDir(st.project_dir), path.join(realDir(r.path), f)).split(path.sep).join('/');
     for (const f of git(r.path, ['diff', '--name-only', r.base]).out.split('\n').filter(Boolean)) touched.push(rel(f));
-    for (const f of fresh) touched.push(rel(f));
-    if (!changed && !fresh.length) continue;
+    for (const f of [...fresh, ...docs]) touched.push(rel(f));
+    if (!changed && !fresh.length && !docs.length) continue;
     out(`=== ${r.path} (since ${r.base.slice(0, 10)})`);
     if (changed) out(changed);
     if (fresh.length) {
       out('new untracked files:');
       for (const f of fresh) out(`  ${f}`);
     }
+    if (docs.length) {
+      out('new documents git ignores (*.md):');
+      for (const f of docs) out(`  ${f}`);
+    }
     if (!stat) {
       process.stdout.write(git(r.path, ['--no-pager', 'diff', r.base]).out);
-      for (const f of fresh) {
+      for (const f of [...fresh, ...docs]) {
         out(`+++ new file: ${f}`);
         try {
           const head = fs.readFileSync(path.join(r.path, f), 'utf8').split('\n').slice(0, 400).join('\n');
@@ -1471,6 +1516,8 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   const now = epoch();
   const created = st.created_epoch || Math.floor(fs.statSync(d).birthtimeMs / 1000);
   const active = !isTerminal(st.status);
+  // A finished task's total stops when it ended (older state files: its last update).
+  const endedAt = active ? now : (st.finished_epoch || st.updated_epoch);
   let sc = CY;
   if (st.status === 'DONE') sc = G;
   else if (['ESCALATED', 'STALLED', 'ABORTED'].includes(st.status)) sc = RD;
@@ -1481,7 +1528,7 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   const waiting = queueCount(st.project_dir);
   const taskPos = view.siblings.length > 1 ? `  ${D}task ${pos + 1}/${view.siblings.length}${view.pinned ? ' (←→)' : ''}${R}` : '';
   const partPos = st.part ? `  ${Y}part ${st.part.index}/${st.part.total}${R}` : '';
-  lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
+  lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(endedAt - created)} · ${localTime(Date.now())}${R}`);
   lines.push(`${D}project${R} ${st.project_dir}`);
   const live = active ? liveProgress(st) : null;
   if (st.status === 'DECISION') {
@@ -1499,7 +1546,7 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
     const idle = idleReason(st);
     if (idle) lines.push(`${RD}${B}⚠  looks unresponsive:${R}${RD} ${idle} — collab abort / collab snooze${R}`);
   } else {
-    lines.push(`${D}finished${R}`);
+    lines.push(`${D}finished at ${localTime(endedAt * 1000)}${R}`);
   }
   const rule = `${D}${'─'.repeat(cols)}${R}`;
   lines.push(rule);
@@ -1672,7 +1719,7 @@ ${B}FOR YOU (the human)${R}
   ${C}queue add${R} [options] "task"  Queue a task; the implementer starts it after the current one
   ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
   ${C}snooze${R} [MIN]                Keep waiting on a slow agent (no idle prompt for MIN, default 30)
-  ${C}clean${R} [--older-than D] [-n] Delete finished tasks (asks first; -n = dry run, -y = no prompt)
+  ${C}clean${R} [--older-than D] [-n] Delete finished tasks and old drafts (asks first; -n dry run, -y no prompt)
   ${C}path${R}                        Folder holding the current task's files
   ${C}help${R}                        This screen
 
@@ -1693,6 +1740,8 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}queue split${R} [--reason TEXT] Implementer: split the current task (parts on stdin, separated
                               by '=== part ===' lines); part 1 stays, the rest queue next
   ${C}check${R}                       Run the task's --check command
+  ${C}scratch${R}                     Folder for message drafts, notes and logs (the task's own, or
+                              a shared drafts folder before 'init'); never write them in the project
   ${C}join${R} [--after ID]           Reviewer: wait until a task exists, print its brief; with
                               --after (the task it just finished), stop when the run ends
   ${C}end${R}                         Implementer: the whole request is done; ends the run for both
@@ -1717,7 +1766,7 @@ Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
   snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
-  show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer,
+  show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer, scratch: cmdScratch,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),
 };
