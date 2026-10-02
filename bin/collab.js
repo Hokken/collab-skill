@@ -1405,9 +1405,15 @@ function cmdEnd(args) {
       : `${pre.id} is still ${pre.status}: finish it first`);
   }
   if (pre.ended) die(`the run already ended after ${pre.id}`);
-  const waiting = queueCount(pre.project_dir);
-  if (waiting) die(`${waiting} queued task(s) still waiting for this project: start them, or remove them with 'collab queue skip' / 'queue rm'`);
+  // Queued tasks that would start on their own mean the work isn't done. Ones that wait for the
+  // user's go-ahead (--confirm, or held after an earlier part failed) stay queued for later.
+  const queued = forProject(readQueue(), pre.project_dir);
+  const waiting = queued.filter((it) => !(it.options && it.options.confirm));
+  if (waiting.length) die(`${waiting.length} queued task(s) still waiting for this project: start them, or remove them with 'collab queue skip' / 'queue rm'`);
   let body = readBody(opts.file);
+  if (queued.length) {
+    body += `\n## Left in the queue for your go-ahead\n${queued.map((it) => `- #${it.id}: ${headline(it.text)}`).join('\n')}\n`;
+  }
 
   const prev = ids.slice(0, -1).map((id) => readState(path.join(TASKS, id))).reduce((at, t, i) => (t.ended ? i : at), -1);
   const run = ids.slice(prev + 1);
@@ -1422,7 +1428,7 @@ function cmdEnd(args) {
     return update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
   });
   notify(`${st.id}: work complete`);
-  out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s). A reviewer in 'join --after' stops now.`);
+  out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s)${queued.length ? `, ${queued.length} queued task(s) left for the user's go-ahead` : ''}. A reviewer in 'join --after' stops now.`);
 }
 
 // --- watch ------------------------------------------------------------------

@@ -733,16 +733,21 @@ test('join --after follows the run to the next task and stops when the implement
   s.run(['queue', 'add', 'one more']);
   assert.match(s.run(['-t', b, 'end'], { input: 'all done' }).err, /1 queued task\(s\) still waiting/);
   s.run(['queue', 'clear']);
+  // A task waiting for the user's go-ahead (they said stop) doesn't block the end; it stays queued.
+  s.run(['queue', 'add', '--confirm', 'Low priority: persona tweaks']);
 
   r = s.run(['-t', b, 'end'], { input: '## Final report\nstages 0 and 1 shipped\n' });
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /ended the run after b-stage-\S+: 2 task\(s\), 1 recorded decision/);
+  assert.match(r.out, /ended the run after b-stage-\S+: 2 task\(s\), 1 recorded decision\(s\), 1 queued task\(s\) left for the user's go-ahead/);
+  assert.match(s.run(['queue', 'next']).out, /persona tweaks/, 'still queued for later');
+  s.run(['queue', 'clear']);
   assert.match(s.run(['-t', b, 'end'], { input: 'again' }).err, /already ended/);
 
   r = s.run(['join', '--after', b, '--timeout', '1']);
   assert.equal(r.code, 10);
   assert.match(r.out, /^WORK COMPLETE/);
   assert.match(r.out, /stages 0 and 1 shipped/);
+  assert.match(r.out, /## Left in the queue for your go-ahead\n- #\d+: Low priority: persona tweaks/);
   assert.match(r.out, /### a-stage-\S+ · #002 reviewer approve\n- kept the old cooldown \(safest\)/);
   assert.match(r.out, /run ended after 2 task\(s\)/);
 

@@ -49,7 +49,9 @@ starts one after another. That sequence is a *run*. Between tasks, the reviewer 
 - it ended `ESCALATED`, `ABORTED` or `STALLED`: `join` returns 10 (`TASK FINISHED`);
 - it's `DONE` and nothing new has started for `COLLAB_IDLE_SECS`: `join` returns 13.
 
-`collab end` (implementer) needs the project's newest task to be `DONE` and its queue to be empty.
+`collab end` (implementer) needs the project's newest task to be `DONE` and no queued task for the
+project that would start on its own. Tasks waiting for the user's go-ahead (`--confirm` or held)
+stay queued and are listed in the report.
 It writes an `end` entry with the implementer's report, followed by every user answer and every
 `## Decisions taken` section from the run. The run is the tasks since the previous `end` in that
 project.

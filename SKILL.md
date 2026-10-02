@@ -244,7 +244,9 @@ folder, with its options.
    If it also says **HELD**, an earlier part of the same split task didn't get approved. Say so
    in your question.
    (Claude Code: AskUserQuestion; Codex: plain text, then end your turn.) *Skip* runs
-   `collab queue skip` and moves on to the next one; *stop* ends the loop.
+   `collab queue skip` and moves on to the next one. *Stop* leaves it queued for later: if the
+   last task was approved, run `collab end` as in step 5 of the implementer loop (it lists the
+   task under *Left in the queue*), then stop.
 2. Turn the task text into a brief as usual, then start it with
    `collab init <short-slug> --from-queue` (brief on stdin or `--file`). This removes the task
    from the queue and applies its options. Pin the new task id with `-t`. For a CONFIRM FIRST
