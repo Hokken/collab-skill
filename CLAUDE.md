@@ -28,7 +28,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Cross-platform**: macOS, Linux and native Windows (PowerShell/cmd/Git Bash). Watch path handling,
   `fs.renameSync` races on Windows (writes go through `retry()`), CRLF/BOM in input (`readBody`), and
   notifications (`notify()` branches per platform). `bin/collab.cmd` is the Windows shim.
-- **Exit codes are protocol**: `SKILL.md` tells agents to branch on them (0, 1, 10–15, defined as
+- **Exit codes are protocol**: `SKILL.md` tells agents to branch on them (0, 1, 10–16, defined as
   `EXIT_*` constants at the top of `collab.js` and documented in its header comment and in
   `docs/how-it-works.md`). Changing or adding one means updating all three, plus `SKILL.md`.
 - **Backwards-compatible state**: old `state.json` files (including ones written by an earlier bash
@@ -41,7 +41,9 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   `CollabError` (exit 1 with `collab: msg` on stderr), `exit(code)` throws `ExitCode`. Don't call
   `process.exit` directly.
 - **Task resolution**: `taskDir()` picks the task from `-t`, then `$COLLAB_TASK`, then the newest
-  task for the current folder (`projectTasks(cwd)`), then `$COLLAB_HOME/current`. `init` allows one
+  active (else newest) task for the current project (`latestTask(cwd)`), then `$COLLAB_HOME/current`.
+  Folders are the same project when one contains the other (`sameProject`; used by `projectTasks`
+  and the queue), so a repo root and a module inside it share tasks. `init` allows one
   active task per project. So pairs in different projects don't interfere, and agents also pin
   their task id with `-t`.
 - **State**: `$COLLAB_HOME/tasks/<slug>-<stamp>/state.json`. All mutations go through
@@ -53,13 +55,21 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   IMPLEMENTING → READY_FOR_REVIEW ⇄ CHANGES_REQUESTED → DONE, plus ESCALATED/ABORTED/STALLED terminals).
   `cmdSubmit` validates the turn, enforces unseen notes (exit 12) and `--check` (exit 14, via `runCheck`),
   writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`.
+- **Decisions**: `submit <role> decide` (numbered options, `decisionOptions`) parks the task in the
+  non-terminal `DECISION` status with `turn: 'human'` and saves the previous status/turn in
+  `st.decision`. `cmdAnswer` restores them. The other agent's `wait` returns exit 16 once (unless
+  `--self`), and idle/stall checks are skipped meanwhile. Hitting the round limit makes a
+  `kind: 'limit'` decision (`LIMIT_OPTIONS`, shown to both agents) instead of escalating.
+- **Runs**: after DONE the reviewer waits in `join --after <id>`, which follows the project's newest
+  task. `cmdEnd` sets `st.ended` on the last DONE task (`join --after` then exits 10) and collects
+  the run's user answers and `## Decisions taken` sections (`collectDecisions`).
 - **Waiting**: `cmdWait`/`cmdJoin` poll `state.json` every `COLLAB_POLL_SECS`. Idle detection
   (`idleReason`, exit 13) combines time since last handoff, `collab progress` pings, and (on the
   implementer's turn) project file mtimes via `lastFileChange`, which skips `SKIP_DIRS`.
 - **Notes**: `pendingNotes`/`markSeen` track, per role, the last entry shown; notes surface in `wait`,
   `progress`, or by refusing `submit`.
-- **Diffs**: `cmdInit` snapshots every git repo under the project (itself + nested up to 3 levels,
-  `findRepos`) with `git stash create` plus the untracked-file list, without touching the working tree.
+- **Diffs**: `cmdInit` snapshots every git repo under the project (its own repo + nested ones up to
+  3 levels, even if the outer repo ignores them, `findRepos`) with `git stash create` plus the untracked-file list, without touching the working tree.
   `cmdDiff` diffs against that snapshot and flags files outside `--scope` globs (`globRegex`).
 - **Queue**: `$COLLAB_HOME/queue.json`, edited via `withQueue`; items are filtered by project folder
   (`realDir`). `init --from-queue` pops an item and applies its options (`TASK_OPTS`/`normTaskOpts`).

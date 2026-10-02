@@ -102,17 +102,53 @@ test('init refuses while a task is active unless --force', () => {
   assert.equal(r.code, 0);
 });
 
-test('max rounds escalates without overflowing the round counter', () => {
+test('the round limit asks the user: more rounds, approve, or stop', () => {
   const s = sandbox();
-  s.run(['init', 'mr', '--max-rounds', '2'], { input: 'b' });
-  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: 'c1' });
-  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
-  const r = s.run(['submit', 'reviewer', 'changes'], { input: 'c2' });
-  assert.equal(r.code, 10);
-  assert.equal(s.state().status, 'ESCALATED');
-  assert.equal(s.state().round, 2);
-  assert.match(s.run(['show']).out, /max rounds \(2\) reached — escalated to the human/);
+  const toLimit = (slug) => {
+    s.run(['init', slug, '--max-rounds', '2'], { input: 'b' });
+    s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+    s.run(['submit', 'reviewer', 'changes'], { input: 'c1' });
+    s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+    return s.run(['submit', 'reviewer', 'changes'], { input: '1. still broken' });
+  };
+  let r = toLimit('a-more');
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /Round limit reached \(2 review rounds\)[\s\S]*exit 16/);
+  assert.equal(s.state().status, 'DECISION');
+  assert.equal(s.state().round, 2, 'no round counter overflow');
+  for (const role of ['implementer', 'reviewer']) {
+    r = s.run(['wait', role, '--timeout', '1']);
+    assert.equal(r.code, 16, `${role} can show the menu`);
+    assert.match(r.out, /round limit is reached[\s\S]*1\. still broken[\s\S]*1\. Give them 2 more rounds[\s\S]*3\. Stop the task/);
+  }
+  assert.match(s.run(['answer', '1.']).out, /back to the implementer \(status: CHANGES_REQUESTED\)/);
+  assert.equal(s.state().round, 3);
+  assert.equal(s.state().max_rounds, 4);
+  r = s.run(['wait', 'implementer', '--timeout', '1']);
+  assert.match(r.out, /1\. still broken[\s\S]*Option 1: Give them 2 more rounds/);
+  s.run(['abort']);
+
+  toLimit('b-approve');
+  r = s.run(['answer', '2']);
+  assert.match(r.out, /the task is DONE/);
+  assert.equal(s.run(['wait', 'reviewer', '--timeout', '1']).code, 10);
+
+  toLimit('c-stop');
+  assert.match(s.run(['answer', '3']).out, /the task is ESCALATED/);
+
+  toLimit('d-words');
+  s.run(['answer', 'fix only the crash, then approve']);
+  assert.equal(s.state().status, 'CHANGES_REQUESTED', 'own words: more rounds, with the words passed on');
+  assert.match(s.run(['wait', 'implementer', '--timeout', '1']).out, /fix only the crash, then approve/);
+  s.run(['abort']);
+
+  s.run(['init', 'e-plan', '--plan', '--max-rounds', '1'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: 'rethink' });
+  assert.match(s.state().decision.question, /1 plan rounds/);
+  s.run(['answer', '1']);
+  assert.equal(s.state().status, 'PLAN_CHANGES');
+  assert.equal(s.state().plan_round, 2);
 });
 
 test('diff across nested repos ignores pre-existing changes', () => {
@@ -652,4 +688,151 @@ test('help and unknown commands', () => {
   assert.equal(r.code, 1);
   assert.match(r.out, /USED BY THE AGENTS/);
   assert.equal(s.run(['wait', 'nobody']).code, 1);
+});
+
+// Finish the current task: implementer ready, reviewer approve (with an optional review body).
+function approveCurrent(s, review = 'ok', summary = 'v1') {
+  s.run(['submit', 'implementer', 'ready'], { input: summary });
+  return s.run(['submit', 'reviewer', 'approve'], { input: review });
+}
+
+test('join --after follows the run to the next task and stops when the implementer ends it', () => {
+  const s = sandbox();
+  s.run(['init', 'a-stage'], { input: 'stage 0' });
+  const a = s.state().id;
+  assert.equal(approveCurrent(s, '## Verdict: approved\n## Decisions taken\n- kept the old cooldown (safest)\n').code, 10);
+
+  let r = s.run(['join', '--after', a, '--timeout', '1']);
+  assert.equal(r.code, 11, 'DONE without end: keep waiting for the next task');
+  assert.ok(r.out.includes(`collab join --after ${a}' again`), r.out);
+
+  s.run(['init', 'b-stage'], { input: 'stage 1 brief' });
+  const b = s.state().id;
+  r = s.run(['join', '--after', a, '--timeout', '1']);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /joined task: b-stage-[\s\S]*stage 1 brief/);
+
+  assert.match(s.run(['-t', b, 'end'], { input: 'all done' }).err, /still IMPLEMENTING/);
+  assert.match(s.run(['-t', a, 'end'], { input: 'all done' }).err, /not the latest task/);
+  approveCurrent(s);
+  s.run(['queue', 'add', 'one more']);
+  assert.match(s.run(['-t', b, 'end'], { input: 'all done' }).err, /1 queued task\(s\) still waiting/);
+  s.run(['queue', 'clear']);
+
+  r = s.run(['-t', b, 'end'], { input: '## Final report\nstages 0 and 1 shipped\n' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /ended the run after b-stage-\S+: 2 task\(s\), 1 recorded decision/);
+  assert.match(s.run(['-t', b, 'end'], { input: 'again' }).err, /already ended/);
+
+  r = s.run(['join', '--after', b, '--timeout', '1']);
+  assert.equal(r.code, 10);
+  assert.match(r.out, /^WORK COMPLETE/);
+  assert.match(r.out, /stages 0 and 1 shipped/);
+  assert.match(r.out, /### a-stage-\S+ · #002 reviewer approve\n- kept the old cooldown \(safest\)/);
+  assert.match(r.out, /run ended after 2 task\(s\)/);
+
+  // A new run only collects its own decisions.
+  s.run(['init', 'c-next'], { input: 'new request' });
+  approveCurrent(s);
+  r = s.run(['end'], { input: 'done' });
+  assert.match(r.out, /1 task\(s\), 0 recorded decision/);
+});
+
+test('join --after: unresponsive implementer after DONE, snooze, and a paused queue', async () => {
+  const s = sandbox({ COLLAB_IDLE_SECS: '2' });
+  s.run(['init', 'idle-run'], { input: 'b' });
+  const a = s.state().id;
+  approveCurrent(s);
+  await pause(2500);
+  let r = s.run(['join', '--after', a, '--timeout', '3']);
+  assert.equal(r.code, 13);
+  assert.match(r.out, /^OTHER AGENT LOOKS UNRESPONSIVE: the implementer has neither started a new task nor ended the run/);
+  s.run(['-t', a, 'snooze', '1']);
+  assert.equal(s.run(['join', '--after', a, '--timeout', '1']).code, 11);
+
+  s.run(['init', 'stopped'], { input: 'b' });
+  s.run(['abort']);
+  r = s.run(['join', '--after', a, '--timeout', '1']);
+  assert.equal(r.code, 10);
+  assert.match(r.out, /TASK FINISHED: ABORTED/);
+});
+
+test('decide: the user picks an option, the turn returns to the asker, and the end report lists it', async () => {
+  const s = sandbox({ COLLAB_IDLE_SECS: '1', COLLAB_STALL_SECS: '1' });
+  s.run(['init', 'dec'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.match(s.run(['submit', 'reviewer', 'decide'], { input: 'Which way?\n1. only one' }).err, /at least 2 numbered options/);
+  assert.match(s.run(['answer', '1']).err, /no decision is pending/);
+
+  const q = '## Drop stale replies or strip the snapshot?\n1. Strip the snapshot (Recommended)\n2) Keep it and drop stale replies\n';
+  let r = s.run(['submit', 'reviewer', 'decide'], { input: q });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(s.state().status, 'DECISION');
+  assert.equal(s.state().turn, 'human');
+  assert.deepEqual(s.state().decision.options, ['Strip the snapshot (Recommended)', 'Keep it and drop stale replies']);
+  assert.equal(s.state().round, 1, 'a decision is not a review round');
+  assert.match(s.run(['progress', 'x']).err, /no agent has the turn/);
+
+  await pause(2200);
+  r = s.run(['wait', 'implementer', '--timeout', '2']);
+  assert.equal(r.code, 16, 'the other agent shows the options');
+  assert.match(r.out, /^DECISION NEEDED: the reviewer asks the user to choose/);
+  assert.match(r.out, /2\) Keep it and drop stale replies/);
+  r = s.run(['wait', 'implementer', '--timeout', '1']);
+  assert.equal(r.code, 11, 'shown once, and no idle or stall while the user decides');
+  assert.match(r.out, /has not answered/);
+  assert.equal(s.run(['wait', 'reviewer', '--timeout', '1']).code, 11, 'the asker waits for the answer');
+  assert.equal(s.state().status, 'DECISION');
+  assert.match(s.run(['watch', '--once']).out, /your decision: Drop stale replies or strip the snapshot\?/);
+
+  r = s.run(['answer', '1', 'and', 'document', 'it']);
+  assert.match(r.out, /back to the reviewer \(status: READY_FOR_REVIEW\)/);
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /Option 1: Strip the snapshot \(Recommended\)\n\nand document it/);
+  assert.equal(s.state().max_rounds, 4, 'an ordinary decision leaves the rounds alone');
+
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. strip it' });
+  approveCurrent(s, 'ok', 'v2');
+  r = s.run(['end'], { input: 'done' });
+  assert.equal(r.code, 0, r.err);
+  const entries = path.join(s.taskDir(), 'entries');
+  const end = fs.readFileSync(path.join(entries, fs.readdirSync(entries).find((f) => f.endsWith('-implementer-end.md'))), 'utf8');
+  assert.match(end, /user decision\nOption 1: Strip the snapshot/);
+});
+
+test('decide --self: the asker presents the options, so the other agent keeps waiting', () => {
+  const s = sandbox();
+  s.run(['init', 'self'], { input: 'b' });
+  const r = s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+  assert.match(r.out, /Ask the user now/);
+  assert.equal(s.run(['wait', 'reviewer', '--timeout', '1']).code, 11);
+  assert.match(s.run(['answer', 'neither, do c']).out, /back to the implementer \(status: IMPLEMENTING\)/);
+  assert.match(fs.readFileSync(path.join(s.taskDir(), 'log.md'), 'utf8'), /## User decision\nneither, do c/);
+});
+
+test('a repo root and a folder inside it are the same project; nested repos are snapshotted', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  fs.writeFileSync(path.join(s.project, '.gitignore'), 'modules/\n');
+  const mod = path.join(s.project, 'modules', 'mod-x');
+  gitRepo(mod);
+
+  let r = s.run(['init', 'from-root'], { input: 'b' });
+  assert.match(r.out, /repos snapshotted: 2/);
+  fs.appendFileSync(path.join(mod, 'f.txt'), 'module change\n');
+  assert.match(s.run(['diff', '--stat']).out, /mod-x[\s\S]*f\.txt/, 'changes in the ignored nested repo show up');
+  s.run(['abort']);
+
+  r = s.run(['init', 'from-module'], { input: 'module brief', cwd: mod });
+  assert.equal(r.code, 0, r.err);
+  assert.match(s.run(['init', 'other'], { input: 'b' }).err, /from-module-\S+' is still active in this project/);
+  r = s.run(['join', '--timeout', '1']);
+  assert.match(r.out, /joined task: from-module-[\s\S]*module brief/, 'reviewer at the root finds it');
+
+  s.run(['queue', 'add', 'queued at the root']);
+  assert.match(s.run(['queue', 'next'], { cwd: mod }).out, /queued at the root/);
+  const sibling = path.join(s.root, 'elsewhere');
+  fs.mkdirSync(sibling);
+  assert.equal(s.run(['queue', 'next'], { cwd: sibling }).code, 15, 'unrelated folders stay separate');
 });

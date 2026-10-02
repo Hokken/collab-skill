@@ -54,8 +54,10 @@ in the dashboard and in the log.
 
 ## Features
 
-- **Autonomous loop.** Implement → review → fix → review, until approval, a round limit, or an
-  escalation to you.
+- **Autonomous loop.** Implement → review → fix → review, task after task, until your whole
+  request is done. It only stops for a real fault, a blocker, or when you say so.
+- **Asks, doesn't stall.** When a choice is yours to make, you get a short list of options. Pick
+  one and the pair carries on. The final report lists every decision made along the way.
 - **Live dashboard.** `collab watch` shows whose turn it is, what they're doing right now, and
   every step so far. Browse them with the arrow keys.
 - **Steer while it runs.** `collab note "don't touch the i18n files"` reaches the agents at their
@@ -186,7 +188,7 @@ work.
 | `--branch feat/x` | Work on this branch |
 | `--commit` | Commit the changes when the task is done (never pushes) |
 | `--confirm` | Ask you before this queued task starts |
-| `--max-rounds N` | Review rounds before escalating (default 4) |
+| `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
 | `--first` | Put it at the front of the queue |
 
 The same options work for a single task: `/Collab implement --check "npm test" fix the login redirect`.
@@ -225,6 +227,7 @@ also run themselves.
 | `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer) |
 | `collab snooze [MIN]` | Keep waiting on a slow agent: no idle prompt for MIN minutes (default 30). 🤖 when you answer *keep waiting* |
 | `collab abort` | Stop the current task; both agents exit their loop. 🤖 when you answer *stop* |
+| `collab answer <N \| text>` | Answer a pending decision: option N, or your own words. 🤖 when you pick an option in Claude Code |
 
 **Look at a task**
 
@@ -258,14 +261,15 @@ Add `-t <task-id>` to any command to target a task other than the current one.
 | `collab queue next` · `queue skip` | Show / drop the next queued task for this project |
 | `collab queue split [--reason TEXT]` | Implementer: split the current task (parts on stdin, separated by `=== part ===` lines); part 1 stays, the rest queue next |
 | `collab check` | Run the task's `--check` command |
-| `collab join` | Reviewer: wait until a task exists, print its brief |
+| `collab join [--after ID]` | Reviewer: wait until a task exists, print its brief. With `--after` (the task it just finished), it also stops when the run ends |
+| `collab end` | Implementer: the whole request is done. Ends the run for both agents (final report on stdin or `--file`) |
 | `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |
 | `collab progress "text"` | Post what you're doing now (shown to the other side) |
-| `collab submit implementer <plan\|ready\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
-| `collab submit reviewer <changes\|approve\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
+| `collab submit implementer <plan\|ready\|decide\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
+| `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself) |
 
 Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` new note · `13` other agent idle ·
-`14` check failed · `15` queue empty · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
+`14` check failed · `15` queue empty · `16` decision for you · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
 
 </details>
 
@@ -280,8 +284,11 @@ Not for the coordination. Waiting is a plain shell command, so an agent spends n
 other works. You pay for the actual implementing and reviewing, as you would by hand.
 
 **What if they disagree forever?**
-They can't. After a round limit (default 4, `--max-rounds N`) the task escalates to you. Either
-agent can also escalate earlier, for example when the brief is ambiguous.
+They can't. After a round limit (default 4, `--max-rounds N`) you pick: 2 more rounds, approve
+as it is, or stop the task. Before that, they settle technical calls themselves (the safest
+option, noted in the final report). When a choice is really yours, such as product behaviour or
+an ambiguous requirement, they ask you right away with a short list of options and carry on once
+you pick one.
 
 **What if an agent crashes or hangs?**
 If the working agent goes quiet (no handoff, no progress update, no file changes for a while), the
@@ -305,7 +312,7 @@ All optional, via environment variables:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLAB_MAX_ROUNDS` | `4` | Review rounds before escalating to you |
+| `COLLAB_MAX_ROUNDS` | `4` | Review rounds before you are asked how to go on |
 | `COLLAB_IDLE_SECS` | `1800` | Quiet time before "stop or keep waiting?" |
 | `COLLAB_QUIET_MINS` | `10` | …and no file changes for this long (implementer's turn) |
 | `COLLAB_STALL_SECS` | `7200` | Hard stop when nobody answers |

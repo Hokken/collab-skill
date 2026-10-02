@@ -7,7 +7,17 @@ description: Autonomous implementer/reviewer loop between two coding agents (e.g
 
 Two agents, running in separate terminals, share one task through the `collab` CLI:
 one **implements**, the other **reviews**, and they hand off turns until the reviewer
-approves, the round limit is reached, or someone escalates to the human.
+approves. A request can take several tasks (e.g. the stages of a plan): the pair works through
+all of them without the user restarting anything.
+
+**The loop only stops when:**
+1. there is a real fault: an agent stops responding, or the CLI fails in a way a retry doesn't fix;
+2. everything the user asked for is done (the implementer runs `collab end`);
+3. a task is escalated: something outside the task blocks it (see *Escalation*), or the user
+   chose *stop* when the round limit (default 4) was reached.
+
+A question only the user can answer is not a stop: ask it with `decide` (see *Decisions for
+the user*) and carry on once they pick an option.
 
 ## Pick your role
 
@@ -32,7 +42,7 @@ dark mode`. Pass them straight to `collab init`:
 | Option | Meaning |
 |---|---|
 | `--plan` | the reviewer approves a plan before any code (see *Plan phase*) |
-| `--max-rounds N` | review rounds before escalating |
+| `--max-rounds N` | review rounds before the user is asked how to go on |
 | `--check "CMD"` | must pass before every handoff; `collab submit` runs it |
 | `--scope "GLOBS"` | files the task may change (comma-separated); `collab diff` flags the rest |
 | `--focus "TEXT"` | what the reviewer should look at hardest |
@@ -63,19 +73,28 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   `11` = wait timed out and it's still not your turn (just run the same command again),
   `12` = submit refused because the user added a note during your turn (see below),
   `13` = the other agent looks unresponsive (see below),
-  `14` = submit refused because the task's `--check` failed, `15` = the queue is empty, `1` = error.
+  `14` = submit refused because the task's `--check` failed, `15` = the queue is empty,
+  `16` = the user has to choose: the other agent asked, or the round limit was reached (see
+  *Decisions for the user*), `1` = error.
+  For `join --after`, `10` also means the implementer ended the run.
+- **Start both agents from the same project folder** when you can. A folder and the folders
+  inside it count as one project (e.g. a repo root and a module in it), so tasks and the queue
+  are still shared if they differ. But `--check` runs, and `collab diff` paths are shown,
+  relative to the folder the task was started from.
 - If a submit fails with "task already finished", the user stopped the task: stop looping and
   give them a short report of where you were.
 
 ## The other agent looks unresponsive (exit 13)
 
 `wait` returns 13 when the other agent has not handed off for 30 min. While the implementer is
-working, it also needs no project file to have changed for 10 min. The user already got a desktop
-notification.
+working, it also needs no project file to have changed for 10 min. `join --after` returns 13 when
+the implementer has neither started a new task nor ended the run for 30 min. The user already
+got a desktop notification.
 - **Claude Code:** use the AskUserQuestion tool: "The <other role> has not handed off for
   N min. Stop the task?", with the options **Keep waiting (30 min)** and **Stop the task**.
   On *keep waiting*, run `collab -t <id> snooze 30` (or the minutes the user gives), then go back
-  to waiting. On *stop*, run `collab -t <id> abort` and give the user a short final report.
+  to waiting. On *stop*, run `collab -t <id> abort` (skip this after `join --after`: that task
+  is already finished) and give the user a short final report.
 - **Codex CLI:** **don't end your turn.** If you ended it, the other agent's handoff would go
   unnoticed until the user spoke to you again. Instead, post a short message: "The <other role>
   has not handed off for N min. I'll keep waiting; interrupt me and say *stop* to end the task."
@@ -118,8 +137,8 @@ collab -t <id> progress "fixing item 2: missing null check in parser.ts"
 Waiting is a blocking shell command, so polling doesn't use model tokens. **Never end your
 turn while you are in the loop**, and that includes the reviewer waiting in `collab join` for a
 task that doesn't exist yet. Exit 11 from `wait` or `join` only means "not yet": run the same
-command again. Keep waiting until you see exit 10 (or exit 13, see above). If the user wants you
-to stop, they will interrupt you.
+command again. Keep waiting until you see exit 10 (or 13 or 16, see above). If the user wants
+you to stop, they will interrupt you.
 
 - **Claude Code:** run `collab wait <role> --timeout 3300` (or `collab join --timeout 3300`)
   with the Bash tool's `run_in_background: true`. You are re-invoked when it exits. Read its
@@ -130,7 +149,7 @@ to stop, they will interrupt you.
 - **If the shell tool stops the command before it exits** (a tool timeout, "command timed out",
   an interrupted or killed process, no exit code), that is not an error in the task. Run the same
   command again, with a `--timeout` below the shell tool's limit (e.g. `--timeout 240` for a
-  5-minute limit). The same goes for any exit code other than 0, 10, 13 and the ones listed for
+  5-minute limit). The same goes for any exit code other than 0, 10, 13, 16 and the ones listed for
   `submit`: check `collab -t <id> status`, then go back to waiting.
 
 ## Implementer loop
@@ -149,11 +168,13 @@ to stop, they will interrupt you.
    (project rules, things not to touch)
    EOF
    ```
-   The CLI snapshots every git repo under the project, so `collab diff` later shows only
-   what changed during this task. Tell the user the task id and that the reviewer can now
+   The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
+   shows only what changed during this task. Tell the user the task id and that the reviewer can now
    be started with `collab review` (Claude Code: `/Collab review`, Codex: `$Collab review`),
    and that they can watch live with `collab watch` and steer with `collab note "…"`.
-   If the task is too big for one review, split it now (see *Splitting a task*).
+   If the request has several stages (a staged plan, a list of deliverables) or is too big for
+   one review, split it now into **all** its parts (see *Splitting a task*), not just the first
+   few. Leave stages out only if the user explicitly asked for a subset.
    In plan mode, go through the *Plan phase* first, then continue at step 2.
 2. **Implement.** Follow the project's own rules (CLAUDE.md / AGENTS.md: commits, dev servers
    and so on). If the task has a `--branch`, create or switch to it before changing anything.
@@ -170,6 +191,8 @@ to stop, they will interrupt you.
    ## Review responses          (from round 2 on)
    1. Fixed — …
    2. Declined — reason …
+   ## Decisions taken           (only for judgment calls you made yourself, see *Escalation*)
+   - what you chose, the alternatives, and why it is the safe choice
    ## Known limitations / open questions
    ```
    **Exit 14** means the task's check failed and nothing was submitted: fix the problem and submit
@@ -178,9 +201,18 @@ to stop, they will interrupt you.
    Address every numbered item, either by fixing it or by declining with a reason, then go back to step 3.
 5. On **exit 10**:
    - **DONE:** if the task has `--commit`, commit its changes now (in each repo you changed, on the
-     current branch, with a message summarising the task; never push). Give the user a short report
-     of the task, then run `collab queue next`. If it shows a task, start it (see *Queued tasks*)
-     and continue the loop. If the queue is empty (exit 15), stop with a final report.
+     current branch, with a message summarising the task; never push). Post a one-line status as
+     plain text (**don't end your turn**), then run `collab queue next`. If it shows a task, start
+     it (see *Queued tasks*) and continue the loop. If the queue is empty (exit 15), check the
+     user's original request (and any plan it points to). If some of it is still not done, start
+     the next part with `collab init` and continue. Only when **all** of it is done, run
+     `collab -t <id> end` with a final report on stdin or `--file`:
+     ```
+     ## Final report
+     what was delivered, task by task; anything left for the user (manual steps, follow-ups)
+     ```
+     The CLI appends every answer the user gave and every *Decisions taken* section of the run,
+     and stops the reviewer. Then stop, and give the user that report, decisions included.
    - **ESCALATED, STALLED or ABORTED:** stop. Give the user a short report and explain what needs
      a decision. **Don't start queued tasks**: the queue waits until the user runs
      `/Collab implement` again.
@@ -207,8 +239,9 @@ folder, with its options.
 ## Splitting a task (implementer)
 
 Use `collab queue split` when a task from the user is too big to review well in one pass, for
-example when it has several independent changes, or a refactor followed by a feature on top of it.
-Don't split small tasks. Each part must be something the reviewer can approve on its own, and
+example when it has several independent changes, a refactor followed by a feature on top of it,
+or a plan with stages. Split it into every part the request covers, so the pair can work through
+all of them. Don't split small tasks. Each part must be something the reviewer can approve on its own, and
 it must leave the project working.
 
 Split **right after `collab init`**, before your first `plan` or `ready`. The CLI refuses later
@@ -230,6 +263,8 @@ EOF
   reviewer sees that only part 1 is in scope.
 - Parts 2..N are queued next for this project. Each will be its own task with its own review,
   and its brief says which part it is. You start them later through *Queued tasks*, as usual.
+- Work you find later (a stage you missed, a follow-up the review uncovered) goes in with
+  `collab queue add --first [options] "…"`, repeating the task options it needs.
 - Tell the user how you split the work (one line per part). They can edit the queue with
   `collab queue rm` / `move`.
 - In plan mode, split before submitting the plan, and make the plan cover part 1 only.
@@ -284,28 +319,74 @@ EOF
      1. [blocking] path:line — problem → what to do
      2. [should-fix] …
      ## Nits (optional, non-blocking)
+     ## Decisions taken (only for judgment calls you made yourself, see *Escalation*)
      ```
      Then go back to step 2.
    - Nothing blocking → `collab submit reviewer approve` with a short verdict and any nits.
      In the build phase, this ends the task for both agents.
 5. On **exit 10** (from `wait`, or from your own `approve`):
-   - If the status is **DONE** and the output has a `QUEUE:` line, more tasks are waiting: go back
-     to step 1 (`collab join`, without `-t`) to pick up the next task, then pin its new id.
-   - Otherwise stop looping and give the user a short final report.
+   - If the status is **DONE**, the implementer may have more tasks to do. Run
+     `collab join --after <id>` (without `-t`; `<id>` is the task that just finished) and wait as
+     in *How to wait*:
+     - **exit 0:** a new task started. Pin its new id and go to step 2.
+     - **exit 10:** with `WORK COMPLETE`, the implementer ended the run; with `TASK FINISHED`, a
+       later task ended without approval. Either way, stop and give the user a short final report.
+     - **exit 13:** the implementer hasn't started anything new for a long time. Handle it as in
+       *The other agent looks unresponsive*, snoozing the task that `join` names.
+     - **exit 11:** run the same `join --after` again.
+   - Otherwise (ESCALATED, STALLED, ABORTED) stop looping and give the user a short final report.
+
+## Decisions for the user (either role)
+
+When a choice belongs to the user (product behaviour, a trade-off they would want a say in, an
+ambiguous requirement), **ask right away** with `decide`. Don't spend review rounds on it. The
+task pauses (`DECISION`) and continues as soon as the user picks an option.
+
+1. Write the question with 2–4 numbered options, the recommended one first and marked
+   `(Recommended)`, each with its consequence:
+   ```
+   ## Strip the base snapshot from incidental prompts?
+   Context in 2–4 lines: what is at stake, what you found.
+   1. Strip it from incidental prompts (Recommended) — nothing stale to drop, replies keep flowing
+   2. Keep it and drop stale replies — strictly factual, but some replies vanish
+   3. Keep it, check only match/audience/age — rare stale mentions
+   ```
+2. Submit it with `collab -t <id> submit <role> decide`:
+   - **Claude Code:** add `--self`, then ask the user yourself with AskUserQuestion (the options
+     from your message; the context goes in the question). Record the answer with
+     `collab -t <id> answer <N>` (or `answer "<their own words>"`). The turn is yours again:
+     carry on.
+   - **Codex CLI:** without `--self`. Then run `collab -t <id> wait <role>` as usual. It returns
+     (exit 0) with the user's answer once they have chosen.
+3. **Exit 16 from `wait`** means the user has to choose: the other agent asked, or the round
+   limit was reached (see *Escalation*). Claude Code: ask the user with AskUserQuestion as in
+   step 2, run `collab -t <id> answer …`, then go back to waiting. Codex: post the question and
+   options as plain text, tell the user to answer with `collab answer <N>` in any terminal, and
+   go back to waiting (**don't end your turn**). If `answer` says no decision is pending, the
+   user already answered elsewhere: just go back to waiting.
+
+The user's answer takes priority, like a human note.
 
 ## Escalation (either role)
 
-Use `collab submit <role> escalate` with a clear question when:
-- the brief is ambiguous, or a decision belongs to the human;
-- you and the other agent disagree on the same point for a second round;
-- something is broken outside the task's scope.
+Don't escalate a disagreement or a technical judgment call. Keep reviewing. If the reviewer
+still requests changes once the round limit (default 4) is reached, the CLI asks the user
+(exit 16 for both agents): 2 more rounds, approve as it is, or stop. The task continues
+with their choice. For a
+technical choice you can make yourself, pick the safest option (or the one the codebase already
+leans towards), carry on, and note it under `## Decisions taken` in your summary or review. The
+final report lists these for the user.
 
-The round limit (default 4) escalates automatically. After escalating, stop and report to the user.
+Use `collab submit <role> escalate` only when the task **cannot** continue: something outside its
+scope is broken, access or credentials are missing, or the next step is destructive or
+irreversible and the user hasn't approved it. Give a clear question. After escalating, stop and
+report to the user.
 
 ## Human controls
 
 - `collab watch`: interactive dashboard: ↑↓ steps in full, ←→ earlier tasks, live progress, timers
 - `collab note "…"`: steer a running task (add `--implementer` or `--reviewer` to target one agent)
+- `collab answer <N | text>`: answer a pending decision
 - `collab status`, `collab log`, `collab list`, `collab abort` (stops both loops)
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks
 - `collab queue add [options] "…"`, `collab queue`, `collab queue rm N`: manage the task queue

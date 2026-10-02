@@ -3,10 +3,12 @@
 // (e.g. Claude Code and Codex CLI) through a shared state folder in ~/.collab.
 //
 // Exit codes: 0 ok / your turn, 1 error, 10 task finished (DONE, ESCALATED,
-// ABORTED, STALLED), 11 wait timed out (not your turn yet — just run it again),
+// ABORTED, STALLED) or, for 'join --after', the implementer ended the run,
+// 11 wait timed out (not your turn yet — just run it again),
 // 12 submit refused because the user added a note during your turn,
 // 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
-// 14 submit refused because the task's --check command failed, 15 the queue is empty.
+// 14 submit refused because the task's --check command failed, 15 the queue is empty,
+// 16 the other agent asked the user to decide something — show them the options.
 //
 // Zero dependencies; runs on macOS, Linux and Windows (Node >= 18).
 'use strict';
@@ -40,6 +42,7 @@ const EXIT_NOTES = 12;
 const EXIT_IDLE = 13;
 const EXIT_CHECK = 14;
 const EXIT_EMPTY = 15;
+const EXIT_DECISION = 16;
 
 const TERMINAL = new Set(['DONE', 'ESCALATED', 'ABORTED', 'STALLED']);
 const ROLES = ['implementer', 'reviewer'];
@@ -132,9 +135,14 @@ function currentId() {
   try { return fs.readFileSync(path.join(COLLAB_HOME, 'current'), 'utf8').trim(); } catch { return ''; }
 }
 
-// Default task: the newest one for the project folder we're in, else the most recent one anywhere.
-// So two pairs working in different projects never pick up each other's task.
-const projectTaskId = () => projectTasks(process.cwd()).slice(-1)[0] || '';
+// Default task: the project's newest active task, else its newest one, else the most recent one
+// anywhere. So two pairs working in different projects never pick up each other's task.
+const projectTaskId = () => latestTask(process.cwd());
+function latestTask(dir) {
+  const ids = projectTasks(dir);
+  const active = ids.filter((id) => { try { return !isTerminal(readState(path.join(TASKS, id)).status); } catch { return false; } });
+  return active.slice(-1)[0] || ids.slice(-1)[0] || '';
+}
 const rawTaskId = () => TASK_OVERRIDE || process.env.COLLAB_TASK || projectTaskId() || currentId();
 
 function taskDir() {
@@ -276,6 +284,12 @@ function readBody(file) {
   return text.endsWith('\n') ? text : `${text}\n`;
 }
 
+// First meaningful line of a message, without markdown heading marks.
+const headline = (t) => (t.split('\n').find((l) => /\w/.test(l)) || '').replace(/^[#>*\s-]+/, '').trim();
+
+// Numbered options ("1. …" or "2) …") of a decision, in order.
+const decisionOptions = (body) => body.split('\n').map((l) => l.match(/^\s*(\d+)[.)]\s+(\S.*)$/)).filter(Boolean).map((m) => m[2].trim());
+
 // --- git snapshot helpers -----------------------------------------------------
 
 function git(cwd, args) {
@@ -285,21 +299,23 @@ function git(cwd, args) {
   return { ok: r.status === 0, out: r.stdout || '' };
 }
 
+// The repo holding root (if any) plus every repo nested under root up to 3 levels down, so a
+// task started at a repo root also sees nested repos it ignores (e.g. AzerothCore's modules/*).
 function findRepos(root) {
+  const repos = new Set();
   const top = git(root, ['rev-parse', '--show-toplevel']);
-  if (top.ok && top.out.trim()) return [path.resolve(top.out.trim())];
-  const repos = [];
+  if (top.ok && top.out.trim()) repos.add(path.resolve(top.out.trim()));
   const walk = (dir, depth) => {
     let items;
     try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const it of items) {
-      if (it.name === 'node_modules') continue;
-      if (it.name === '.git') { repos.push(dir); continue; }
+      if (it.name === '.git') { if (dir !== root || !repos.size) repos.add(path.resolve(dir)); continue; }
+      if (SKIP_DIRS.has(it.name)) continue;
       if (it.isDirectory() && depth < 3) walk(path.join(dir, it.name), depth + 1);
     }
   };
   walk(root, 1);
-  return repos.sort();
+  return [...repos].sort();
 }
 
 const untrackedFiles = (repo) =>
@@ -352,6 +368,7 @@ const lastActivity = (st) => Math.max(st.updated_epoch, (liveProgress(st) || {})
 
 // Why the agent whose turn it is looks unresponsive, or ''.
 function idleReason(st) {
+  if (!ROLES.includes(st.turn)) return ''; // waiting on the user (a decision), not on an agent
   const now = epoch();
   const since = now - lastActivity(st);
   if (since < IDLE || now < (st.snooze_until || 0)) return '';
@@ -419,6 +436,14 @@ function realDir(p) {
   try { return fs.realpathSync.native(path.resolve(p)); } catch { return path.resolve(p); }
 }
 
+// Two folders are the same project when one contains the other, so a pair whose agents start
+// from a repo root and from a module inside it still share tasks and the queue. Arguments are realDir()s.
+function sameProject(a, b) {
+  const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p).replace(/[\\/]+$/, '');
+  const [x, y] = [norm(a), norm(b)];
+  return x === y || x.startsWith(y + path.sep) || y.startsWith(x + path.sep);
+}
+
 // --- queue ------------------------------------------------------------------------
 
 const queuePath = () => path.join(COLLAB_HOME, 'queue.json');
@@ -442,7 +467,7 @@ function withQueue(fn) {
   });
 }
 
-const forProject = (q, dir) => q.items.filter((it) => it.project_dir === realDir(dir));
+const forProject = (q, dir) => q.items.filter((it) => sameProject(it.project_dir, realDir(dir)));
 const partLabel = (p) => `part ${p.index}/${p.total} of ${p.parent}`;
 
 // A split part that ends without approval holds back its later parts: each one then needs
@@ -459,9 +484,9 @@ function holdParts(st) {
 }
 const queueCount = (dir) => forProject(readQueue(), dir).length;
 
-function queueLine(dir) {
-  const n = queueCount(dir);
-  return n ? `QUEUE: ${n} more task(s) waiting for this project. Implementer: start the next one ('collab queue next'). Reviewer: run 'collab join' to wait for it.` : '';
+function queueLine(st) {
+  const n = queueCount(st.project_dir);
+  return n ? `QUEUE: ${n} more task(s) waiting for this project. Implementer: start the next one ('collab queue next'). Reviewer: run 'collab join --after ${st.id}' to wait for it.` : '';
 }
 
 // --- --check and --scope ---------------------------------------------------------------
@@ -598,7 +623,7 @@ function cmdInit(args) {
   let item = null;
   if (opts.fromQueue) {
     item = withQueue((q) => {
-      const i = q.items.findIndex((it) => it.project_dir === realDir(dir));
+      const i = q.items.findIndex((it) => sameProject(it.project_dir, realDir(dir)));
       if (i < 0) return null;
       // A --confirm task only starts with the user's recorded go-ahead.
       if (q.items[i].options && q.items[i].options.confirm && !(opts.confirmed || '').trim()) {
@@ -670,12 +695,21 @@ function cmdInit(args) {
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
 }
 
+// --after <task-id>: the reviewer just finished that task and waits for the implementer's next
+// one. Then the newest task of that project decides: a new active task is joined, `collab end`
+// on it stops the reviewer too (exit 10), and a long silence after DONE asks the user (exit 13).
 async function cmdJoin(args) {
-  const { opts } = takeOpts(args, timeoutOpt);
+  const { opts } = takeOpts(args, { values: { ...timeoutOpt.values, '--after': 'after' } });
   const timeout = toSecs(opts.timeout, 540);
   const start = epoch();
+  let projectDir = '';
+  if (opts.after) {
+    const ad = path.join(TASKS, opts.after);
+    if (!fs.existsSync(statePath(ad))) die(`task not found: ${opts.after}`);
+    projectDir = readState(ad).project_dir;
+  }
   for (;;) {
-    const id = rawTaskId();
+    const id = projectDir ? latestTask(projectDir) : rawTaskId();
     const d = id && path.join(TASKS, id);
     if (d && fs.existsSync(statePath(d))) {
       const st = readState(d);
@@ -686,10 +720,27 @@ async function cmdJoin(args) {
         printEntry(d, listEntries(d)[0]);
         return;
       }
+      if (projectDir && st.ended) {
+        out(`WORK COMPLETE: the implementer ended the run after ${id}.`);
+        printEntry(d, listEntries(d).find((f) => seqOf(f) === st.ended.seq));
+        exit(EXIT_TERMINAL);
+      }
+      if (projectDir && st.status !== 'DONE') {
+        out(`TASK FINISHED: ${st.status} (${id}) — the queue is paused until the user decides.`);
+        printEntry(d, latestEntry(d));
+        exit(EXIT_TERMINAL);
+      }
+      if (projectDir && epoch() - st.updated_epoch >= IDLE && epoch() >= (st.snooze_until || 0)) {
+        const why = `the implementer has neither started a new task nor ended the run for ${Math.floor((epoch() - st.updated_epoch) / 60)} min since ${id} was approved`;
+        notify(`${id}: ${why} — stop or keep waiting?`);
+        out(`OTHER AGENT LOOKS UNRESPONSIVE: ${why}.`);
+        out(`Ask the user: stop here, or keep waiting ('collab -t ${id} snooze [MIN]', default 30)?`);
+        exit(EXIT_IDLE);
+      }
     }
     if (epoch() - start >= timeout) {
       out(`no active task yet (waited ${fmtDur(epoch() - start)}). This is normal: the implementer may still be writing the brief.`);
-      out("Run 'collab join' again right away. Keep waiting; don't end your turn.");
+      out(`Run 'collab join${opts.after ? ` --after ${opts.after}` : ''}' again right away. Keep waiting; don't end your turn.`);
       exit(EXIT_TIMEOUT);
     }
     await sleep(POLL * 1000);
@@ -709,7 +760,7 @@ async function cmdWait(args) {
     if (isTerminal(st.status)) {
       out(`TASK FINISHED: ${st.status} (round ${st.round})`);
       printEntry(d, latestEntry(d));
-      if (st.status === 'DONE' && queueLine(st.project_dir)) out(queueLine(st.project_dir));
+      if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
       exit(EXIT_TERMINAL);
     }
     if (st.turn === role) {
@@ -723,6 +774,25 @@ async function cmdWait(args) {
       out(`project: ${st.project_dir}`);
       for (const f of fresh) printEntry(d, f);
       return;
+    }
+    // A decision for the user: the agent that asked waits for the answer; the other one shows
+    // the options once, unless the asker presents them itself (--self). The round-limit menu goes
+    // to both agents, whichever can show it. No idle or stall meanwhile.
+    if (st.status === 'DECISION') {
+      const dec = st.decision || {};
+      if ((dec.role !== role || dec.kind === 'limit') && !dec.self && !(dec.shown || {})[role]) {
+        withLock(d, () => update(d, (s) => { if (s.decision) s.decision.shown = { ...s.decision.shown, [role]: true }; }, { touch: false }));
+        out(`DECISION NEEDED: ${dec.kind === 'limit' ? 'the round limit is reached' : `the ${dec.role} asks the user to choose`}. Show the user the options below, then record`);
+        out(`their choice with 'collab -t ${st.id} answer <N | text>' and go back to waiting.`);
+        printEntry(d, listEntries(d).find((f) => seqOf(f) === dec.seq));
+        exit(EXIT_DECISION);
+      }
+      if (epoch() - start >= timeout) {
+        out(`still waiting — the user has not answered the ${dec.role}'s question yet ('collab answer <N | text>'). Run 'collab wait ${role}' again.`);
+        exit(EXIT_TIMEOUT);
+      }
+      await sleep(POLL * 1000);
+      continue;
     }
     const idle = idleReason(st);
     if (idle) {
@@ -749,39 +819,59 @@ async function cmdWait(args) {
   }
 }
 
+// The reviewer's changes go back to the implementer for another round.
+function requestChanges(s) {
+  if ((s.phase || 'build') === 'plan') { s.status = 'PLAN_CHANGES'; s.plan_round = (s.plan_round || 1) + 1; } else { s.status = 'CHANGES_REQUESTED'; s.round += 1; }
+  s.turn = 'implementer';
+}
+
+const LIMIT_OPTIONS = [
+  'Give them 2 more rounds: the implementer gets this review (Recommended)',
+  'Approve the task as it is',
+  'Stop the task (escalate; queued tasks wait for you)',
+];
+
 function transition(st, role, kind) {
   const phase = st.phase || 'build';
   const max = st.max_rounds;
   const bad = `invalid: '${role} ${kind}' in ${phase} phase`;
-  const escalate = (why) => ({ apply: (s) => { s.status = 'ESCALATED'; s.turn = 'none'; }, note: why });
+  const escalate = () => ({ apply: (s) => { s.status = 'ESCALATED'; s.turn = 'none'; } });
+  // Out of rounds: the user decides (LIMIT_OPTIONS) instead of the task just stopping.
+  const limit = (what) => ({ apply: (s) => { s.decision = { role, status: s.status, turn: s.turn, kind: 'limit' }; s.status = 'DECISION'; s.turn = 'human'; }, limit: what });
   switch (`${phase}:${role}:${kind}`) {
     case 'plan:implementer:plan':
       return { apply: (s) => { s.status = 'PLAN_REVIEW'; s.turn = 'reviewer'; } };
     case 'plan:reviewer:approve':
       return { apply: (s) => { s.phase = 'build'; s.status = 'IMPLEMENTING'; s.turn = 'implementer'; s.round = 1; } };
     case 'plan:reviewer:changes':
-      if ((st.plan_round || 1) + 1 > max) return escalate(`max plan rounds (${max}) reached`);
-      return { apply: (s) => { s.status = 'PLAN_CHANGES'; s.turn = 'implementer'; s.plan_round = (s.plan_round || 1) + 1; } };
+      if ((st.plan_round || 1) + 1 > max) return limit(`${max} plan rounds`);
+      return { apply: requestChanges };
     case 'build:implementer:ready':
       return { apply: (s) => { s.status = 'READY_FOR_REVIEW'; s.turn = 'reviewer'; } };
     case 'build:reviewer:changes':
-      if (st.round + 1 > max) return escalate(`max rounds (${max}) reached`);
-      return { apply: (s) => { s.status = 'CHANGES_REQUESTED'; s.turn = 'implementer'; s.round += 1; } };
+      if (st.round + 1 > max) return limit(`${max} review rounds`);
+      return { apply: requestChanges };
     case 'build:reviewer:approve':
       return { apply: (s) => { s.status = 'DONE'; s.turn = 'none'; } };
     case 'plan:implementer:ready':
       return die(`${bad} — submit your plan with 'collab submit implementer plan' first`);
     default:
-      if (ROLES.includes(role) && kind === 'escalate') return escalate('');
-      return die(`${bad} (plan phase: implementer plan|escalate, reviewer changes|approve|escalate; build phase: implementer ready|escalate, reviewer changes|approve|escalate)`);
+      if (ROLES.includes(role) && kind === 'escalate') return escalate();
+      // A question for the user; the turn comes back to the asker once they answer.
+      if (ROLES.includes(role) && kind === 'decide') {
+        return { apply: (s) => { s.decision = { role, status: s.status, turn: s.turn }; s.status = 'DECISION'; s.turn = 'human'; } };
+      }
+      return die(`${bad} (plan phase: implementer plan|decide|escalate, reviewer changes|approve|decide|escalate; build phase: implementer ready|decide|escalate, reviewer changes|approve|decide|escalate)`);
   }
 }
 
 async function cmdSubmit(args) {
-  const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' } });
+  const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' }, flags: { '--self': { self: true } } });
   const [role, kind] = rest;
   const d = taskDir();
   let body = readBody(opts.file);
+  const options = kind === 'decide' ? decisionOptions(body) : [];
+  if (kind === 'decide' && options.length < 2) die("a decision needs at least 2 numbered options ('1. …', '2. …'), one per line");
 
   // The task's --check must pass before the implementer hands off its work.
   const pre = readState(d);
@@ -811,10 +901,17 @@ async function cmdSubmit(args) {
     }
 
     const t = transition(st, role, kind);
-    if (t.note) body += `\n\n> collab: ${t.note} — escalated to the human.\n`;
+    const question = t.limit ? `Round limit reached (${t.limit}) and the reviewer still requests changes. What now?` : headline(body);
+    if (t.limit) body += `\n\n## ${question}\n${LIMIT_OPTIONS.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n`;
     addEntry(d, st, role, kind, body);
     return {
-      st: update(d, (s) => { t.apply(s); s.seq += 1; s.updated_by = role; s.turn_since = epoch(); }),
+      st: update(d, (s) => {
+        t.apply(s);
+        if (s.decision && s.decision.seq === undefined) {
+          Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
+        }
+        s.seq += 1; s.updated_by = role; s.turn_since = epoch();
+      }),
     };
   });
 
@@ -825,9 +922,17 @@ async function cmdSubmit(args) {
   }
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+  if (st.status === 'DECISION') {
+    const dec = st.decision;
+    notify(`${st.id}: your decision is needed — ${dec.question}`);
+    if (dec.kind === 'limit') out(`${dec.question} The user decides. Run 'collab -t ${st.id} wait ${role}': it shows you the options (exit 16).`);
+    else if (dec.self) out(`Ask the user now, then record their choice with 'collab -t ${st.id} answer <N | text>'; the turn comes back to you.`);
+    else out(`The other agent (or the user, with 'collab answer <N | text>') presents it. Run 'collab -t ${st.id} wait ${role}': it returns with the answer.`);
+    return;
+  }
   notify(`${st.id}: ${st.status}`);
   holdParts(st);
-  if (st.status === 'DONE' && queueLine(st.project_dir)) out(queueLine(st.project_dir));
+  if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
   if (isTerminal(st.status)) exit(EXIT_TERMINAL);
 }
 
@@ -901,7 +1006,7 @@ function cmdQueue(args) {
     if (!q.items.length) { out('the queue is empty'); return; }
     const here = realDir(process.cwd());
     out(`queue: ${q.items.length} task(s)`);
-    q.items.forEach((it, i) => out(`${it.project_dir === here ? '*' : ' '} ${String(i + 1).padStart(2)}. ${show(it)}`));
+    q.items.forEach((it, i) => out(`${sameProject(it.project_dir, here) ? '*' : ' '} ${String(i + 1).padStart(2)}. ${show(it)}`));
     out('(* = this project; the implementer takes the first task for its own project)');
     return;
   }
@@ -950,7 +1055,7 @@ function cmdQueue(args) {
     const { opts } = takeOpts(rest, { values: { '--dir': 'dir' } });
     const dir = path.resolve(opts.dir || process.cwd());
     const it = withQueue((q) => {
-      const i = q.items.findIndex((x) => x.project_dir === realDir(dir));
+      const i = q.items.findIndex((x) => sameProject(x.project_dir, realDir(dir)));
       return i < 0 ? null : q.items.splice(i, 1)[0];
     });
     if (!it) { out(`the queue has no task for ${dir}`); exit(EXIT_EMPTY); }
@@ -978,7 +1083,7 @@ function cmdQueue(args) {
       delete options.confirm;
       const queued = withQueue((q) => {
         const dir = realDir(st.project_dir);
-        const at = q.items.findIndex((it) => it.project_dir === dir);
+        const at = q.items.findIndex((it) => sameProject(it.project_dir, dir));
         const items = parts.slice(1).map((text, i) => ({
           id: q.next_id + i, added_at: nowIso(), added_by: 'implementer', project_dir: dir,
           text: `${text}\n`, options, part: { index: i + 2, total, parent: st.id },
@@ -1031,7 +1136,7 @@ function cmdQueue(args) {
     const here = realDir(process.cwd());
     const n = withQueue((q) => {
       const before = q.items.length;
-      q.items = opts.all ? [] : q.items.filter((it) => it.project_dir !== here);
+      q.items = opts.all ? [] : q.items.filter((it) => !sameProject(it.project_dir, here));
       return before - q.items.length;
     });
     out(`removed ${n} task(s) ${opts.all ? 'from the queue' : `for ${path.basename(here)}`}`);
@@ -1186,6 +1291,95 @@ function cmdAbort() {
   out(`aborted ${st.id}`);
 }
 
+// Records the user's answer to a pending decision and hands the turn back to the agent that asked.
+// "N" (optionally followed by more text) picks option N; anything else is a free-form answer.
+function cmdAnswer(args) {
+  const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' } });
+  const d = taskDir();
+  const text = rest.join(' ').trim();
+  const raw = (text && !opts.file ? text : readBody(opts.file)).trim();
+  const st = withLock(d, () => {
+    const s0 = readState(d);
+    if (s0.status !== 'DECISION' || !s0.decision) die(`no decision is pending (status: ${s0.status})`);
+    const dec = s0.decision;
+    const m = raw.match(/^(\d+)(?:[.):](?!\d)|(?=\s|$))\s*([\s\S]*)$/);
+    const pick = m && dec.options && dec.options[parseInt(m[1], 10) - 1];
+    const answer = pick ? `Option ${m[1]}: ${pick}${m[2].trim() ? `\n\n${m[2].trim()}` : ''}` : raw;
+    addEntry(d, s0, 'human', 'answer', `## User decision\n${answer}\n\n> question (#${pad3(dec.seq)}, ${dec.role}): ${dec.question}\n`);
+    return update(d, (s) => {
+      s.status = dec.status;
+      s.turn = dec.turn;
+      // Round limit: 2 approves, 3 stops, 1 or the user's own words: 2 more rounds with this review.
+      if (dec.kind === 'limit') {
+        const n = pick ? parseInt(m[1], 10) : 1;
+        if (n === 2) { s.status = 'DONE'; s.turn = 'none'; } else if (n === 3) { s.status = 'ESCALATED'; s.turn = 'none'; } else { requestChanges(s); s.max_rounds += 2; }
+      }
+      delete s.decision;
+      s.seq += 1; s.updated_by = 'human'; s.turn_since = epoch();
+    });
+  });
+  holdParts(st);
+  out(isTerminal(st.status) ? `answer recorded; the task is ${st.status}` : `answer recorded; back to the ${st.turn} (status: ${st.status})`);
+  if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
+}
+
+// Decisions of the given tasks, as markdown: the user's answers, and the "## Decisions taken"
+// sections in which the agents note judgment calls they made themselves.
+function collectDecisions(ids) {
+  const found = [];
+  for (const id of ids) {
+    const d = path.join(TASKS, id);
+    for (const f of listEntries(d)) {
+      const text = fs.readFileSync(path.join(entriesDir(d), f), 'utf8');
+      if (roleOf(f) === 'human' && kindOf(f) === 'answer') {
+        found.push(`### ${id} · #${pad3(seqOf(f))} user decision\n${text.replace(/^## User decision\n/, '').trim()}`);
+        continue;
+      }
+      if (!ROLES.includes(roleOf(f))) continue;
+      const m = text.match(/^##[ \t]+Decisions taken[ \t]*\n([\s\S]*?)(?=^##[ \t]|(?![\s\S]))/im);
+      const body = m && m[1].trim();
+      if (body && !/^(none|n\/a|-)\.?$/i.test(body)) found.push(`### ${id} · #${pad3(seqOf(f))} ${roleOf(f)} ${kindOf(f)}\n${body}`);
+    }
+  }
+  return found;
+}
+
+// The implementer ends the whole run once everything the user asked for is done. It marks the
+// project's latest (DONE) task, so a reviewer waiting in 'join --after' stops too, and collects
+// the decisions both agents took instead of escalating since the previous run ended.
+function cmdEnd(args) {
+  const { opts } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' } }, { strict: true });
+  const d = taskDir();
+  const pre = readState(d);
+  const latest = latestTask(pre.project_dir);
+  if (latest !== pre.id) die(`${pre.id} is not the latest task for this project (${latest})`);
+  const ids = projectTasks(pre.project_dir).filter((id) => id !== pre.id).concat(pre.id);
+  if (pre.status !== 'DONE') {
+    die(isTerminal(pre.status)
+      ? `${pre.id} ended ${pre.status}: report to the user instead, 'collab end' only follows an approved task`
+      : `${pre.id} is still ${pre.status}: finish it first`);
+  }
+  if (pre.ended) die(`the run already ended after ${pre.id}`);
+  const waiting = queueCount(pre.project_dir);
+  if (waiting) die(`${waiting} queued task(s) still waiting for this project: start them, or remove them with 'collab queue skip' / 'queue rm'`);
+  let body = readBody(opts.file);
+
+  const prev = ids.slice(0, -1).map((id) => readState(path.join(TASKS, id))).reduce((at, t, i) => (t.ended ? i : at), -1);
+  const run = ids.slice(prev + 1);
+  const decisions = collectDecisions(run);
+  body += `\n## Decisions recorded during this run (collected by collab)\n${decisions.length ? decisions.join('\n\n') : 'none'}\n`;
+  body += `\n> collab: run ended after ${run.length} task(s): ${run.join(', ')}\n`;
+
+  const st = withLock(d, () => {
+    const s0 = readState(d);
+    if (s0.ended) die(`the run already ended after ${s0.id}`);
+    addEntry(d, s0, 'implementer', 'end', body);
+    return update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
+  });
+  notify(`${st.id}: work complete`);
+  out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s). A reviewer in 'join --after' stops now.`);
+}
+
 // --- watch ------------------------------------------------------------------
 
 // Task ids that belong to the same project folder, oldest first. A task's project and
@@ -1203,7 +1397,7 @@ function projectTasks(dir) {
     }
     metas.push(taskMeta.get(id));
   }
-  return metas.filter((m) => m.dir === want)
+  return metas.filter((m) => sameProject(m.dir, want))
     .sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))
     .map((m) => m.id);
 }
@@ -1280,7 +1474,7 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   let sc = CY;
   if (st.status === 'DONE') sc = G;
   else if (['ESCALATED', 'STALLED', 'ABORTED'].includes(st.status)) sc = RD;
-  else if (['CHANGES_REQUESTED', 'PLAN_CHANGES'].includes(st.status)) sc = Y;
+  else if (['CHANGES_REQUESTED', 'PLAN_CHANGES', 'DECISION'].includes(st.status)) sc = Y;
 
   // Header
   const lines = [];
@@ -1290,7 +1484,11 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(now - created)} · ${localTime(Date.now())}${R}`);
   lines.push(`${D}project${R} ${st.project_dir}`);
   const live = active ? liveProgress(st) : null;
-  if (active) {
+  if (st.status === 'DECISION') {
+    const dec = st.decision || {};
+    lines.push(`${Y}${B}?  your decision:${R}${Y} ${dec.question || ''} — ${(dec.options || []).map((o, i) => `${i + 1}. ${o}`).join('  ')}${R}`);
+    lines.push(`${D}asked by the ${dec.role} ${fmtDur(now - turnStart(st))} ago · answer with: collab answer <N | text>${R}`);
+  } else if (active) {
     let verb = st.turn === 'reviewer' ? 'reviewing' : 'implementing';
     if (['PLANNING', 'PLAN_CHANGES'].includes(st.status)) verb = 'planning';
     if (st.status === 'PLAN_REVIEW') verb = 'reviewing the plan';
@@ -1313,7 +1511,7 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
     return { file: f, seq: f.split('-')[0], time: localTime(fs.statSync(p).mtimeMs), role: roleOf(f), kind: kindOf(f), preview: first.replace(/^[-*\s]+/, '') };
   });
   const entryCount = items.length;
-  if (active) {
+  if (active && ROLES.includes(st.turn)) {
     items.push({
       live: true, seq: 'now', time: localTime((live ? live.epoch : turnStart(st)) * 1000), role: st.turn,
       kind: 'in progress', preview: live ? `⟳ ${live.text}` : '(no progress update yet)',
@@ -1469,6 +1667,7 @@ ${B}FOR YOU (the human)${R}
   ${C}diff${R} [--stat]               What changed in the project since the task started
   ${C}list${R}                        All tasks (* = current) with status and round
   ${C}abort${R}                       Stop the current task; both agents exit their loop
+  ${C}answer${R} <N | text>           Answer a pending decision (option N, or your own words)
   ${C}queue${R}                       List queued tasks (* = this project)
   ${C}queue add${R} [options] "task"  Queue a task; the implementer starts it after the current one
   ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
@@ -1494,19 +1693,23 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}queue split${R} [--reason TEXT] Implementer: split the current task (parts on stdin, separated
                               by '=== part ===' lines); part 1 stays, the rest queue next
   ${C}check${R}                       Run the task's --check command
-  ${C}join${R}                        Reviewer: wait until a task exists, print its brief
+  ${C}join${R} [--after ID]           Reviewer: wait until a task exists, print its brief; with
+                              --after (the task it just finished), stop when the run ends
+  ${C}end${R}                         Implementer: the whole request is done; ends the run for both
+                              (final report on stdin or --file)
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
   ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
-  ${C}submit${R} implementer <plan|ready|escalate>
-  ${C}submit${R} reviewer <changes|approve|escalate>
-                              Hand off the turn (message on stdin or --file PATH)
+  ${C}submit${R} implementer <plan|ready|decide|escalate>
+  ${C}submit${R} reviewer <changes|approve|decide|escalate>
+                              Hand off the turn (message on stdin or --file PATH); decide asks
+                              the user to pick a numbered option (--self: I ask them myself)
 
 ${B}START A SESSION${R}
   Claude Code:  /Collab implement   ·  /Collab review     ${D}(add --plan to plan first)${R}
   Codex:        $Collab implement   ·  $Collab review
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
-Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 1 error${R}`);
+Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 1 error${R}`);
 }
 
 // --- main -------------------------------------------------------------------
@@ -1514,7 +1717,7 @@ Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
   snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
-  show: cmdShow, list: cmdList, abort: cmdAbort,
+  show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),
 };

@@ -27,16 +27,47 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   when it's your turn or the task ends. It uses no model tokens.
 - **Plan mode** (`init --plan`) adds a first phase: `PLANNING → PLAN_REVIEW → (PLAN_CHANGES …)`.
   Approving the plan moves to `IMPLEMENTING` and doesn't end the task.
-- **Round limits:** a `changes` beyond `max_rounds` becomes `ESCALATED` instead.
+- **Round limits:** a `changes` beyond `max_rounds` (or the plan rounds) becomes a `DECISION`
+  for the user, shown to both agents: `1` gives 2 more rounds and passes the review on, `2`
+  approves (`DONE`), `3` stops (`ESCALATED`). An answer in the user's own words counts as `1`, and
+  the implementer gets the words.
+- **Decisions:** the agent holding the turn can `submit <role> decide` a question with numbered
+  options. The task goes to `DECISION` (turn: `human`) until someone runs `collab answer <N | text>`.
+  Then it returns to the status and turn it came from, and the asker gets the answer. The other
+  agent's `wait` returns 16 once, so a Claude Code agent can show the options as an interactive
+  choice. With `--self`, the asker shows them itself and the other agent keeps waiting. No idle or
+  stall checks run while the user decides.
+
+## Runs: from one request to the end
+
+A request can take several tasks: the parts of a split, queued tasks, or stages the implementer
+starts one after another. That sequence is a *run*. Between tasks, the reviewer waits in
+`collab join --after <finished-task>`, which looks at the newest task of that project:
+
+- a new active task: `join` prints its brief (exit 0);
+- `collab end` was run on it: `join` prints the final report and returns 10 (`WORK COMPLETE`);
+- it ended `ESCALATED`, `ABORTED` or `STALLED`: `join` returns 10 (`TASK FINISHED`);
+- it's `DONE` and nothing new has started for `COLLAB_IDLE_SECS`: `join` returns 13.
+
+`collab end` (implementer) needs the project's newest task to be `DONE` and its queue to be empty.
+It writes an `end` entry with the implementer's report, followed by every user answer and every
+`## Decisions taken` section from the run. The run is the tasks since the previous `end` in that
+project.
 
 ## Queue and task options
 
 - `collab queue add [options] "task"` appends to `~/.collab/queue.json`. Each item remembers the
-  project folder it was added from, and an implementer only takes items for its own folder.
+  project folder it was added from, and an implementer only takes items for its own project.
+- **Projects:** two folders are the same project when one contains the other (a repo root and a
+  module inside it). Tasks, the queue, `join` and the one-active-task-per-project rule all use
+  this, so agents started from different levels of the same tree still find each other. Unrelated
+  folders, siblings included, stay separate. When several tasks match, the newest active one is
+  the default.
 - `collab queue next` shows the first item for the current folder. `collab init <slug> --from-queue`
   removes it and applies its options (flags given to `init` override them).
 - When a task ends `DONE` and more items are waiting, `wait` and the reviewer's `approve` print a
-  `QUEUE:` line. The implementer starts the next item, and the reviewer runs `collab join` again.
+  `QUEUE:` line. The implementer starts the next item, and the reviewer, as after every `DONE`,
+  runs `collab join --after <task>` (see *Runs*).
   Any other ending (`ESCALATED`, `STALLED`, `ABORTED`) pauses the queue.
 - `collab queue split` (implementer, once, before its first `plan` or `ready`) splits the current
   task. The parts come on stdin, separated by `=== part ===` lines. Part 1 stays the current task
@@ -60,8 +91,9 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
 | `PLAN_REVIEW` | reviewer | reviewing the plan |
 | `IMPLEMENTING`, `CHANGES_REQUESTED` | implementer | building or fixing |
 | `READY_FOR_REVIEW` | reviewer | reviewing the changes |
+| `DECISION` | human | an agent asked the user to choose; `collab answer` resumes the task |
 | `DONE` | — | the reviewer approved |
-| `ESCALATED` | — | an agent asked for a human, or the round limit was hit |
+| `ESCALATED` | — | an agent hit a blocker, or the user chose *stop* at the round limit |
 | `ABORTED` | — | stopped with `collab abort` |
 | `STALLED` | — | nobody handed off for too long |
 
@@ -73,12 +105,13 @@ Agents branch on these, so they are part of the protocol:
 |---|---|
 | `0` | OK / it's your turn |
 | `1` | error (message on stderr) |
-| `10` | the task is finished; stop looping |
+| `10` | the task is finished; stop looping (`join --after`: the run ended, or a task ended without approval) |
 | `11` | `wait` timed out and it's still not your turn; run it again |
 | `12` | submit refused: the user added a note during your turn |
 | `13` | the other agent looks unresponsive; ask the user whether to stop or keep waiting |
 | `14` | submit refused: the task's `--check` command failed |
 | `15` | the queue has no task for this project |
+| `16` | the other agent asked the user to decide; show them the options, record the answer with `collab answer` |
 
 ## Human notes
 
@@ -101,8 +134,9 @@ answering, the task becomes `STALLED`.
 
 ## Reviewing real changes
 
-`collab init` snapshots every git repo under the project folder. It checks the folder itself,
-then nested repos up to three levels down. The snapshot comes from `git stash create`, which
+`collab init` snapshots every git repo under the project folder: the repo holding the folder
+itself, plus nested repos up to three levels down, including ones the outer repo ignores
+(e.g. separate module repos). The snapshot comes from `git stash create`, which
 records the working tree **without touching it**, plus the list of untracked files at that
 moment. `collab diff` compares against that snapshot, so the reviewer sees only what changed
 during the task, even when you started with uncommitted work.
