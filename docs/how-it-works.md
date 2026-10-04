@@ -27,6 +27,17 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   when it's your turn or the task ends. It uses no model tokens.
 - **Plan mode** (`init --plan`) adds a first phase: `PLANNING → PLAN_REVIEW → (PLAN_CHANGES …)`.
   Approving the plan moves to `IMPLEMENTING` and doesn't end the task.
+- **Verdicts must match their items:** `submit reviewer approve` is refused (exit 1, nothing
+  written) when it contains a numbered `[blocking]` item (`1. [blocking] …`), and
+  `submit reviewer changes` is refused when it has no numbered item for the implementer to
+  address. This applies in both phases.
+- **Closeout:** a build-phase `submit implementer ready` is refused (exit 1, nothing written)
+  without a `## Closeout` section that has the labels `Verified:`, `Attempted, blocked:`,
+  `Deferred:` and `Not claimed:` (content may be `none`; list markers and bold are fine).
+- **Review recap:** when it's the reviewer's turn, `wait` also prints the `[blocking]` items
+  (with their continuation lines) of the earlier `changes` entries of the current phase, by round,
+  and in a `--plan` task's build phase, which entry is the approved plan. Both come from `entries/`:
+  the plan approval is the only reviewer `approve` of an unfinished task, so it separates the phases.
 - **Round limits:** a `changes` beyond `max_rounds` (or the plan rounds) becomes a `DECISION`
   for the user, shown to both agents: `1` gives 2 more rounds and passes the review on, `2`
   approves (`DONE`), `3` stops (`ESCALATED`). An answer in the user's own words counts as `1`, and
@@ -52,9 +63,11 @@ starts one after another. That sequence is a *run*. Between tasks, the reviewer 
 `collab end` (implementer) needs the project's newest task to be `DONE` and no queued task for the
 project that would start on its own. Tasks waiting for the user's go-ahead (`--confirm` or held)
 stay queued and are listed in the report.
-It writes an `end` entry with the implementer's report, followed by every user answer and every
-`## Decisions taken` section from the run. The run is the tasks since the previous `end` in that
-project.
+It writes an `end` entry with the implementer's report, followed by each task's closeout (the
+`## Closeout` of its last `ready`, or "no structured closeout recorded" for older tasks), the
+reviewer's `## For the user` briefings (from a build approve, never the plan approval), and every
+user answer and every `## Decisions taken` section from the run. The run is the tasks since the
+previous `end` in that project.
 
 ## Queue and task options
 
@@ -83,7 +96,24 @@ project.
     exit 14 on failure. On success, a `check passed` line is appended to the summary.
   - `--scope` is flagged: `collab diff` lists changed files outside the globs.
   - `--focus`, `--branch` and `--commit` are instructions the agents follow (and the reviewer checks).
+    Before a `--commit` commit, the implementer runs `collab verify` and commits only on exit 0.
   - `--confirm` makes the implementer ask you before starting that queued task.
+- **Approval is bound to the reviewed tree** (build phase, tasks with git repos). `submit
+  implementer ready` records a digest of the project files, after `--check` ran. For each repo
+  it lists every path changed since the task's base snapshot (tracked, untracked but not ignored,
+  new ignored `*.md`), plus every assume-unchanged / skip-worktree path. Each path gets a signature
+  of what is on disk (content sha256 and exec bit, a symlink's target, or a nested repo's
+  checked-out commit; a nested repo's own files are covered by its own entry). `submit reviewer
+  approve` recomputes it. If it differs, the approve is refused with exit 17, lists the changed
+  paths, and records the new digest as pending. `approve --rereviewed` then succeeds only if the
+  files still match that pending digest. `collab diff` never changes a digest. A successful
+  approve (or the user's *approve as it is* at the round limit) records the approved digest,
+  which `collab verify` compares against (exit 0 or 17; exit 1 when none was recorded).
+  Computing it is read-only: `git diff` runs on a temporary copy of the index, and nothing is
+  written to the repo. If it can't be computed (a git error, an unreadable file, a changed folder
+  that isn't one of the task's snapshotted repos), the command fails (exit 1) instead of passing.
+  Ignored files other than new `*.md` are not covered. Tasks without git repos, or started before
+  this existed, approve as before with a notice.
 
 ## States
 
@@ -114,6 +144,7 @@ Agents branch on these, so they are part of the protocol:
 | `14` | submit refused: the task's `--check` command failed |
 | `15` | the queue has no task for this project |
 | `16` | the other agent asked the user to decide; show them the options, record the answer with `collab answer` |
+| `17` | the project files changed since the review (`approve` refused; inspect, then `approve --rereviewed`) or since the approval (`collab verify`; don't commit) |
 
 ## Human notes
 
@@ -166,6 +197,8 @@ work go where the brief's `## Deliverables` line says.
     progress.log                   JSON lines of progress updates
     untracked/<n>.txt              untracked files per repo at the start
     untracked/<n>-ignored-md.txt   ignored *.md files per repo at the start
+    digests/{review,pending,approved}.json   file signatures behind review_digest, pending_digest
+                                   and approved_digest in state.json
     scratch/                       the agents' message drafts, notes and logs for this task
 ```
 

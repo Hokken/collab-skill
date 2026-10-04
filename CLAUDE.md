@@ -28,7 +28,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Cross-platform**: macOS, Linux and native Windows (PowerShell/cmd/Git Bash). Watch path handling,
   `fs.renameSync` races on Windows (writes go through `retry()`), CRLF/BOM in input (`readBody`), and
   notifications (`notify()` branches per platform). `bin/collab.cmd` is the Windows shim.
-- **Exit codes are protocol**: `SKILL.md` tells agents to branch on them (0, 1, 10–16, defined as
+- **Exit codes are protocol**: `SKILL.md` tells agents to branch on them (0, 1, 10–17, defined as
   `EXIT_*` constants at the top of `collab.js` and documented in its header comment and in
   `docs/how-it-works.md`). Changing or adding one means updating all three, plus `SKILL.md`.
 - **Backwards-compatible state**: old `state.json` files (including ones written by an earlier bash

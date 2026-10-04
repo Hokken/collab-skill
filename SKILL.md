@@ -77,7 +77,8 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   `13` = the other agent looks unresponsive (see below),
   `14` = submit refused because the task's `--check` failed, `15` = the queue is empty,
   `16` = the user has to choose: the other agent asked, or the round limit was reached (see
-  *Decisions for the user*), `1` = error.
+  *Decisions for the user*), `17` = the project files changed since the review (a refused
+  `approve`) or since the approval (`collab verify`), `1` = error.
   For `join --after`, `10` also means the implementer ended the run.
 - **Start both agents from the same project folder** when you can. A folder and the folders
   inside it count as one project (e.g. a repo root and a module in it), so tasks and the queue
@@ -200,25 +201,34 @@ you to stop, they will interrupt you.
 3. **Hand off** with `collab submit implementer ready`, using this summary:
    ```
    ## Summary
-   what changed and why (2–5 bullets)
+   what changed and why (2–5 bullets); what the reviewer should check
    ## Files changed
    - path — what changed
-   ## How to verify
-   commands run and their results; what the reviewer should check
+   ## Closeout
+   Verified: what you checked and how: commands run and their results
+   Attempted, blocked: what you tried but couldn't finish, and why (or "none")
+   Deferred: what you consciously left for later, and where it is recorded (or "none")
+   Not claimed: what this work does not vouch for (or "none")
    ## Review responses          (from round 2 on)
    1. Fixed — …
    2. Declined — reason …
+   ## Divergence from plan      (--plan tasks only, when the build departs from the approved plan)
+   - what differs from the plan, and why
    ## Decisions taken           (only for judgment calls you made yourself, see *Escalation*)
    - what you chose, the alternatives, and why it is the safe choice
-   ## Known limitations / open questions
    ```
+   `## Closeout` is required, with exactly that heading and all four labels (the CLI refuses a
+   `ready` without them; write "none" where nothing applies). Only put under `Verified` what you
+   actually ran or checked in this turn.
    **Exit 14** means the task's check failed and nothing was submitted: fix the problem and submit
    again. If the check can't pass for reasons outside the task, escalate.
 4. **Wait** with `collab wait implementer`. On exit 0 the output is the reviewer's feedback.
    Address every numbered item, either by fixing it or by declining with a reason, then go back to step 3.
 5. On **exit 10**:
-   - **DONE:** if the task has `--commit`, commit its changes now (in each repo you changed, on the
-     current branch, with a message summarising the task; never push). Post a one-line status as
+   - **DONE:** if the task has `--commit`, first run `collab -t <id> verify`. Only on **exit 0**,
+     commit the task's changes (in each repo you changed, on the current branch, with a message
+     summarising the task; never push). On exit 17 (files changed after the approval) or 1 (no
+     approved tree recorded), don't commit: tell the user, then carry on. Post a one-line status as
      plain text (**don't end your turn**), then run `collab queue next`. If it shows a task, start
      it (see *Queued tasks*) and continue the loop. If the queue is empty (exit 15), check the
      user's original request (and any plan it points to). If some of it is still not done, start
@@ -228,8 +238,9 @@ you to stop, they will interrupt you.
      ## Final report
      what was delivered, task by task; anything left for the user (manual steps, follow-ups)
      ```
-     The CLI appends every answer the user gave and every *Decisions taken* section of the run,
-     and stops the reviewer. Then stop, and give the user that report, decisions included.
+     The CLI appends each task's last *Closeout*, the reviewer's *For the user* briefings, every
+     answer the user gave and every *Decisions taken* section of the run, and stops the reviewer.
+     Then stop, and give the user that report (`collab -t <id> show`), all of it included.
    - **ESCALATED, STALLED or ABORTED:** stop. Give the user a short report and explain what needs
      a decision. **Don't start queued tasks**: the queue waits until the user runs
      `/Collab implement` again.
@@ -317,6 +328,13 @@ EOF
 3. **Review** (on exit 0):
    - Treat the implementer's summary as a guide, not proof. Run `collab diff --stat`, then
      `collab diff` (or read the files) to see the real changes.
+   - Check the summary's `## Closeout`: anything under `Verified` that wasn't actually run or
+     checked (a test claimed to pass that doesn't, a check that never ran) is a blocking item.
+   - From round 2 on, `wait` recaps the `[blocking]` items of your earlier reviews. Check that
+     each one is resolved in intent, not just in wording, and raise it again if it isn't.
+   - In a `--plan` task, `wait` names the approved plan entry (`collab show N`). Review the build
+     against it too. A substantive divergence the summary doesn't declare under
+     `## Divergence from plan` is blocking; a declared one is judged on its merits.
    - Check them against the brief's acceptance criteria. Look for correctness, edge cases,
      regressions, security, and consistency with the surrounding code and project conventions.
    - You can run read-only checks (lint, type-check, tests). **Don't edit project files**;
@@ -345,7 +363,16 @@ EOF
      ```
      Then go back to step 2.
    - Nothing blocking → `collab submit reviewer approve` with a short verdict and any nits.
-     In the build phase, this ends the task for both agents.
+     In the build phase, this ends the task for both agents. There, add a short `## For the user`
+     section: the riskiest changes, invariants worth protecting, and what to try to break by hand.
+     `collab end` passes it on to the user.
+   - The CLI refuses (exit 1) an `approve` that contains a numbered `[blocking]` item, and a
+     `changes` without numbered items. Don't restate resolved items as `[blocking]` in an approve.
+   - An `approve` covers the files as they were at the implementer's handoff. If they changed
+     since (exit 17, the files are listed), look at the listed files. If your review still holds,
+     run `collab -t <id> submit reviewer approve --rereviewed` (it covers the files as they were
+     when the approve was refused); if the changes matter, submit `changes`. Your own test runs
+     can cause this when they leave files behind that git doesn't ignore.
 5. On **exit 10** (from `wait`, or from your own `approve`):
    - If the status is **DONE**, the implementer may have more tasks to do. Run
      `collab join --after <id>` (without `-t`; `<id>` is the task that just finished) and wait as

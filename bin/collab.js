@@ -8,11 +8,13 @@
 // 12 submit refused because the user added a note during your turn,
 // 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
 // 14 submit refused because the task's --check command failed, 15 the queue is empty,
-// 16 the other agent asked the user to decide something — show them the options.
+// 16 the other agent asked the user to decide something — show them the options,
+// 17 the tree changed since the review (refused approve) or since the approval ('verify').
 //
 // Zero dependencies; runs on macOS, Linux and Windows (Node >= 18).
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -44,6 +46,7 @@ const EXIT_IDLE = 13;
 const EXIT_CHECK = 14;
 const EXIT_EMPTY = 15;
 const EXIT_DECISION = 16;
+const EXIT_TREE = 17;
 
 const TERMINAL = new Set(['DONE', 'ESCALATED', 'ABORTED', 'STALLED']);
 const ROLES = ['implementer', 'reviewer'];
@@ -329,6 +332,105 @@ const untrackedFiles = (repo) =>
 // would otherwise never show up in collab diff.
 const ignoredDocs = (repo) =>
   git(repo, ['ls-files', '--others', '--ignored', '--exclude-standard', '--', '*.md']).out.split('\n').filter(Boolean);
+
+// --- tree digests ---------------------------------------------------------------
+// An approval covers the files the reviewer saw. Per repo: every path changed since the task's base
+// (tracked, untracked, new ignored *.md) plus every assume-unchanged / skip-worktree path (git diff
+// can't see edits to those), each with a signature of what is on disk now. Read-only: git diff runs
+// on a temporary copy of the index (it would refresh the real one), other git calls only read
+// (GIT_OPTIONAL_LOCKS=0), no objects are written. Any failure dies, so a check fails closed.
+// Paths are keys of null-prototype objects / checked with Object.hasOwn: a file may be '__proto__'.
+
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+const zList = (s) => s.split('\0').filter(Boolean);
+const noDigest = (why) => die(`cannot compute the tree digest: ${why}`);
+
+function digestGit(cwd, args, env = {}) {
+  const r = spawnSync('git', args, {
+    cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0', ...env },
+  });
+  if (r.status !== 0) noDigest(`'git ${args.join(' ')}' failed in ${cwd}${r.stderr ? `: ${r.stderr.trim().split('\n')[0]}` : ''}`);
+  return r.stdout || '';
+}
+
+// What is at abs now: content hash (+ exec bit), link target, or a nested repo's checked-out
+// commit. A changed directory must be one of the task's repos, whose own map covers its content.
+function fileSig(abs, covered) {
+  let s;
+  try { s = fs.lstatSync(abs); } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return 'absent';
+    return noDigest(`${abs}: ${e.message}`);
+  }
+  try {
+    if (s.isSymbolicLink()) return `l:${sha256(fs.readlinkSync(abs))}`;
+    if (s.isFile()) return `${process.platform !== 'win32' && (s.mode & 0o111) ? 'x' : 'f'}:${sha256(fs.readFileSync(abs))}`;
+  } catch (e) { return noDigest(`${abs}: ${e.message}`); }
+  if (s.isDirectory()) {
+    if (!covered.has(realDir(abs))) noDigest(`a changed folder is not one of this task's snapshotted repos: ${abs}`);
+    return `g:${digestGit(abs, ['rev-parse', 'HEAD']).trim()}`;
+  }
+  return noDigest(`unsupported file type: ${abs}`);
+}
+
+function treeMap(st, d) {
+  const covered = new Set(st.repos.map((r) => realDir(r.path)));
+  const repos = st.repos.map((r, i) => {
+    const idx = Number.isInteger(r.index) ? r.index : i;
+    // git diff refreshes the index it reads (even with GIT_OPTIONAL_LOCKS=0), so it gets a copy.
+    const index = path.resolve(r.path, digestGit(r.path, ['rev-parse', '--git-path', 'index']).trim());
+    fs.mkdirSync(path.join(d, 'digests'), { recursive: true });
+    const copy = path.join(d, 'digests', `index-${process.pid}-${idx}.tmp`);
+    let changed;
+    try {
+      if (fs.existsSync(index)) fs.copyFileSync(index, copy);
+      changed = digestGit(r.path, ['diff', '--name-only', '-z', '--no-renames', '--ignore-submodules=none', r.base], { GIT_INDEX_FILE: copy });
+    } catch (e) {
+      if (e instanceof CollabError) throw e;
+      noDigest(`cannot copy ${index}: ${e.message}`);
+    } finally {
+      try { fs.rmSync(copy, { force: true }); } catch { /* best effort */ }
+    }
+    const paths = new Set(zList(changed));
+    for (const f of zList(digestGit(r.path, ['ls-files', '-z', '--others', '--exclude-standard']))) paths.add(f.replace(/\/$/, ''));
+    let had = null;
+    try { had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean)); } catch { /* no snapshot */ }
+    if (had) {
+      for (const f of zList(digestGit(r.path, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '*.md']))) {
+        if (!had.has(f)) paths.add(f);
+      }
+    }
+    // 'h path' (assume-unchanged, any lowercase tag) or 'S path' (skip-worktree).
+    for (const e of zList(digestGit(r.path, ['ls-files', '-v', '-z']))) if (/^[a-zS] /.test(e)) paths.add(e.slice(2));
+    const files = Object.create(null);
+    for (const f of [...paths].sort()) files[f] = fileSig(path.join(r.path, f), covered);
+    return { path: r.path, files };
+  });
+  return { id: sha256(JSON.stringify(repos)), repos };
+}
+
+const digestPath = (d, name) => path.join(d, 'digests', `${name}.json`);
+function saveMap(d, name, map) {
+  fs.mkdirSync(path.join(d, 'digests'), { recursive: true });
+  const tmp = `${digestPath(d, name)}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(map));
+  retry(() => fs.renameSync(tmp, digestPath(d, name)));
+}
+const loadMap = (d, name) => { try { return JSON.parse(fs.readFileSync(digestPath(d, name), 'utf8')); } catch { return null; } };
+
+// Paths whose signature differs between two maps: + newly changed, ~ changed again, - back to base.
+function mapChanges(from, to) {
+  const before = new Map(((from && from.repos) || []).map((r) => [r.path, r.files]));
+  const lines = [];
+  for (const r of to.repos) {
+    const a = before.get(r.path) || {};
+    const has = (o, f) => Object.hasOwn(o, f);
+    const rows = [...new Set([...Object.keys(a), ...Object.keys(r.files)])].sort()
+      .filter((f) => !has(a, f) || !has(r.files, f) || a[f] !== r.files[f])
+      .map((f) => `  ${!has(a, f) ? '+' : !has(r.files, f) ? '-' : '~'} ${f}`);
+    if (rows.length) lines.push(`${r.path}:`, ...rows);
+  }
+  return lines.length ? lines : ['  (the set of changed files differs)'];
+}
 
 // Newest mtime (ms) of any project file, skipping dependency/build folders.
 // Stops early once a file at least as new as stopAt is found; capped so a huge tree can't hang.
@@ -760,6 +862,46 @@ async function cmdJoin(args) {
   }
 }
 
+// '1. [blocking] …' items of a review, each with its continuation lines (up to a blank line, the
+// next numbered item or a heading).
+function blockingItems(text) {
+  const items = [];
+  let cur = null;
+  for (const line of text.split('\n')) {
+    if (/^\s*\d+[.)]\s/.test(line) || /^\s*#/.test(line) || !line.trim()) {
+      cur = /^\s*\d+[.)]\s*\[blocking\]/i.test(line) ? [line.trimEnd()] : null;
+      if (cur) items.push(cur);
+    } else if (cur) {
+      cur.push(line.trimEnd());
+    }
+  }
+  return items.map((l) => l.join('\n'));
+}
+
+// What the reviewer gets besides the latest messages: the blocking items of the current phase's
+// earlier reviews, and (in a --plan task's build phase) which entry is the approved plan. The plan
+// approval is the only reviewer approve of an unfinished task, so it splits the phases.
+function reviewRecap(d, st) {
+  const files = listEntries(d);
+  const approve = files.find((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'approve');
+  const build = (st.phase || 'build') === 'build';
+  const inPhase = files.filter((f) => !approve || (build ? seqOf(f) > seqOf(approve) : seqOf(f) < seqOf(approve)));
+  const lines = [];
+  const rounds = inPhase.filter((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'changes');
+  const found = rounds.map((f, i) => ({ f, i, items: blockingItems(fs.readFileSync(path.join(entriesDir(d), f), 'utf8')) }))
+    .filter((r) => r.items.length);
+  if (found.length) {
+    lines.push('----- earlier blocking items (from collab): check each is resolved in intent, not just in wording -----');
+    for (const r of found) lines.push(`${build ? '' : 'plan '}round ${r.i + 1} (#${pad3(seqOf(r.f))}):`, ...r.items);
+    lines.push('----- end -----');
+  }
+  if (build && approve) {
+    const plan = files.filter((f) => roleOf(f) === 'implementer' && kindOf(f) === 'plan' && seqOf(f) < seqOf(approve)).pop();
+    if (plan) lines.push(`approved plan: #${pad3(seqOf(plan))} (read it with 'collab -t ${st.id} show ${seqOf(plan)}'). Review the build against it too.`);
+  }
+  return lines;
+}
+
 async function cmdWait(args) {
   const { opts, rest } = takeOpts(args, timeoutOpt);
   const role = rest[0];
@@ -786,6 +928,7 @@ async function cmdWait(args) {
       out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
       out(`project: ${st.project_dir}`);
       for (const f of fresh) printEntry(d, f);
+      if (role === 'reviewer') for (const l of reviewRecap(d, st)) out(l);
       return;
     }
     // A decision for the user: the agent that asked waits for the answer; the other one shows
@@ -879,15 +1022,28 @@ function transition(st, role, kind) {
 }
 
 async function cmdSubmit(args) {
-  const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' }, flags: { '--self': { self: true } } });
+  const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' }, flags: { '--self': { self: true }, '--rereviewed': { rereviewed: true } } });
   const [role, kind] = rest;
   const d = taskDir();
   let body = readBody(opts.file);
   const options = kind === 'decide' ? decisionOptions(body) : [];
   if (kind === 'decide' && options.length < 2) die("a decision needs at least 2 numbered options ('1. …', '2. …'), one per line");
+  // The verdict must match the review: no blocking items in an approve, something to address in changes.
+  if (role === 'reviewer' && kind === 'approve' && /^\s*\d+[.)]\s*\[blocking\]/im.test(body)) {
+    die("an approve can't contain [blocking] items: submit 'changes' instead (or drop/reword items you only restate as resolved)");
+  }
+  if (role === 'reviewer' && kind === 'changes' && !/^\s*\d+[.)]\s+\S/m.test(body)) {
+    die("changes needs numbered items ('1. …') for the implementer to address");
+  }
+
+  const pre = readState(d);
+  // A build handoff says what was verified and what wasn't (see SKILL.md), before the check runs.
+  if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build') {
+    const missing = closeoutMissing(body);
+    if (missing.length) die(`a ready needs a '## Closeout' section with the labels ${missing.map((l) => `'${l}:'`).join(', ')} (write 'none' where nothing applies)`);
+  }
 
   // The task's --check must pass before the implementer hands off its work.
-  const pre = readState(d);
   if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build' && pre.turn === role
       && !isTerminal(pre.status) && pre.options && pre.options.check) {
     const res = await runCheck(pre);
@@ -897,6 +1053,15 @@ async function cmdSubmit(args) {
       exit(EXIT_CHECK);
     }
     body += `\n\n> collab: check passed: \`${res.cmd}\` (${res.secs}s)\n`;
+  }
+
+  // Build-phase handoffs bind the review to the tree: 'ready' records what the reviewer is shown
+  // (after the check, so its artefacts are included), 'approve' must still match it.
+  if (opts.rereviewed && !(role === 'reviewer' && kind === 'approve')) die('--rereviewed only goes with \'submit reviewer approve\'');
+  let tree = null;
+  if ((pre.phase || 'build') === 'build' && pre.turn === role && !isTerminal(pre.status) && pre.repos && pre.repos.length
+      && ((role === 'implementer' && kind === 'ready') || (role === 'reviewer' && kind === 'approve' && pre.review_digest))) {
+    tree = treeMap(pre, d);
   }
 
   const result = withLock(d, () => {
@@ -914,12 +1079,26 @@ async function cmdSubmit(args) {
     }
 
     const t = transition(st, role, kind);
+    // The tree changed since the review: refuse, and remember the tree as it is now, so an
+    // approve --rereviewed after inspecting the listed files covers exactly that tree.
+    const binding = tree && st.review_digest && kind === 'approve';
+    if (binding && tree.id !== st.review_digest && !(opts.rereviewed && tree.id === st.pending_digest)) {
+      const since = opts.rereviewed && st.pending_digest ? 'pending' : 'review';
+      const changes = mapChanges(loadMap(d, since), tree);
+      saveMap(d, 'pending', tree);
+      update(d, (s) => { s.pending_digest = tree.id; }, { touch: false });
+      return { stale: { since, changes } };
+    }
+    if (tree && kind === 'ready') saveMap(d, 'review', tree);
+    if (binding) saveMap(d, 'approved', tree);
     const question = t.limit ? `Round limit reached (${t.limit}) and the reviewer still requests changes. What now?` : headline(body);
     if (t.limit) body += `\n\n## ${question}\n${LIMIT_OPTIONS.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n`;
     addEntry(d, st, role, kind, body);
     return {
       st: update(d, (s) => {
         t.apply(s);
+        if (tree && kind === 'ready') { s.review_digest = tree.id; delete s.pending_digest; }
+        if (binding) s.approved_digest = tree.id;
         if (s.decision && s.decision.seq === undefined) {
           Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
         }
@@ -933,8 +1112,19 @@ async function cmdSubmit(args) {
     for (const f of result.pending) printEntry(d, f);
     exit(EXIT_NOTES);
   }
+  if (result.stale) {
+    out(`NOT APPROVED: the tree changed since ${result.stale.since === 'pending' ? 'your approve was refused' : "the implementer's handoff"}`
+      + ' (+ newly changed, ~ changed again, - back to its base content):');
+    for (const l of result.stale.changes) out(l);
+    out("Look at these files (collab diff, or read them). If the review still holds, approve again with "
+      + `'collab -t ${pre.id} submit reviewer approve --rereviewed'; if they matter, submit 'changes'.`);
+    exit(EXIT_TREE);
+  }
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+  if (role === 'reviewer' && kind === 'approve' && st.status === 'DONE' && !st.approved_digest) {
+    out('note: no reviewed tree was recorded for this task (no git repos, or started before collab recorded them), so this approval is not bound to the files.');
+  }
   if (st.status === 'DECISION') {
     const dec = st.decision;
     notify(`${st.id}: your decision is needed — ${dec.question}`);
@@ -1292,6 +1482,26 @@ function cmdDiff(args) {
   }
 }
 
+// Before committing an approved task: is the tree still the one the reviewer approved?
+function cmdVerify() {
+  const d = taskDir();
+  const st = readState(d);
+  if (!st.repos || !st.repos.length) {
+    out(`No git repos in ${st.project_dir}: nothing to verify.`);
+    return;
+  }
+  if (!st.approved_digest) die(`no approved tree recorded for ${st.id} (approved before collab recorded digests, or not approved yet)`);
+  const tree = treeMap(st, d);
+  if (tree.id === st.approved_digest) {
+    out(`verified: the tree matches what was approved in ${st.id}`);
+    return;
+  }
+  out(`TREE CHANGED since ${st.id} was approved (+ newly changed, ~ changed again, - back to its base content):`);
+  for (const l of mapChanges(loadMap(d, 'approved'), tree)) out(l);
+  out("Don't commit: tell the user what changed after the approval.");
+  exit(EXIT_TREE);
+}
+
 function cmdStatus() {
   const d = taskDir();
   const st = readState(d);
@@ -1365,11 +1575,60 @@ function cmdAnswer(args) {
   });
   holdParts(st);
   out(isTerminal(st.status) ? `answer recorded; the task is ${st.status}` : `answer recorded; back to the ${st.turn} (status: ${st.status})`);
+  // The user approved the task as it is: that tree is what 'collab verify' checks against.
+  if (st.status === 'DONE' && st.repos && st.repos.length) {
+    try {
+      const tree = treeMap(st, d);
+      saveMap(d, 'approved', tree);
+      withLock(d, () => update(d, (s) => { s.approved_digest = tree.id; }, { touch: false }));
+    } catch (e) {
+      if (!(e instanceof CollabError)) throw e;
+      out(`collab: ${e.message}`);
+      out("no verified approval was recorded: 'collab verify' will not pass for this task.");
+    }
+  }
   if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
 }
 
 // Decisions of the given tasks, as markdown: the user's answers, and the "## Decisions taken"
 // sections in which the agents note judgment calls they made themselves.
+// Body of the '## <heading>' section of a message, up to the next '## ' heading (null if absent).
+function section(text, heading) {
+  const m = text.match(new RegExp(`^##[ \\t]+${heading}[ \\t]*\\n([\\s\\S]*?)(?=^##[ \\t]|(?![\\s\\S]))`, 'im'));
+  return m ? m[1].trim() : null;
+}
+
+const CLOSEOUT_LABELS = [['Verified', /^verified\s*:/], ['Attempted, blocked', /^attempted[\s,/-]*blocked\s*:/],
+  ['Deferred', /^deferred\s*:/], ['Not claimed', /^not\s+claimed\s*:/]];
+
+// Labels missing from a message's '## Closeout' (all of them if it has none). List markers,
+// quotes and bold/italic marks around a label are fine.
+function closeoutMissing(text) {
+  const body = section(text, 'Closeout');
+  const lines = (body || '').split('\n').map((l) => l.replace(/[*_]/g, '').replace(/^\s*(?:[-+>]\s*)*/, '').toLowerCase());
+  return CLOSEOUT_LABELS.filter(([, re]) => !lines.some((l) => re.test(l))).map(([name]) => name);
+}
+
+// The closeout of each task's last build-phase ready, and the '## For the user' briefing of the
+// reviewer's approve after it (a plan approval comes before any ready, so it never counts).
+function collectCloseouts(ids) {
+  const closeouts = [];
+  const briefings = [];
+  for (const id of ids) {
+    const d = path.join(TASKS, id);
+    const files = listEntries(d);
+    const ready = files.filter((f) => roleOf(f) === 'implementer' && kindOf(f) === 'ready').pop();
+    if (!ready) continue;
+    const text = fs.readFileSync(path.join(entriesDir(d), ready), 'utf8');
+    const closeout = section(text, 'Closeout');
+    closeouts.push(`### ${id}\n${closeout || 'no structured closeout recorded for this task'}`);
+    const approve = files.find((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'approve' && seqOf(f) > seqOf(ready));
+    const brief = approve && section(fs.readFileSync(path.join(entriesDir(d), approve), 'utf8'), 'For the user');
+    if (brief && !/^(none|n\/a|-)\.?$/i.test(brief)) briefings.push(`### ${id}\n${brief}`);
+  }
+  return { closeouts, briefings };
+}
+
 function collectDecisions(ids) {
   const found = [];
   for (const id of ids) {
@@ -1381,8 +1640,7 @@ function collectDecisions(ids) {
         continue;
       }
       if (!ROLES.includes(roleOf(f))) continue;
-      const m = text.match(/^##[ \t]+Decisions taken[ \t]*\n([\s\S]*?)(?=^##[ \t]|(?![\s\S]))/im);
-      const body = m && m[1].trim();
+      const body = section(text, 'Decisions taken');
       if (body && !/^(none|n\/a|-)\.?$/i.test(body)) found.push(`### ${id} · #${pad3(seqOf(f))} ${roleOf(f)} ${kindOf(f)}\n${body}`);
     }
   }
@@ -1418,6 +1676,9 @@ function cmdEnd(args) {
   const prev = ids.slice(0, -1).map((id) => readState(path.join(TASKS, id))).reduce((at, t, i) => (t.ended ? i : at), -1);
   const run = ids.slice(prev + 1);
   const decisions = collectDecisions(run);
+  const { closeouts, briefings } = collectCloseouts(run);
+  body += `\n## Closeouts (collected by collab)\n${closeouts.length ? closeouts.join('\n\n') : 'none'}\n`;
+  if (briefings.length) body += `\n## For the user, from the reviewer (collected by collab)\n${briefings.join('\n\n')}\n`;
   body += `\n## Decisions recorded during this run (collected by collab)\n${decisions.length ? decisions.join('\n\n') : 'none'}\n`;
   body += `\n> collab: run ended after ${run.length} task(s): ${run.join(', ')}\n`;
 
@@ -1746,6 +2007,7 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}queue split${R} [--reason TEXT] Implementer: split the current task (parts on stdin, separated
                               by '=== part ===' lines); part 1 stays, the rest queue next
   ${C}check${R}                       Run the task's --check command
+  ${C}verify${R}                      Implementer: is the tree still the approved one? (before a --commit commit)
   ${C}scratch${R}                     Folder for message drafts, notes and logs (the task's own, or
                               a shared drafts folder before 'init'); never write them in the project
   ${C}join${R} [--after ID]           Reviewer: wait until a task exists, print its brief; with
@@ -1755,7 +2017,7 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
   ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
   ${C}submit${R} implementer <plan|ready|decide|escalate>
-  ${C}submit${R} reviewer <changes|approve|decide|escalate>
+  ${C}submit${R} reviewer <changes|approve [--rereviewed]|decide|escalate>
                               Hand off the turn (message on stdin or --file PATH); decide asks
                               the user to pick a numbered option (--self: I ask them myself)
 
@@ -1764,14 +2026,14 @@ ${B}START A SESSION${R}
   Codex:        $Collab implement   ·  $Collab review
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
-Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 1 error${R}`);
+Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 17 tree changed since review/approval · 1 error${R}`);
 }
 
 // --- main -------------------------------------------------------------------
 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
-  snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, status: cmdStatus,
+  snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, verify: cmdVerify, status: cmdStatus,
   show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer, scratch: cmdScratch,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),

@@ -68,6 +68,9 @@ in the dashboard and in the log.
   written.
 - **Reviews the real changes.** Each task snapshots your git repos (even several nested ones),
   so the reviewer sees exactly what changed, not just the implementer's summary.
+- **Approval means what it says.** An approval covers the exact files the reviewer saw: if they
+  change afterwards, it is refused, and `collab verify` checks them again before a commit. Verdicts
+  must match their findings, and every handoff states what was verified and what wasn't.
 - **Never gets stuck silently.** Agents post short progress updates. If one goes quiet, the other
   asks you: *stop, or keep waiting?*
 - **Cheap to run.** Waiting is a blocking shell command, so no tokens are spent while an agent waits.
@@ -261,16 +264,17 @@ Add `-t <task-id>` to any command to target a task other than the current one.
 | `collab queue next` · `queue skip` | Show / drop the next queued task for this project |
 | `collab queue split [--reason TEXT]` | Implementer: split the current task (parts on stdin, separated by `=== part ===` lines); part 1 stays, the rest queue next |
 | `collab check` | Run the task's `--check` command |
+| `collab verify` | Implementer: are the project files still the ones the reviewer approved? Exit 0 yes, 17 no. 🤖 before a `--commit` commit |
 | `collab scratch` | Folder for message drafts, notes and logs: the task's own, or a shared drafts folder before `init`. Keeps them out of your project |
 | `collab join [--after ID]` | Reviewer: wait until a task exists, print its brief. With `--after` (the task it just finished), it also stops when the run ends |
 | `collab end` | Implementer: the whole request is done. Ends the run for both agents (final report on stdin or `--file`) |
 | `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |
 | `collab progress "text"` | Post what you're doing now (shown to the other side) |
 | `collab submit implementer <plan\|ready\|decide\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
-| `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself) |
+| `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself). `approve` is refused (exit 17) if the files changed since the implementer's handoff; `approve --rereviewed` after checking them |
 
 Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` new note · `13` other agent idle ·
-`14` check failed · `15` queue empty · `16` decision for you · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
+`14` check failed · `15` queue empty · `16` decision for you · `17` files changed since review/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
 
 </details>
 

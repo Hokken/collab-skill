@@ -9,6 +9,8 @@ const { spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'collab.js');
 
+const CLOSEOUT = '## Closeout\nVerified: none\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n';
+
 function sandbox(extraEnv = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'collab-test-'));
   const home = path.join(root, 'home');
@@ -18,7 +20,10 @@ function sandbox(extraEnv = {}) {
     ...process.env, COLLAB_HOME: home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0',
     COLLAB_TASK: '', ...extraEnv,
   };
-  const run = (args, { input, cwd = project, env: more = {} } = {}) => {
+  // A build 'ready' needs a closeout; tests that aren't about it get a minimal one (raw: send as is).
+  const run = (args, { input, cwd = project, env: more = {}, raw = false } = {}) => {
+    const ready = args.join(' ').includes('submit implementer ready') && !args.includes('--file');
+    if (ready && !raw && typeof input === 'string' && !/^## Closeout/m.test(input)) input += `\n${CLOSEOUT}`;
     const r = spawnSync(process.execPath, [CLI, ...args], {
       cwd, input: input === undefined ? '' : input, encoding: 'utf8', env: { ...env, ...more },
     });
@@ -107,7 +112,7 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
   const toLimit = (slug) => {
     s.run(['init', slug, '--max-rounds', '2'], { input: 'b' });
     s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-    s.run(['submit', 'reviewer', 'changes'], { input: 'c1' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. c1' });
     s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
     return s.run(['submit', 'reviewer', 'changes'], { input: '1. still broken' });
   };
@@ -144,7 +149,7 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
 
   s.run(['init', 'e-plan', '--plan', '--max-rounds', '1'], { input: 'b' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: 'rethink' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' });
   assert.match(s.state().decision.question, /1 plan rounds/);
   s.run(['answer', '1']);
   assert.equal(s.state().status, 'PLAN_CHANGES');
@@ -200,7 +205,7 @@ test('notes: gate, routing and finished tasks', () => {
   r = s.run(['wait', 'reviewer', '--timeout', '1']);
   assert.match(r.out, /check perf/);
   assert.doesNotMatch(r.out, /impl only/);
-  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: 'fix' }).code, 0, 'implementer-only note does not gate the reviewer');
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' }).code, 0, 'implementer-only note does not gate the reviewer');
 
   s.run(['note', '--to', 'reviewer', 'reviewer note during impl turn']);
   r = s.run(['wait', 'implementer', '--timeout', '1']);
@@ -224,7 +229,7 @@ test('plan mode', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /submit your plan/);
   assert.match(s.run(['submit', 'implementer', 'plan'], { input: 'p1' }).out, /PLAN_REVIEW/);
-  assert.match(s.run(['submit', 'reviewer', 'changes'], { input: 'rethink' }).out, /PLAN_CHANGES/);
+  assert.match(s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' }).out, /PLAN_CHANGES/);
   assert.match(s.run(['wait', 'implementer', '--timeout', '1']).out, /rethink/);
   s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
   r = s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
@@ -233,6 +238,34 @@ test('plan mode', () => {
   assert.equal(s.state().phase, 'build');
   s.run(['submit', 'implementer', 'ready'], { input: 'built' });
   assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ship' }).code, 10);
+});
+
+test('the reviewer verdict must match its items', () => {
+  const s = sandbox();
+  const refused = (kind, input, re) => {
+    const before = s.state();
+    const r = s.run(['submit', 'reviewer', kind], { input });
+    assert.equal(r.code, 1, `${kind} refused: ${input}`);
+    assert.match(r.err, re);
+    const after = s.state();
+    assert.equal(after.status, before.status, 'status unchanged');
+    assert.equal(after.seq, before.seq, 'no entry written');
+    assert.equal(fs.readdirSync(path.join(s.taskDir(), 'entries')).length, before.seq);
+  };
+  s.run(['init', 'verdict', '--plan'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+  refused('approve', '## Verdict: approved\n1. [blocking] step 2 is missing\n', /\[blocking\] items/);
+  refused('changes', 'rethink the whole thing', /numbered items/);
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: '2) rethink step 2' }).code, 0);
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok\n1. [nit] wording' }).code, 0, 'nits are fine in an approve');
+
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  refused('approve', 'looks good\n  2) [Blocking] races on Windows\n', /\[blocking\] items/);
+  refused('changes', '## Verdict: changes requested\n- a bullet is not a numbered item\n', /numbered items/);
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix the race' }).code, 0);
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: '## Verdict: approved\n## Nits\n- naming\n' }).code, 10);
 });
 
 test('escalate is allowed out of turn', () => {
@@ -320,12 +353,12 @@ test('-t pins a task even when current moves', () => {
 test('--file bodies keep UTF-8 and normalise CRLF and BOM', () => {
   const s = sandbox();
   const f = path.join(s.root, 'msg.md');
-  fs.writeFileSync(f, '﻿## Résumé — done → ok\r\nline two\r\n');
+  fs.writeFileSync(f, `﻿## Résumé — done → ok\r\nline two\r\n${CLOSEOUT.replace(/\n/g, '\r\n')}`);
   s.run(['init', 'utf'], { input: 'b' });
   const r = s.run(['submit', 'implementer', 'ready', '--file', f]);
   assert.equal(r.code, 0, r.err);
   const entry = fs.readFileSync(path.join(s.taskDir(), 'entries', '001-implementer-ready.md'), 'utf8');
-  assert.equal(entry, '## Résumé — done → ok\nline two\n');
+  assert.equal(entry, `## Résumé — done → ok\nline two\n${CLOSEOUT}`);
 
   assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: '   \n' }).code, 1, 'empty body refused');
 });
@@ -897,4 +930,328 @@ test('scratch: drafts folder before init, the task folder after, cleaned with th
   assert.match(r.out, /deleted 1 task\(s\) and 1 draft file\(s\)/);
   assert.ok(!fs.existsSync(old) && fs.existsSync(fresh), 'only drafts older than a day go');
   assert.match(s.run(['clean', '-y']).out, /nothing to clean/);
+});
+
+// --- approval bound to the reviewed tree ------------------------------------------
+
+const gitIn = (dir) => (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+
+test('approve is refused when the tree changed since ready; --rereviewed covers only the refused tree', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const f = path.join(s.project, 'f.txt');
+  s.run(['init', 'bind'], { input: 'b' });
+  fs.appendFileSync(f, 'two\n');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  assert.ok(s.state().review_digest);
+
+  fs.appendFileSync(f, 'three\n');
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /NOT APPROVED: the tree changed since the implementer's handoff[\s\S]*~ f\.txt/);
+  assert.equal(s.state().status, 'READY_FOR_REVIEW');
+  assert.ok(s.state().pending_digest);
+
+  s.run(['diff']);
+  s.run(['diff', '--stat']);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 17, 'diff does not clear the refusal');
+
+  fs.appendFileSync(f, 'four\n');
+  r = s.run(['submit', 'reviewer', 'approve', '--rereviewed'], { input: 'ok' });
+  assert.equal(r.code, 17, 'changed again after the refusal');
+  assert.match(r.out, /since your approve was refused[\s\S]*~ f\.txt/);
+
+  r = s.run(['submit', 'reviewer', 'approve', '--rereviewed'], { input: 'ok' });
+  assert.equal(r.code, 10, r.out + r.err);
+  assert.equal(s.state().status, 'DONE');
+  assert.match(s.run(['verify']).out, /verified/);
+
+  fs.writeFileSync(path.join(s.project, 'late.txt'), 'x\n');
+  r = s.run(['verify']);
+  assert.equal(r.code, 17);
+  assert.match(r.out, /TREE CHANGED[\s\S]*\+ late\.txt/);
+  fs.rmSync(path.join(s.project, 'late.txt'));
+  const g = gitIn(s.project);
+  g('add', '-A');
+  g('commit', '-qm', 'approved work');
+  assert.equal(s.run(['verify']).code, 0, 'committing the approved tree keeps it verified');
+  assert.equal(s.run(['submit', 'implementer', 'ready', '--rereviewed'], { input: 'x' }).code, 1);
+});
+
+test('the digest covers untracked files, new ignored docs and assume-unchanged / skip-worktree paths', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = gitIn(s.project);
+  const p = (f) => path.join(s.project, f);
+  fs.writeFileSync(p('.gitignore'), 'notes/\n');
+  fs.writeFileSync(p('skip.txt'), 'skip\n');
+  fs.writeFileSync(p('assume.txt'), 'assume\n');
+  g('add', '.gitignore', 'skip.txt', 'assume.txt');
+  g('commit', '-qm', 'more');
+  g('update-index', '--skip-worktree', 'skip.txt');
+  g('update-index', '--assume-unchanged', 'assume.txt');
+  fs.writeFileSync(p('old-untracked.txt'), 'old\n');
+  fs.mkdirSync(p('notes'));
+
+  const cases = [
+    ['untracked file created', () => fs.writeFileSync(p('new.txt'), 'n\n'), /\+ new\.txt/],
+    ['pre-existing untracked file edited', () => fs.appendFileSync(p('old-untracked.txt'), 'more\n'), /~ old-untracked\.txt/],
+    ['new ignored doc edited', () => fs.appendFileSync(p('notes/plan.md'), 'edit\n'), /~ notes\/plan\.md/, () => fs.writeFileSync(p('notes/plan.md'), 'plan\n')],
+    ['skip-worktree file edited', () => fs.appendFileSync(p('skip.txt'), 'edit\n'), /~ skip\.txt/],
+    ['assume-unchanged file edited', () => fs.appendFileSync(p('assume.txt'), 'edit\n'), /~ assume\.txt/],
+  ];
+  for (const [name, mutate, re, before] of cases) {
+    s.run(['init', 'cover'], { input: 'b' });
+    if (before) before();
+    assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0, name);
+    mutate();
+    const r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+    assert.equal(r.code, 17, `${name}: ${r.out}${r.err}`);
+    assert.match(r.out, re, name);
+    s.run(['abort']);
+  }
+});
+
+test('the digest never writes to the git index or object store, even after a stat-only change', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = gitIn(s.project);
+  const idx = path.join(s.project, '.git', 'index');
+  s.run(['init', 'readonly'], { input: 'b' });
+  const later = new Date(Date.now() + 60000);
+  fs.utimesSync(path.join(s.project, 'f.txt'), later, later);
+  fs.writeFileSync(path.join(s.project, 'new.txt'), 'n\n');
+  const index0 = fs.readFileSync(idx);
+  const objects0 = g('count-objects', '-v').stdout;
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
+  assert.equal(s.run(['verify']).code, 0);
+  assert.ok(fs.readFileSync(idx).equals(index0), 'index is byte-identical');
+  assert.equal(g('count-objects', '-v').stdout, objects0, 'no objects written');
+});
+
+test('a nested repo counts by its checked-out commit and its own content; uncovered ones fail closed', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const mod = path.join(s.project, 'mod');
+  gitRepo(mod);
+  const gm = gitIn(mod);
+  s.run(['init', 'nested'], { input: 'b' });
+  gm('commit', '-q', '--allow-empty', '-m', 'B');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  gm('commit', '-q', '--allow-empty', '-m', 'C (same tree as B)');
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /~ mod/);
+  s.run(['abort']);
+
+  s.run(['init', 'nested-dirty'], { input: 'b' });
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  fs.appendFileSync(path.join(mod, 'f.txt'), 'dirty\n');
+  r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 17);
+  assert.match(r.out, /mod:\n {2}\+ f\.txt/);
+  s.run(['abort']);
+
+  s.run(['init', 'uncovered'], { input: 'b' });
+  gitRepo(path.join(s.project, 'late-repo'));
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cannot compute the tree digest: a changed folder is not one of this task's snapshotted repos/);
+  assert.equal(s.state().status, 'IMPLEMENTING');
+});
+
+test('a file named __proto__ is covered during review and after approval', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const proto = path.join(s.project, '__proto__');
+  fs.writeFileSync(proto, 'a\n');
+  s.run(['init', 'proto'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  fs.writeFileSync(proto, 'b\n');
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /~ __proto__/);
+  assert.equal(s.run(['submit', 'reviewer', 'approve', '--rereviewed'], { input: 'ok' }).code, 10);
+  fs.writeFileSync(proto, 'c\n');
+  r = s.run(['verify']);
+  assert.equal(r.code, 17);
+  assert.match(r.out, /~ __proto__/);
+});
+
+test('a tracked gitlink counts even when git config ignores submodule changes', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = gitIn(s.project);
+  const mod = path.join(s.project, 'mod');
+  gitRepo(mod);
+  const gm = gitIn(mod);
+  g('add', 'mod');
+  g('commit', '-qm', 'add gitlink');
+  g('config', 'diff.ignoreSubmodules', 'all');
+  g('config', 'submodule.mod.ignore', 'all');
+  s.run(['init', 'gitlink'], { input: 'b' });
+  assert.match(s.run(['status']).out, /gitlink/);
+  gm('commit', '-q', '--allow-empty', '-m', 'B');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+  gm('commit', '-q', '--allow-empty', '-m', 'C (same tree as B)');
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /~ mod/);
+  assert.equal(s.run(['submit', 'reviewer', 'approve', '--rereviewed'], { input: 'ok' }).code, 10);
+  gm('commit', '-q', '--allow-empty', '-m', 'D');
+  r = s.run(['verify']);
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /~ mod/);
+});
+
+test('the reviewer gets earlier blocking items of its phase and the approved plan', () => {
+  const s = sandbox();
+  const reviewerWait = () => s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  s.run(['init', 'recap'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  let out = reviewerWait();
+  assert.doesNotMatch(out, /earlier blocking items|approved plan/, 'round 1: nothing to recap, no plan');
+  s.run(['submit', 'reviewer', 'changes'], {
+    input: '## Verdict: changes requested\n1. [blocking] parser.ts:12 — null deref\n   → guard it before use\n2. [should-fix] rename b\n## Nits\n- spacing\n',
+  });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1) [Blocking] still racy on Windows\n\nunrelated prose\n' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v3' });
+  out = reviewerWait();
+  assert.match(out, /----- earlier blocking items \(from collab\)[^\n]*\nround 1 \(#002\):\n1\. \[blocking\] parser\.ts:12 — null deref\n {3}→ guard it before use\nround 2 \(#004\):\n1\) \[Blocking\] still racy on Windows\n----- end -----/);
+  assert.doesNotMatch(out, /rename b|spacing|unrelated prose|approved plan/);
+
+  s.run(['abort']);
+  s.run(['init', 'planned', '--plan'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'plan v1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] step 3 is missing' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'plan v2' });
+  out = reviewerWait();
+  assert.match(out, /plan round 1 \(#002\):\n1\. \[blocking\] step 3 is missing/);
+  assert.doesNotMatch(out, /approved plan/);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'built' });
+  out = reviewerWait();
+  assert.doesNotMatch(out, /earlier blocking items/, 'plan-phase blockers stay in the plan phase');
+  const id = s.state().id;
+  assert.ok(out.includes(`approved plan: #003 (read it with 'collab -t ${id} show 3')`), out);
+});
+
+test('a build ready needs a closeout with all four labels', () => {
+  const s = sandbox();
+  const ready = (input) => s.run(['submit', 'implementer', 'ready'], { input, raw: true });
+  s.run(['init', 'closeout', '--plan'], { input: 'b' });
+  assert.equal(s.run(['submit', 'implementer', 'plan'], { input: 'plan without closeout', raw: true }).code, 0, 'plans are not checked');
+  s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
+
+  const before = s.state();
+  let r = ready('## Summary\ndid it\n## How to verify\nnpm test\n');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /'## Closeout' section with the labels 'Verified:', 'Attempted, blocked:', 'Deferred:', 'Not claimed:'/);
+  r = ready('## Summary\nx\n## Closeout\nVerified: npm test, 12 pass\nDeferred: none\n## Decisions taken\nNot claimed: outside the section\n');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /labels 'Attempted, blocked:', 'Not claimed:'/);
+  assert.equal(s.state().seq, before.seq, 'nothing written');
+  assert.equal(s.state().status, 'IMPLEMENTING');
+
+  r = ready('## Summary\nx\n## Closeout\n- **Verified:** npm test, 12 pass\n- Attempted-blocked: none\n> _Deferred_: docs, tracked in #12\n**NOT CLAIMED:** Windows\n');
+  assert.equal(r.code, 0, r.err);
+  assert.equal(s.state().status, 'READY_FOR_REVIEW');
+});
+
+test('the summary template in SKILL.md passes the closeout check as written', () => {
+  const s = sandbox();
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'SKILL.md'), 'utf8');
+  const tpl = skill.match(/using this summary:\n {3}```\n([\s\S]*?)\n {3}```/);
+  assert.ok(tpl, 'template found');
+  s.run(['init', 'template'], { input: 'b' });
+  const r = s.run(['submit', 'implementer', 'ready'], { input: tpl[1].replace(/^ {3}/gm, ''), raw: true });
+  assert.equal(r.code, 0, r.err);
+});
+
+test('collab end collects each task\'s last closeout and the reviewer\'s briefing for the user', () => {
+  const s = sandbox();
+  const closeout = (v) => `## Closeout\nVerified: ${v}\nAttempted, blocked: none\nDeferred: none\nNot claimed: perf\n`;
+  s.run(['init', 'a-task'], { input: 'b' });
+  const a = s.state().id;
+  s.run(['submit', 'implementer', 'ready'], { input: `## Summary\nv1\n${closeout('first try')}` });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix x' });
+  s.run(['submit', 'implementer', 'ready'], { input: `## Summary\nv2\n${closeout('npm test, 40 pass')}` });
+  s.run(['submit', 'reviewer', 'approve'], { input: '## Verdict: approved\n## For the user\n- try a 2 GB file by hand\n## Nits\n- naming\n' });
+
+  // An older task: its ready predates closeouts (the entry is rewritten as such a task wrote it).
+  s.run(['init', 'b-old'], { input: 'b' });
+  const b = s.state().id;
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  fs.writeFileSync(path.join(s.taskDir(), 'entries', '001-implementer-ready.md'), '## Summary\nold style\n## How to verify\nnpm test\n');
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+
+  // A planned task the user approved at the round limit: its only approve is the plan's.
+  s.run(['init', 'c-limit', '--plan', '--max-rounds', '1'], { input: 'b' });
+  const c = s.state().id;
+  s.run(['submit', 'implementer', 'plan'], { input: 'p' });
+  s.run(['submit', 'reviewer', 'approve'], { input: '## Verdict: plan ok\n## For the user\nPLAN BRIEFING\n' });
+  s.run(['submit', 'implementer', 'ready'], { input: `## Summary\nc\n${closeout('c checks')}` });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] still wrong' });
+  s.run(['answer', '2']);
+  assert.equal(s.state().status, 'DONE');
+
+  assert.equal(s.run(['end'], { input: '## Final report\nall done\n' }).code, 0);
+  const report = s.run(['show']).out;
+  const at = (str) => { const i = report.indexOf(str); assert.ok(i >= 0, `missing: ${str}\n${report}`); return i; };
+  assert.ok(at('## Closeouts (collected by collab)') < at('## For the user, from the reviewer (collected by collab)'));
+  assert.ok(at('## For the user, from the reviewer') < at('## Decisions recorded during this run'));
+  assert.match(report, new RegExp(`### ${a}\\nVerified: npm test, 40 pass\\n`));
+  assert.doesNotMatch(report, /first try/, 'only the last ready counts');
+  assert.match(report, new RegExp(`### ${b}\\nno structured closeout recorded for this task`));
+  assert.match(report, new RegExp(`### ${c}\\nVerified: c checks`));
+  assert.match(report, new RegExp(`## For the user, from the reviewer \\(collected by collab\\)\\n### ${a}\\n- try a 2 GB file by hand\\n\\n## Decisions`));
+  assert.doesNotMatch(report, /PLAN BRIEFING|naming/);
+});
+
+test('symlinks are signed by their target', { skip: process.platform === 'win32' }, () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const link = path.join(s.project, 'link');
+  s.run(['init', 'link'], { input: 'b' });
+  fs.symlinkSync('f.txt', link);
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  fs.unlinkSync(link);
+  fs.symlinkSync('elsewhere.txt', link);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 17);
+});
+
+test('tasks without a recorded digest, plan approvals, no repos and the round-limit override', () => {
+  const s = sandbox();
+  s.run(['init', 'norepo'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  let r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 10);
+  assert.match(r.out, /not bound to the files/);
+  assert.match(s.run(['verify']).out, /nothing to verify/);
+
+  gitRepo(s.project);
+  s.run(['init', 'old'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  const sp = path.join(s.taskDir(), 'state.json');
+  const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+  delete st.review_digest;
+  fs.writeFileSync(sp, JSON.stringify(st));
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'edit\n');
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10, 'old state approves as before');
+  r = s.run(['verify']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /no approved tree recorded/);
+
+  s.run(['init', 'planned', '--plan', '--max-rounds', '1'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p' });
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'during plan review\n');
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' }).code, 0, 'plan approvals are not bound');
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix it' });
+  assert.equal(s.state().status, 'DECISION');
+  r = s.run(['answer', '2']);
+  assert.match(r.out, /the task is DONE/);
+  assert.equal(s.run(['verify']).code, 0, 'the user-approved tree is recorded');
 });
