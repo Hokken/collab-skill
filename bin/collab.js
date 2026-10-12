@@ -2197,7 +2197,7 @@ function cmdEnd(args) {
     return update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
   });
   notify(`${st.id}: work complete`);
-  pushPhone(st, `Work complete: ${run.length} task(s). 'collab show' has the final report.`);
+  pushPhone(st, `Work complete: ${run.length} task(s). 'collab show' has the final report.`, { priority: 'high' });
   out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s)${queued.length ? `, ${queued.length} queued task(s) left for the user's go-ahead` : ''}. A reviewer in 'join --after' stops now.`);
 }
 
