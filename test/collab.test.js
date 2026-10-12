@@ -1255,3 +1255,673 @@ test('tasks without a recorded digest, plan approvals, no repos and the round-li
   assert.match(r.out, /the task is DONE/);
   assert.equal(s.run(['verify']).code, 0, 'the user-approved tree is recorded');
 });
+
+// --- project lessons ---------------------------------------------------------------
+
+const lessonsMd = (dir) => path.join(dir, '.collab', 'lessons.md');
+
+test('lessons: .collab/lessons.md in the project; add, list, rm, hand edits and the length limit', () => {
+  const s = sandbox();
+  const sub = path.join(s.project, 'module');
+  const other = path.join(s.root, 'other');
+  fs.mkdirSync(sub);
+  fs.mkdirSync(other);
+  assert.match(s.run(['lessons']).out, /no lessons yet/);
+  let r = s.run(['lessons', 'add', 'Run', 'npm', 'test', 'before', 'handing', 'off.']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /added lesson #1 to .*lessons\.md\ncreated .*commit it/);
+  assert.match(fs.readFileSync(lessonsMd(s.project), 'utf8'),
+    /^# Project lessons\n\n[\s\S]*\n\n- Run npm test before handing off\. <!-- collab: by user, \d{4}-\d\d-\d\d -->\n$/);
+  assert.match(s.run(['lessons', 'add', 'run npm test  before handing off']).out, /already known/);
+  r = s.run(['lessons', 'add', 'Use path.join, never string concatenation']);
+  assert.match(r.out, /#2/);
+  assert.doesNotMatch(r.out, /created/);
+  r = s.run(['lessons', 'add', 'x'.repeat(301)]);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /at most 300 characters \(got 301\)/);
+  assert.equal(s.run(['lessons', 'add', 'x'.repeat(300)]).code, 0, 'exactly the limit is fine');
+
+  r = s.run(['lessons'], { cwd: sub });
+  assert.match(r.out, /#1 +Run npm test before handing off\. +\(user\)[\s\S]*#2 /, 'a folder inside the project shares them');
+  assert.ok(!fs.existsSync(lessonsMd(sub)));
+  assert.match(s.run(['lessons'], { cwd: other }).out, /no lessons/, 'unrelated folders do not');
+  assert.equal(s.run(['lessons', 'add', 'other project lesson'], { cwd: other }).code, 0);
+  assert.ok(fs.existsSync(lessonsMd(other)));
+
+  // Numbers are positions: all of them are removed, or none.
+  r = s.run(['lessons', 'rm', '3', '9']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /no lesson #9/);
+  assert.match(s.run(['lessons']).out, /#3 +x{300}/);
+  assert.match(s.run(['lessons', 'rm', '3']).out, /removed: x{300}/);
+  assert.match(s.run(['lessons'], { cwd: other }).out, /other project lesson/);
+  assert.equal(s.run(['lessons', 'rm', 'x']).code, 1);
+  assert.equal(s.run(['lessons', 'bogus']).code, 1);
+
+  // People edit the file by hand: their bullets count, the rest of the file is left alone.
+  fs.appendFileSync(lessonsMd(s.project), '\nSome notes for the team.\n\n- Hand-written lesson\n  that goes on here\n');
+  r = s.run(['lessons']);
+  assert.match(r.out, /#3 +Hand-written lesson that goes on here\n/);
+  s.run(['lessons', 'add', 'after the hand edit']);
+  s.run(['lessons', 'rm', '1']);
+  const md = fs.readFileSync(lessonsMd(s.project), 'utf8');
+  assert.match(md, /^# Project lessons\n[\s\S]*\n- Use path\.join[^\n]*\n\nSome notes for the team\.\n\n- Hand-written lesson\n  that goes on here\n- after the hand edit <!-- collab: by user/);
+  assert.doesNotMatch(md, /npm test/);
+
+  // CRLF files stay CRLF.
+  fs.writeFileSync(lessonsMd(other), '# Lessons\r\n\r\n- one\r\n');
+  s.run(['lessons', 'add', 'two'], { cwd: other });
+  assert.match(fs.readFileSync(lessonsMd(other), 'utf8'), /^# Lessons\r\n\r\n- one\r\n- two <!-- collab: by user, [\d-]+ -->\r\n$/);
+});
+
+test("lessons: agents record them from handoffs, briefs carry them, end lists the run's", () => {
+  const s = sandbox();
+  s.run(['lessons', 'add', 'Keep collab.js dependency-free']);
+  s.run(['init', 'first'], { input: 'b' });
+  assert.match(fs.readFileSync(path.join(s.taskDir(), 'entries', '000-implementer-brief.md'), 'utf8'),
+    /## Project lessons \(set by collab, from \.collab\/lessons\.md\)\n[^\n]*current instructions[^\n]*\n- #1 Keep collab\.js dependency-free\n/);
+
+  // A refused submit records nothing.
+  let r = s.run(['submit', 'reviewer', 'changes'], { input: '## Lessons\n- refused lesson\n' });
+  assert.equal(r.code, 1);
+  s.run(['note', '-i', 'please also do Y']);
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v1\n## Lessons\n- note-refused lesson\n' });
+  assert.equal(r.code, 12);
+  assert.doesNotMatch(s.run(['lessons']).out, /refused lesson/);
+
+  const long = `- ${'y'.repeat(301)}`;
+  r = s.run(['submit', 'implementer', 'ready'], {
+    input: `v1\n${CLOSEOUT}## Lessons\n- Tests on Windows need\n  forward slashes in globs\n- keep collab.js dependency-free.\n${long}\n- none\n`,
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /lessons recorded: #2 in .*lessons\.md/);
+  assert.match(r.out, /already known, not added again: 1/);
+  assert.match(r.out, /lesson not recorded \(over 300 characters\): y{60}…/);
+  r = s.run(['submit', 'reviewer', 'changes'], { input: `1. fix\n## Lessons\n${[1, 2, 3, 4, 5, 6].map((n) => `${n}. lesson ${n}`).join('\n')}\n` });
+  assert.match(r.out, /lessons recorded: #3, #4, #5, #6, #7 [\s\S]*at most 5 per message\): 1/);
+  r = s.run(['lessons']);
+  assert.match(r.out, /#2 +Tests on Windows need forward slashes in globs +\(implementer, first-/);
+  assert.match(r.out, /#7 +lesson 5 +\(reviewer, first-/);
+  assert.doesNotMatch(r.out, /lesson 6|none|y{10}/);
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+
+  // The next brief has them; the brief keeps the newest 30.
+  for (let i = 8; i <= 32; i++) s.run(['lessons', 'add', `bulk lesson ${i}`]);
+  s.run(['init', 'second'], { input: 'b' });
+  const brief = fs.readFileSync(path.join(s.taskDir(), 'entries', '000-implementer-brief.md'), 'utf8');
+  assert.doesNotMatch(brief, /#1 Keep/);
+  assert.match(brief, /- #3 lesson 1\n[\s\S]*- #32 bulk lesson 32\n\(2 older lesson\(s\) not shown: 'collab lessons'\)/);
+  s.run(['lessons', 'rm', '5']);
+  approveCurrent(s);
+  r = s.run(['end'], { input: 'done' });
+  assert.equal(r.code, 0, r.err);
+  const report = s.run(['show']).out;
+  assert.match(report, /## Lessons recorded during this run \(collected by collab\)\n.*commit them.*\n### \.collab\/lessons\.md \(remove with 'collab lessons rm N --dir [^']+'\)\n- #2 \(implementer\) Tests on Windows/);
+  assert.match(report, /- #6 \(reviewer\) lesson 5/);
+  assert.doesNotMatch(report, /bulk lesson|lesson 3\b/, "only lessons from the run's tasks, and not removed ones");
+});
+
+test('lessons: the file never counts as a project change (diff, scope, approval, verify)', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const sub = path.join(s.project, 'src');
+  fs.mkdirSync(sub);
+  s.run(['init', 'git-lessons', '--scope', 'src/**'], { input: 'b' });
+  fs.writeFileSync(path.join(sub, 'a.js'), 'x\n');
+  let r = s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- from the implementer\n` });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /created .*lessons\.md: it belongs to the project, commit it/);
+  assert.ok(fs.existsSync(lessonsMd(s.project)), 'at the repo top level');
+
+  r = s.run(['diff']);
+  assert.doesNotMatch(r.out, /lessons\.md|OUTSIDE SCOPE/);
+  assert.match(r.out, /src\/a\.js[\s\S]*scope: all changes are inside src\/\*\*/);
+
+  // A lesson recorded from a subfolder goes to the same file; approving after it still works.
+  s.run(['lessons', 'add', 'added during the review'], { cwd: sub });
+  r = s.run(['submit', 'reviewer', 'approve'], { input: `ok\n## Lessons\n- from the reviewer\n` });
+  assert.equal(r.code, 10, r.out + r.err);
+  assert.equal(s.state().status, 'DONE');
+  assert.equal(s.run(['verify']).code, 0);
+  assert.equal(s.run(['lessons']).out.match(/^#\d/gm).length, 3);
+});
+
+// --- phone notifications -------------------------------------------------------------
+
+// A local stand-in for ntfy that records each push (hang: accept but never answer).
+async function pushServer({ hang = false } = {}) {
+  const http = require('http');
+  const got = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      got.push({ title: req.headers.title, priority: req.headers.priority, body });
+      if (!hang) res.end('ok');
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/topic`;
+  // Pushes come from detached processes, a little after the command returns.
+  const until = async (n, ms = 10000) => {
+    const t = Date.now();
+    while (got.length < n && Date.now() - t < ms) await pause(50);
+    return got;
+  };
+  const close = () => { if (server.closeAllConnections) server.closeAllConnections(); server.close(); };
+  return { got, url, until, close };
+}
+
+test('phone: only --phone tasks push, ordinary handoffs never do, end does', async () => {
+  const p = await pushServer();
+  try {
+    const s = sandbox({ COLLAB_PHONE_URL: p.url });
+    s.run(['init', 'a-quiet'], { input: 'b' });
+    s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+    s.run(['answer', '1']);
+    approveCurrent(s);
+
+    let r = s.run(['init', 'b-loud', '--phone'], { input: 'b' });
+    assert.ok(r.out.includes(`pushes go to ${p.url}`), r.out);
+    assert.match(r.out, /options: .*phone notifications/);
+    s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+    s.run(['progress', 'fixing']);
+    approveCurrent(s);
+    assert.equal(s.state().status, 'DONE');
+    r = s.run(['end'], { input: 'all done' });
+    assert.equal(r.code, 0, r.err);
+    await p.until(1);
+    await pause(1000);
+    assert.equal(p.got.length, 1, JSON.stringify(p.got));
+    assert.match(p.got[0].title, /^collab: b-loud-/);
+    assert.match(p.got[0].body, /^Work complete: 2 task\(s\)/);
+  } finally { p.close(); }
+});
+
+test('phone: decisions, the round limit, escalations and a confirm-first queued task push', async () => {
+  const p = await pushServer();
+  try {
+    const s = sandbox({ COLLAB_PHONE_URL: p.url });
+    s.run(['init', 'ask', '--phone'], { input: 'b' });
+    s.run(['submit', 'implementer', 'decide'], { input: '## Which storage?\n1. json\n2. sqlite\n' });
+    let got = await p.until(1);
+    assert.equal(got[0].body, 'Decision needed: Which storage?');
+    assert.equal(got[0].priority, 'high');
+    s.run(['answer', '1']);
+    s.run(['abort']);
+
+    s.run(['init', 'limit', '--phone', '--max-rounds', '1'], { input: 'b' });
+    s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. still broken' });
+    assert.equal(s.state().status, 'DECISION');
+    got = await p.until(2);
+    assert.match(got[1].body, /^Decision needed: Round limit reached/);
+    s.run(['answer', '3']);
+
+    s.run(['init', 'esc', '--phone'], { input: 'b' });
+    s.run(['submit', 'reviewer', 'escalate'], { input: 'Missing credentials for the API\n' });
+    got = await p.until(3);
+    assert.equal(got[2].body, 'Escalated by the reviewer: Missing credentials for the API');
+
+    // Confirm-first: pushed while a --phone run continues (its last task approved, not ended).
+    s.run(['init', 'run', '--phone'], { input: 'b' });
+    approveCurrent(s);
+    s.run(['queue', 'add', '--confirm', 'Run the DB migration']);
+    assert.match(s.run(['queue', 'next']).out, /CONFIRM FIRST/);
+    got = await p.until(4);
+    assert.match(got[3].body, /^Queued task #1 needs your go-ahead: Run the DB migration/);
+  } finally { p.close(); }
+});
+
+test('phone: unresponsive agents and stalls push', async () => {
+  const p = await pushServer();
+  try {
+    const s = sandbox({ COLLAB_PHONE_URL: p.url, COLLAB_IDLE_SECS: '2', COLLAB_QUIET_MINS: '0' });
+    s.run(['init', 'idle', '--phone'], { input: 'b' });
+    await pause(2500);
+    let r = s.run(['wait', 'reviewer', '--timeout', '3']);
+    assert.equal(r.code, 13, r.out);
+    let got = await p.until(1);
+    assert.match(got[0].body, /^the implementer has not handed off .*Stop or keep waiting\?$/);
+
+    const id = s.state().id;
+    approveCurrent(s);
+    await pause(2500);
+    r = s.run(['join', '--after', id, '--timeout', '3']);
+    assert.equal(r.code, 13, r.out);
+    got = await p.until(2);
+    assert.match(got[1].body, /^the implementer has neither started a new task nor ended the run/);
+
+    const t = sandbox({ COLLAB_PHONE_URL: p.url, COLLAB_STALL_SECS: '2' });
+    t.run(['init', 'stall', '--phone'], { input: 'b' });
+    await pause(2500);
+    assert.equal(t.run(['wait', 'reviewer', '--timeout', '3']).code, 10);
+    got = await p.until(3);
+    assert.match(got[2].body, /^STALLED/);
+  } finally { p.close(); }
+});
+
+test('phone: --phone carries on only through an approved run that was not ended', async () => {
+  const s = sandbox({ COLLAB_PHONE_URL: 'http://127.0.0.1:9/never' });
+  const other = path.join(s.root, 'other');
+  fs.mkdirSync(other);
+  const phone = () => !!(s.state().options || {}).phone;
+
+  s.run(['init', 'a', '--phone'], { input: 'b' });
+  approveCurrent(s);
+  s.run(['init', 'b'], { input: 'b' });
+  assert.ok(phone(), 'the next task of the run inherits it');
+  const r = s.run(['init', 'x'], { input: 'b', cwd: other });
+  assert.equal(r.code, 0, r.err);
+  assert.doesNotMatch(r.out, /phone/, 'not another project');
+  approveCurrent(s);
+  s.run(['end'], { input: 'done' });
+  s.run(['init', 'c'], { input: 'b' });
+  assert.ok(!phone(), 'not after end');
+
+  // A sandbox each, so the finished task is surely the project's latest one.
+  const finishes = {
+    ABORTED: (u) => u.run(['abort']),
+    ESCALATED: (u) => u.run(['submit', 'implementer', 'escalate'], { input: 'blocked' }),
+  };
+  for (const [status, finish] of Object.entries(finishes)) {
+    const u = sandbox({ COLLAB_PHONE_URL: 'http://127.0.0.1:9/never' });
+    u.run(['init', 'd', '--phone'], { input: 'b' });
+    finish(u);
+    assert.equal(u.state().status, status);
+    u.run(['init', 'e'], { input: 'b' });
+    assert.ok(!(u.state().options || {}).phone, `not after ${status}`);
+  }
+
+  const t = sandbox({ COLLAB_PHONE_URL: 'http://127.0.0.1:9/never', COLLAB_STALL_SECS: '1' });
+  t.run(['init', 'a', '--phone'], { input: 'b' });
+  await pause(1500);
+  assert.equal(t.run(['wait', 'reviewer', '--timeout', '2']).code, 10);
+  assert.equal(t.state().status, 'STALLED');
+  t.run(['init', 'b'], { input: 'b' });
+  assert.ok(!(t.state().options || {}).phone, 'not after STALLED');
+});
+
+test('phone: set, show, test, and the first --phone creates a private topic', async () => {
+  const s = sandbox({ COLLAB_PHONE_URL: '' });
+  assert.match(s.run(['phone']).out, /aren't set up/);
+  assert.equal(s.run(['phone', 'test']).code, 1);
+  let r = s.run(['init', 'first', '--phone'], { input: 'b' });
+  const m = r.out.match(/phone: +NEW, tell the user: subscribe to topic '(collab-[0-9a-f]{16})' in the ntfy app/);
+  assert.ok(m, r.out);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).phone_url, `https://ntfy.sh/${m[1]}`);
+  approveCurrent(s);
+  r = s.run(['init', 'second'], { input: 'b' });
+  assert.match(r.out, new RegExp(`phone: +subscribe to topic '${m[1]}'`), 'same topic, not a new one');
+  assert.match(s.run(['phone']).out, new RegExp(m[1]));
+
+  assert.equal(s.run(['phone', 'set', 'bad topic!']).code, 1);
+  assert.match(s.run(['phone', 'set', 'my_topic-1']).out, /topic 'my_topic-1'/);
+  assert.match(s.run(['phone', 'set', 'https://push.example.com/t']).out, /pushes go to https:\/\/push\.example\.com\/t/);
+
+  const p = await pushServer();
+  try {
+    // spawnSync would block this process's server, so the test push runs asynchronously.
+    const { spawn } = require('child_process');
+    const code = await new Promise((resolve) => {
+      const c = spawn(process.execPath, [CLI, 'phone', 'test'], { env: { ...process.env, COLLAB_HOME: s.home, COLLAB_PHONE_URL: p.url } });
+      c.on('exit', resolve);
+    });
+    assert.equal(code, 0);
+    assert.equal(p.got[0].body, 'Test notification from collab');
+  } finally { p.close(); }
+  r = s.run(['phone', 'test'], { env: { COLLAB_PHONE_URL: 'http://127.0.0.1:9/closed' } });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /push to http:\/\/127\.0\.0\.1:9\/closed failed/);
+});
+
+test('phone: a slow or unreachable server never delays or changes a handoff', async () => {
+  const p = await pushServer({ hang: true });
+  try {
+    for (const url of [p.url, 'http://127.0.0.1:9/closed']) {
+      const s = sandbox({ COLLAB_PHONE_URL: url });
+      s.run(['init', 'slow', '--phone'], { input: 'b' });
+      const t = Date.now();
+      const r = s.run(['submit', 'implementer', 'decide'], { input: 'Pick\n1. a\n2. b\n' });
+      assert.ok(Date.now() - t < 5000, `took ${Date.now() - t} ms`);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(s.state().status, 'DECISION');
+      assert.equal(s.run(['answer', '2']).code, 0);
+    }
+    await p.until(1);
+    assert.equal(p.got.length, 1, 'the hanging server did receive its push');
+  } finally { p.close(); }
+});
+
+test('tasks created in the same second keep their creation order (phone inheritance, queue push)', async () => {
+  // Make every task of the sandbox look created in the same second, so only created_ms orders them.
+  const tie = (s) => {
+    for (const id of fs.readdirSync(path.join(s.home, 'tasks'))) {
+      const f = path.join(s.home, 'tasks', id, 'state.json');
+      const st = JSON.parse(fs.readFileSync(f, 'utf8'));
+      st.created_epoch = 1700000000;
+      fs.writeFileSync(f, JSON.stringify(st));
+    }
+  };
+  const phone = (s) => !!(s.state().options || {}).phone;
+  const env = { COLLAB_PHONE_URL: 'http://127.0.0.1:9/never' };
+
+  // A newer task that ended without approval (slug sorting before the approved one) stops the run.
+  const setStatus = (s, status) => {
+    const f = path.join(s.taskDir(), 'state.json');
+    const st = JSON.parse(fs.readFileSync(f, 'utf8'));
+    Object.assign(st, { status, turn: 'none' });
+    fs.writeFileSync(f, JSON.stringify(st));
+  };
+  for (const status of ['ABORTED', 'ESCALATED', 'STALLED']) {
+    const s = sandbox(env);
+    s.run(['init', 'z-prior', '--phone'], { input: 'b' });
+    approveCurrent(s);
+    s.run(['init', 'a-later'], { input: 'b' });
+    setStatus(s, status);
+    tie(s);
+    s.run(['init', 'c-fresh'], { input: 'b' });
+    assert.ok(!phone(s), `not after a newer ${status} task`);
+  }
+
+  // A newer task whose run was ended stops it too.
+  let s = sandbox(env);
+  s.run(['init', 'z-prior', '--phone'], { input: 'b' });
+  approveCurrent(s);
+  s.run(['init', 'a-later'], { input: 'b' });
+  approveCurrent(s);
+  assert.equal(s.run(['end'], { input: 'done' }).code, 0);
+  tie(s);
+  s.run(['init', 'c-fresh'], { input: 'b' });
+  assert.ok(!phone(s), 'not after the newer task ended the run');
+
+  // And a newer approved --phone task carries on, even though an older one sorts after it.
+  s = sandbox(env);
+  s.run(['init', 'z-prior'], { input: 'b' });
+  approveCurrent(s);
+  s.run(['init', 'a-later', '--phone'], { input: 'b' });
+  approveCurrent(s);
+  tie(s);
+  s.run(['queue', 'add', '--confirm', 'later']);
+  const p = await pushServer();
+  try {
+    s.run(['queue', 'next'], { env: { COLLAB_PHONE_URL: p.url } });
+    assert.match((await p.until(1))[0]?.body || '', /needs your go-ahead/, 'the queue push follows the newest task too');
+  } finally { p.close(); }
+  s.run(['init', 'c-fresh', '--from-queue', '--confirmed', 'go'], { input: 'b' });
+  assert.ok(phone(s), 'inherited from the newest task');
+
+
+  // Older tasks without created_ms still sort by their creation second.
+  const t = sandbox();
+  t.run(['init', 'a-old'], { input: 'b' });
+  approveCurrent(t);
+  t.run(['init', 'z-old'], { input: 'b' });
+  approveCurrent(t);
+  for (const [slug, epoch] of [['a-old', 1700000100], ['z-old', 1700000000]]) {
+    const id = fs.readdirSync(path.join(t.home, 'tasks')).find((n) => n.startsWith(slug));
+    const f = path.join(t.home, 'tasks', id, 'state.json');
+    const st = JSON.parse(fs.readFileSync(f, 'utf8'));
+    delete st.created_ms;
+    st.created_epoch = epoch;
+    fs.writeFileSync(f, JSON.stringify(st));
+  }
+  assert.match(t.run(['path']).out, /a-old-/, 'the later creation second wins');
+});
+
+test('phone set rejects malformed URLs; lessons --dir lists another folder', () => {
+  const s = sandbox({ COLLAB_PHONE_URL: '' });
+  for (const bad of ['http://[invalid', 'http://', 'https://host:99999/t', 'ftp://host/t', 'http//host']) {
+    const r = s.run(['phone', 'set', bad]);
+    assert.equal(r.code, 1, bad);
+    assert.ok(!fs.existsSync(path.join(s.home, 'config.json')), `nothing saved for ${bad}`);
+  }
+  assert.equal(s.run(['phone', 'set', 'http://ntfy.home.lan:8080/collab']).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).phone_url, 'http://ntfy.home.lan:8080/collab');
+
+  const other = path.join(s.root, 'other');
+  fs.mkdirSync(other);
+  s.run(['lessons', 'add', '--dir', other, 'only over there']);
+  let r = s.run(['lessons', '--dir', other]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /only over there/);
+  r = s.run(['lessons', 'list', '--dir', other]);
+  assert.match(r.out, /only over there/);
+  assert.match(s.run(['lessons']).out, /no lessons/);
+});
+
+test('lessons: hand-written lessons over the limit stay in the file but never reach a brief', () => {
+  const s = sandbox();
+  fs.mkdirSync(path.join(s.project, '.collab'));
+  const md = `# L\n\n- ${'z'.repeat(12000)}\n- long\n${'  more words here\n'.repeat(30)}- fine one\n`;
+  fs.writeFileSync(lessonsMd(s.project), md);
+  let r = s.run(['init', 'long'], { input: 'b' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /lessons: #1, #2 over 300 characters, left out of the brief: shorten them in .*lessons\.md/);
+  const brief = fs.readFileSync(path.join(s.taskDir(), 'entries', '000-implementer-brief.md'), 'utf8');
+  assert.ok(brief.length < 1500, `brief is ${brief.length} chars`);
+  assert.match(brief, /- #3 fine one\n\(2 lesson\(s\) over 300 characters left out: shorten them in \.collab\/lessons\.md\)/);
+  assert.equal(fs.readFileSync(lessonsMd(s.project), 'utf8'), md, 'the file is left as it is');
+  r = s.run(['lessons']);
+  assert.match(r.out, /#1 +\(over 300 characters, not put into briefs: shorten it\) z{60}…\n#2 +\(over 300 characters[^\n]*\) long more words here/);
+  assert.match(r.out, /#3 +fine one/);
+  assert.match(s.run(['lessons', 'rm', '1']).out, /removed: z+/);
+  assert.match(s.run(['lessons']).out, /^#1 +\(over 300[\s\S]*#2 +fine one/m);
+});
+
+test('lessons: numbers skip empty bullets and agree between add, list and rm', () => {
+  const s = sandbox();
+  fs.mkdirSync(path.join(s.project, '.collab'));
+  fs.writeFileSync(lessonsMd(s.project), '- first\n- <!-- comment only -->\n-   \n- second\n');
+  assert.match(s.run(['lessons', 'add', 'third']).out, /added lesson #3 /);
+  assert.match(s.run(['lessons']).out, /^#1 +first\n#2 +second\n#3 +third  \(user\)$/m);
+  assert.match(s.run(['lessons', 'rm', '3']).out, /removed: third/);
+  assert.equal(fs.readFileSync(lessonsMd(s.project), 'utf8'), '- first\n- <!-- comment only -->\n-   \n- second\n');
+});
+
+test('lessons: code fences and HTML comments are never lessons, and an unclosed one blocks appending', () => {
+  const s = sandbox();
+  fs.mkdirSync(path.join(s.project, '.collab'));
+  const md = '# L\n\n```md\n- an example, not a lesson\n```\n\n<!--\n- commented out\n-->\n\n~~~~\n- tilde example\n~~~\n~~~~\n- real one\n';
+  fs.writeFileSync(lessonsMd(s.project), md);
+  let r = s.run(['lessons']);
+  assert.match(r.out, /^1 lesson\(s\)[^\n]*\n#1 +real one$/m);
+  s.run(['init', 'fences'], { input: 'b' });
+  const brief = fs.readFileSync(path.join(s.taskDir(), 'entries', '000-implementer-brief.md'), 'utf8');
+  assert.match(brief, /- #1 real one\n/);
+  assert.doesNotMatch(brief, /example|commented out/);
+  s.run(['lessons', 'rm', '1']);
+  assert.equal(fs.readFileSync(lessonsMd(s.project), 'utf8'), md.replace('- real one\n', ''), 'examples and comments untouched');
+
+  // A file ending inside an unclosed fence: nothing is appended (it would be invisible).
+  const open = '- kept\n\n```\n- inside the fence\n';
+  fs.writeFileSync(lessonsMd(s.project), open);
+  r = s.run(['lessons', 'add', 'new one']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /ends inside an unclosed code fence/);
+  r = s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- from a handoff\n` });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /submitted: implementer ready[\s\S]*lessons not recorded: .*ends inside an unclosed code fence/);
+  fs.writeFileSync(lessonsMd(s.project), '- kept\n<!-- open comment\n');
+  assert.match(s.run(['lessons', 'add', 'new one']).err, /unclosed HTML comment/);
+  assert.equal(fs.readFileSync(lessonsMd(s.project), 'utf8'), '- kept\n<!-- open comment\n');
+  assert.match(s.run(['lessons']).out, /#1 +kept/);
+});
+
+test('lessons: an unreadable file is an error, never read as empty or replaced', () => {
+  const s = sandbox();
+  fs.mkdirSync(lessonsMd(s.project), { recursive: true }); // a folder where the file should be
+  let r = s.run(['lessons']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cannot read .*lessons\.md: EISDIR/);
+  assert.equal(s.run(['lessons', 'add', 'x']).code, 1);
+  r = s.run(['init', 'broken'], { input: 'b' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /lessons: cannot read .*; the brief has none/);
+  r = s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- from a handoff\n` });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /lessons not recorded: cannot read/);
+  r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 10);
+  r = s.run(['end'], { input: 'done' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(s.run(['show']).out, /lessons recorded during this run not listed: cannot read/);
+  assert.ok(fs.statSync(lessonsMd(s.project)).isDirectory(), 'nothing replaced it');
+});
+
+// Whether the sandbox's filesystem ignores case (NTFS, default APFS) or not (Linux, case-sensitive APFS).
+function ignoresCase(dir) {
+  fs.writeFileSync(path.join(dir, 'case-probe'), '');
+  const res = fs.existsSync(path.join(dir, 'CASE-PROBE'));
+  fs.rmSync(path.join(dir, 'case-probe'));
+  return res;
+}
+
+test('lessons: a case variant is the lessons file only where the filesystem ignores case', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = (...a) => spawnSync('git', a, { cwd: s.project, encoding: 'utf8' });
+  const commit = () => { g('add', '-A'); g('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x'); };
+  fs.mkdirSync(path.join(s.project, 'src'));
+  fs.mkdirSync(path.join(s.project, '.Collab'));
+  const variant = path.join(s.project, '.Collab', 'LESSONS.md');
+  fs.writeFileSync(variant, '- tracked lesson\n');
+  commit();
+  const names = () => fs.readdirSync(path.join(s.project)).filter((n) => /^\.collab$/i.test(n))
+    .flatMap((d) => fs.readdirSync(path.join(s.project, d)).map((n) => `${d}/${n}`)).sort();
+
+  s.run(['init', 'case', '--scope', 'src/**'], { input: 'b' });
+  fs.writeFileSync(path.join(s.project, 'src', 'a.js'), 'x\n');
+  let r = s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- from the implementer\n` });
+  assert.equal(r.code, 0, r.err);
+
+  if (ignoresCase(s.root)) {
+    // The variant is the lessons file: edited under its own name, and never part of the review.
+    assert.deepEqual(names(), ['.Collab/LESSONS.md']);
+    assert.match(fs.readFileSync(variant, 'utf8'), /^- tracked lesson\n- from the implementer <!-- collab: by implementer/);
+    s.run(['lessons', 'add', 'added during the review'], { cwd: path.join(s.project, 'src') });
+    r = s.run(['diff']);
+    assert.doesNotMatch(r.out, /LESSONS|OUTSIDE SCOPE/i);
+    r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok\n## Lessons\n- from the reviewer\n' });
+    assert.equal(r.code, 10, r.out + r.err);
+    assert.equal(s.run(['verify']).code, 0);
+    assert.equal(s.run(['lessons']).out.match(/^#\d/gm).length, 4);
+  } else {
+    // A different file: a new .collab/lessons.md is created beside it, and the variant is reviewed.
+    assert.deepEqual(names(), ['.Collab/LESSONS.md', '.collab/lessons.md']);
+    assert.equal(fs.readFileSync(variant, 'utf8'), '- tracked lesson\n');
+    fs.writeFileSync(variant, '- edited\n');
+    r = s.run(['diff']);
+    assert.match(r.out, /\.Collab\/LESSONS\.md/);
+    assert.match(r.out, /OUTSIDE SCOPE[\s\S]*\.Collab\/LESSONS\.md/);
+    assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 17, 'a change to it voids the review');
+  }
+});
+
+test('lessons: removing a lesson keeps a comment it opens, so hidden text stays hidden', () => {
+  const s = sandbox();
+  fs.mkdirSync(path.join(s.project, '.collab'));
+  const md = ['- first lesson <!-- explanatory comment', '- hidden example, not a lesson', '-->',
+    '- second lesson', '- third', '  continues <!-- note on a continuation', '- hidden two', '-->', ''].join('\r\n');
+  fs.writeFileSync(lessonsMd(s.project), md);
+  assert.match(s.run(['lessons']).out, /^#1 +first lesson\r?\n#2 +second lesson\r?\n#3 +third continues$/m);
+  assert.match(s.run(['lessons', 'rm', '1']).out, /removed: first lesson$/m);
+  assert.match(s.run(['lessons']).out, /^2 lesson\(s\)[^\n]*\n#1 +second lesson\n#2 +third continues$/m);
+  assert.match(s.run(['lessons', 'rm', '2']).out, /removed: third continues$/m);
+  assert.equal(fs.readFileSync(lessonsMd(s.project), 'utf8'), ['<!-- explanatory comment', '- hidden example, not a lesson', '-->',
+    '- second lesson', '<!-- note on a continuation', '- hidden two', '-->', ''].join('\r\n'));
+  s.run(['init', 'after-rm'], { input: 'b' });
+  const brief = fs.readFileSync(path.join(s.taskDir(), 'entries', '000-implementer-brief.md'), 'utf8');
+  assert.match(brief, /- #1 second lesson\n/);
+  assert.doesNotMatch(brief, /hidden|#2/);
+});
+
+test('lessons: the final report covers every lessons file the run used', () => {
+  const run = (moduleFile) => {
+    const s = sandbox();
+    const mod = path.join(s.project, 'module');
+    fs.mkdirSync(path.join(mod, '.collab'), { recursive: true });
+    if (moduleFile === 'broken') fs.mkdirSync(lessonsMd(mod));
+    else fs.writeFileSync(lessonsMd(mod), '# Module lessons\n\n- older module lesson\n');
+    s.run(['init', 'a-root'], { input: 'b' });
+    s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- ROOT_RUN_LESSON\n- ROOT_REMOVED\n` });
+    s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+    s.run(['init', 'b-module'], { input: 'b', cwd: mod });
+    const r = s.run(['submit', 'implementer', 'ready'], { input: `v1\n${CLOSEOUT}## Lessons\n- MODULE_RUN_LESSON\n`, cwd: mod });
+    s.run(['submit', 'reviewer', 'approve'], { input: 'ok', cwd: mod });
+    s.run(['lessons', 'rm', '2']);
+    assert.equal(s.run(['end'], { input: 'done', cwd: mod }).code, 0);
+    return { s, mod, r, report: s.run(['show'], { cwd: mod }).out };
+  };
+
+  let { report, mod } = run('ok');
+  assert.match(report, /ended after 2 task\(s\)|run ended after 2 task\(s\)/);
+  assert.match(report, /### \.collab\/lessons\.md \(remove with 'collab lessons rm N --dir [^']+'\)\n- #1 \(implementer\) ROOT_RUN_LESSON\n/);
+  assert.match(report, new RegExp(`### module/\\.collab/lessons\\.md \\(remove with 'collab lessons rm N --dir [^']*module'\\)\\n- #2 \\(implementer\\) MODULE_RUN_LESSON\\n`));
+  assert.doesNotMatch(report, /ROOT_REMOVED|older module lesson/);
+  assert.ok(mod);
+
+  // An unreadable module file is reported and doesn't hide the root's lessons.
+  const broken = run('broken');
+  assert.match(broken.r.out, /lessons not recorded: cannot read/);
+  assert.match(broken.report, /### \.collab\/lessons\.md[^\n]*\n- #1 \(implementer\) ROOT_RUN_LESSON\n/);
+  assert.match(broken.report, /> collab: lessons recorded during this run not listed: cannot read .*module/);
+});
+
+test('phone send: agent hooks push "waiting for you", only for a running --phone task, and never fail', async () => {
+  const p = await pushServer();
+  try {
+    const s = sandbox({ COLLAB_PHONE_URL: p.url });
+    const send = (input, args = [], cwd) => s.run(['phone', 'send', ...args], { input, cwd });
+    const claude = (message, type = 'permission_prompt') => JSON.stringify({
+      session_id: 'x', cwd: s.project, hook_event_name: 'Notification', message, notification_type: type,
+    });
+
+    let r = send(claude('Claude needs your permission to use Bash'));
+    assert.equal(r.code, 0);
+    assert.equal(r.out, '', 'nothing on stdout: hooks may read it');
+    assert.match(r.err, /not sent \(no collab task running in this project\)/);
+    s.run(['init', 'plain'], { input: 'b' });
+    assert.match(send(claude('Claude needs your permission to use Bash')).err, /not sent \(this task wasn't started with --phone\)/);
+    s.run(['abort']);
+
+    s.run(['init', 'away', '--phone'], { input: 'b' });
+    // Claude Code Notification hook: JSON on stdin; the hook's cwd picks the project.
+    r = send(claude('Claude needs your permission to use Bash'), [], s.root);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, '');
+    assert.match(r.err, /sent for away-/);
+    let got = await p.until(1);
+    assert.equal(got[0].body, 'Waiting for you: Claude needs your permission to use Bash');
+    assert.equal(got[0].priority, 'high');
+    assert.match(got[0].title, /^collab: away-/);
+    assert.match(send(claude('Claude needs your permission to use Bash')).err, /not sent \(sent the same a moment ago\)/);
+
+    // Codex PermissionRequest hook (stdin) and Codex notify (JSON argument).
+    send(JSON.stringify({ hook_event_name: 'PermissionRequest', cwd: s.project, tool_name: 'Bash', tool_input: { command: 'rm -rf build', description: 'Delete the build folder' } }));
+    got = await p.until(2);
+    assert.equal(got[1].body, 'Waiting for you: Codex needs your approval: Delete the build folder');
+    send('', [JSON.stringify({ type: 'agent-turn-complete', cwd: s.project, 'last-assistant-message': 'Which database should I use?' })]);
+    got = await p.until(3);
+    assert.equal(got[2].body, 'Waiting for you: Codex stopped and is waiting for you: Which database should I use?');
+    // Plain text, with --dir.
+    send('', ['--dir', s.project, 'Please', 'look', 'at', 'the', 'terminal'], s.root);
+    got = await p.until(4);
+    assert.equal(got[3].body, 'Waiting for you: Please look at the terminal');
+
+    // Between tasks of the run it still sends; after the run ends it doesn't.
+    approveCurrent(s);
+    send('', ['between tasks']);
+    await p.until(5);
+    s.run(['end'], { input: 'done' });
+    await p.until(6); // the 'Work complete' push
+    r = send(claude('Claude is waiting for your input'));
+    assert.match(r.err, /no collab task running/);
+    assert.equal(send('not json and no task').code, 0);
+    assert.match(send('').err, /no message/);
+    await pause(800);
+    assert.equal(p.got.length, 6, JSON.stringify(p.got.map((g) => g.body)));
+  } finally { p.close(); }
+});

@@ -62,7 +62,10 @@ if ($LinkCodexSkills) { Set-Junction $Repo $CodexLink }
 # `collab` on PATH: a .cmd shim for PowerShell/cmd and an extensionless sh shim for Git Bash.
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 [IO.File]::WriteAllText((Join-Path $Bin 'collab.cmd'), "@node `"$Js`" %*`r`n")
-[IO.File]::WriteAllText((Join-Path $Bin 'collab'), '#!/bin/sh' + "`n" + 'exec node "$HOME/.agents/skills/Collab/bin/collab.js" "$@"' + "`n")
+# The sh shim names the script as C:/... (not $HOME/...): node needs a Windows path, and Git Bash
+# only converts /c/... paths when MSYS path conversion is on (MSYS_NO_PATHCONV=1 turns it off).
+$JsFwd = $Js -replace '\\', '/'
+[IO.File]::WriteAllText((Join-Path $Bin 'collab'), '#!/bin/sh' + "`n" + 'exec node "' + $JsFwd + '" "$@"' + "`n")
 Write-Host "shims   $Bin\collab.cmd, $Bin\collab"
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

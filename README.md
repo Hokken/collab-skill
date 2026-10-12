@@ -71,6 +71,10 @@ in the dashboard and in the log.
 - **Approval means what it says.** An approval covers the exact files the reviewer saw: if they
   change afterwards, it is refused, and `collab verify` checks them again before a commit. Verdicts
   must match their findings, and every handoff states what was verified and what wasn't.
+- **Learns your project.** Recurring review findings and conventions become *project lessons*,
+  put into every later brief, so the same mistake isn't made twice. You can list and prune them.
+- **Pings your phone (optional).** With `--phone`, decisions, escalations, stalls and the end of
+  the run reach your phone through the free [ntfy](https://ntfy.sh) app. No account needed.
 - **Never gets stuck silently.** Agents post short progress updates. If one goes quiet, the other
   asks you: *stop, or keep waiting?*
 - **Cheap to run.** Waiting is a blocking shell command, so no tokens are spent while an agent waits.
@@ -191,6 +195,7 @@ work.
 | `--branch feat/x` | Work on this branch |
 | `--commit` | Commit the changes when the task is done (never pushes) |
 | `--confirm` | Ask you before this queued task starts |
+| `--phone` | Push to your phone when you're needed (see [Phone notifications](#phone-notifications)); stays on for the rest of the run |
 | `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
 | `--first` | Put it at the front of the queue |
 
@@ -216,6 +221,72 @@ collab abort                                  # stop both agents
 ```
 
 When it's finished, both agents give you a short report. `collab clean` tidies up old tasks.
+
+### Project lessons
+
+When a review turns up something a future task in the same project would get wrong too (a
+convention, a recurring mistake), the agents record it as a *lesson*. Every new brief for that
+project includes the lessons, and the reviewer checks the work against them. Your current
+instructions and the project's own rules (`CLAUDE.md`, `AGENTS.md`) always come first.
+
+```bash
+collab lessons                                # list this project's lessons
+collab lessons add "Never edit generated files in src/gen/"
+collab lessons rm 4                           # drop one that's wrong or outdated
+```
+
+Lessons live in `.collab/lessons.md` at the top of your repo (a module inside it shares the same
+file), a plain Markdown list you can read and edit. Commit it, and every teammate, machine and
+clone gets the same lessons. When editing by hand:
+
+- each top-level `- ` bullet is one lesson (indented lines continue it), at most 300 characters:
+  a longer one stays in the file but is left out of briefs until you shorten it;
+- headings, notes, code blocks and HTML comments are left alone, and bullets inside them are not
+  lessons, so you can keep examples there.
+
+Collab's writes to the file never count as part of the work under review, so they can't void an
+approval. That also means your own edits to it aren't reviewed: check it with `git diff` before
+committing. The final report lists the lessons recorded during the run, so you can prune them first.
+
+### Phone notifications
+
+Off unless you ask: add `--phone` to a task (`/Collab implement --phone …` or
+`collab queue add --phone …`). You then get a push when a decision is waiting for you, a task is
+escalated or stalls, an agent looks unresponsive, a confirm-first queued task needs your go-ahead,
+and when the whole run is done. Ordinary handoffs don't notify you. The rest of the run keeps
+`--phone`; a new request needs it again.
+
+The first time, collab creates a private, random [ntfy](https://ntfy.sh) topic and the implementer
+tells you its name: install the ntfy app and subscribe to it. `collab phone` shows the topic,
+`collab phone test` sends a test push, and `collab phone set <topic | url>` switches to your own
+topic or a self-hosted server. ntfy.sh topics are public to anyone who knows the name, so keep it
+private. Pushes contain the task id and the decision question.
+
+Collab only sees what goes through it. An agent stuck on its own permission prompt ("Allow this
+command?") looks merely quiet until the 30-minute idle check. To hear about those right away,
+let the agent CLI call `collab phone send`. It pushes "Waiting for you: …" only when the project
+has a running `--phone` task, and does nothing otherwise:
+
+- **Claude Code** (`~/.claude/settings.json`):
+  ```json
+  "hooks": {
+    "Notification": [
+      { "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
+    ]
+  }
+  ```
+  Don't add `idle_prompt`: Claude Code ends its turn while it waits in the loop, so that one would
+  fire all the time.
+- **Codex** (`~/.codex/hooks.json`; hooks are on by default, and Codex asks you once to trust a
+  new hook):
+  ```json
+  { "hooks": { "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
+  ] } }
+  ```
+  The hook prints nothing on stdout and always exits 0, so Codex's normal approval prompt is
+  unchanged.
 
 ## Command reference
 
@@ -250,6 +321,8 @@ also run themselves.
 | `collab queue` | List queued tasks (`*` = this project) |
 | `collab queue add [options] "task"` | Queue a task; the implementer starts it after the current one (options [above](#queue-up-a-mornings-work)) |
 | `collab queue rm N` · `move N M` · `clear [--all]` | Edit the queue |
+| `collab lessons [add "text" \| rm N]` | List, add or remove this project's lessons (see [Project lessons](#project-lessons)) |
+| `collab phone [set <topic \| url> \| test \| send]` | Show, change or test where `--phone` tasks push to; `send` is for agent CLI hooks (see [Phone notifications](#phone-notifications)) |
 | `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks and drafts older than a day (asks first; `-n` dry run, `-y` no prompt) |
 | `collab help` | Print this list |
 
@@ -323,8 +396,9 @@ All optional, via environment variables:
 | `COLLAB_STALL_SECS` | `7200` | Hard stop when nobody answers |
 | `COLLAB_POLL_SECS` | `5` | How often a waiting agent checks for its turn |
 | `COLLAB_CHECK_TIMEOUT` | `1800` | Seconds before a `--check` command is stopped |
-| `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications |
-| `COLLAB_HOME` | `~/.collab` | Where task state is kept |
+| `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications (phone pushes only depend on `--phone`) |
+| `COLLAB_PHONE_URL` | | Where `--phone` pushes go, overriding `collab phone set` |
+| `COLLAB_HOME` | `~/.collab` | Where task state, the queue and settings are kept (lessons live in the repo) |
 
 ## How it works
 

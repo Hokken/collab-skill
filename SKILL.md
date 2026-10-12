@@ -48,6 +48,7 @@ dark mode`. Pass them straight to `collab init`:
 | `--focus "TEXT"` | what the reviewer should look at hardest |
 | `--branch NAME` | work on this branch |
 | `--commit` | commit the task's changes when it's DONE (never push) |
+| `--phone` | push the moments that need the user to their phone; later tasks of the run keep it |
 
 `collab init` adds a *Task options* section to the brief, so the reviewer sees them too.
 
@@ -97,6 +98,20 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   the task.
 - **Deliverable documents** (a plan, an investigation, a verification checklist) are part of
   the work. They go where the brief's `## Deliverables` line says, and nowhere else.
+
+## Project lessons (either role)
+
+A brief may have a *Project lessons* section: things learned in earlier tasks of this project.
+Follow them. The user's current instructions and the project's own rules (CLAUDE.md / AGENTS.md)
+come first: if a lesson contradicts them or is clearly obsolete, say so with evidence (implementer:
+in your summary; reviewer: as a non-blocking item or under `## For the user`) instead of following it.
+
+To record a lesson, add a `## Lessons` section with one bullet each to any `submit` message.
+Only for something a *future* task in this project would get wrong without being told: a
+convention, a recurring mistake, a non-obvious project fact. Not one-off bugs, and not what
+CLAUDE.md / AGENTS.md already say. Usually none; at most 1–2 per task, each under 300 characters.
+Collab keeps them in the project's `.collab/lessons.md`. It belongs to the project: commit it with
+the task's changes when you commit, but never edit it to record a lesson.
 
 ## The other agent looks unresponsive (exit 13)
 
@@ -190,6 +205,7 @@ you to stop, they will interrupt you.
    shows only what changed during this task. Tell the user the task id and that the reviewer can now
    be started with `collab review` (Claude Code: `/Collab review`, Codex: `$Collab review`),
    and that they can watch live with `collab watch` and steer with `collab note "…"`.
+   If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
    If the request has several stages (a staged plan, a list of deliverables) or is too big for
    one review, split it now into **all** its parts (see *Splitting a task*), not just the first
    few. Leave stages out only if the user explicitly asked for a subset.
@@ -343,6 +359,7 @@ EOF
    - A new document outside the brief's `## Deliverables` location, or a handoff draft (brief,
      summary, review copy) written into the project, is a blocking item: it belongs in the
      scratch folder (see *Files you write*).
+   - Breaking an applicable *Project lesson* from the brief is a blocking item (see *Project lessons*).
    - Respect the brief's *Task options*. Look hardest at the **review focus**. If `collab diff`
      shows `⚠ OUTSIDE SCOPE`, treat it as blocking unless the change is clearly required. A
      `check passed` line in the summary means the check command succeeded; you can run
@@ -440,4 +457,5 @@ report to the user.
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks
 - `collab queue add [options] "…"`, `collab queue`, `collab queue rm N`: manage the task queue
 - `collab queue split [--reason TEXT]`: implementer only, split the current task (see *Splitting a task*)
+- `collab lessons [add "…" | rm N]`: the project's lessons; `collab phone [set … | test]`: where `--phone` pushes go
 State lives in `~/.collab/tasks/<task-id>/` (`state.json`, `log.md`, `entries/`).

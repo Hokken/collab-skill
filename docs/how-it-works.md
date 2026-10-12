@@ -115,6 +115,85 @@ previous `end` in that project.
   Ignored files other than new `*.md` are not covered. Tasks without git repos, or started before
   this existed, approve as before with a notice.
 
+## Project lessons
+
+Lessons carry knowledge from one task of a project to the next. They live in the project, in
+`.collab/lessons.md`, meant to be committed so they travel with the repo and reach everyone who
+works on it.
+
+- **Where:** the nearest `.collab/lessons.md` from the task's folder up to its git repo's top
+  level, so a module inside a repo shares the repo's file. With none yet, it is created at the top
+  level. Outside git: the nearest one below the home folder, else one in the folder itself. On a
+  case-insensitive filesystem an existing variant such as `.Collab/LESSONS.md` *is* that file
+  (same file on disk) and is edited under its own name; on a case-sensitive one it is just
+  another project file.
+- **Format:** Markdown, one top-level `- ` bullet per lesson (indented lines continue it). Collab
+  appends `- text <!-- collab: by <role>, task <id>, <date> -->`; the comment is hidden when
+  rendered. People can edit the file freely: their bullets count as lessons, and anything else
+  (headings, paragraphs) is left alone. Bullets inside fenced code blocks (``` or ~~~) or
+  multi-line HTML comments are not lessons, and empty or comment-only bullets are skipped. CRLF
+  files stay CRLF. Lessons are numbered consecutively in file order, as `collab lessons` lists
+  them; `add`, `rm`, briefs and the final report use the same numbers. Removing a lesson whose
+  line opens an HTML comment keeps that opener, so the comment's body stays hidden.
+- **Errors:** a missing file reads as empty; any other read failure (a folder in its place, no
+  permission) is an error, and the file is never replaced. `collab lessons` then exits 1; a
+  handoff, `init` or `end` reports it and goes on. If the file ends inside an unclosed code
+  fence or HTML comment, nothing is appended (it would be invisible): `lessons add` exits 1 and a
+  handoff reports `lessons not recorded`.
+- **Not a project change:** collab writes the file during handoffs, so `collab diff`, `--scope`
+  and the approved-tree digest leave out every `.collab/lessons.md`. Recording a lesson never
+  voids a review, and an edit to the file during a task is not reviewed. In a repo whose
+  `core.ignorecase` is true (git sets it when the working tree's filesystem ignores case) any
+  case variant is left out; otherwise only the exact name. That setting has to match the
+  filesystem, as git itself assumes.
+- **Recording:** the user runs `collab lessons add "…"`, or an agent adds a `## Lessons` section
+  (bullets or numbered items; continuation lines are joined) to any `submit` message except
+  `decide`. They are recorded only once the submit succeeds (a refused one records nothing), at
+  most 5 per message. A lesson whose text (case, whitespace and trailing punctuation aside)
+  already exists for the project is not added again.
+- **Bounds:** a lesson is at most 300 characters. `lessons add` refuses a longer one (exit 1); a
+  longer bullet in a message is skipped with a notice, never shortened, and the submit still
+  succeeds. A longer hand-written one stays in the file but is left out of briefs (`init` and
+  `collab lessons` say which to shorten). `init` puts the newest 30 of the rest into the brief
+  under *Project lessons*, plus lines counting older and over-long ones.
+- **Precedence:** the brief section says that the user's current instructions and the project's
+  own rules come first; a lesson that contradicts them or is obsolete is reported with evidence,
+  not followed. Otherwise the reviewer treats breaking one as blocking.
+- **Pruning:** `collab lessons` lists them, `collab lessons rm N…` removes them (all the given
+  numbers, or none if one doesn't exist), or edit the file. `collab end` lists the lessons
+  recorded during the run, so the user can check them before committing: from every lessons file
+  the run's tasks used (a repo root and a module can each have one), per file, with the
+  `lessons rm … --dir` command for it.
+
+## Phone notifications
+
+Off unless a task has `--phone` (`init`, `queue add`, or the `/Collab implement` request). The
+next task started after an approved one (`DONE`, run not ended) keeps it, so one flag covers a
+split, a queue or a staged plan. After `collab end`, an escalation, an abort or a stall, a new
+task needs the flag again. Queued items carry it like any other option.
+
+- **Destination:** `COLLAB_PHONE_URL`, else `phone_url` in `~/.collab/config.json`. The first
+  `--phone` task without one creates a random `https://ntfy.sh/collab-<16 hex>` topic, and `init`
+  prints a `phone:` line (with `NEW` the first time) telling the user what to subscribe to.
+  `collab phone` shows it, `collab phone set <topic | url>` changes it (a bare topic means ntfy.sh),
+  `collab phone test` sends a test push and reports a failure (exit 1).
+- **What pushes:** a decision for the user (including the round limit), an escalation through
+  `submit`, an unresponsive agent (`wait`/`join --after` exit 13), a stall, a confirm-first
+  queued task shown by `queue next` during a `--phone` run, and `collab end`. Ordinary handoffs,
+  a `DONE` inside a run and `abort` don't.
+- **From the agent CLIs:** `collab phone send ["message"] [--dir PATH]` lets hooks report waits
+  collab can't see (an agent's own permission prompt). It reads a Claude Code `Notification`
+  hook's JSON on stdin (`message`, `cwd`), a Codex `PermissionRequest` hook's (`tool_input`,
+  `cwd`) or Codex `notify`'s JSON argument (`type`, `last-assistant-message`, `cwd`), or plain
+  text. It pushes `Waiting for you: …` (high) only when the folder's project has a `--phone` task
+  that is running (or `DONE` with the run not ended), once per identical message per minute. It
+  never fails: it always exits 0, prints nothing on stdout, and says on stderr why it didn't send.
+- **How:** a plain-text POST with ntfy's `Title`, `Priority` and `Tags` headers, sent by a
+  detached child process with a 10 s timeout, so a slow or unreachable server never delays a
+  command or changes its result. `COLLAB_NOTIFY=0` only turns off desktop notifications.
+- **Privacy:** anyone who knows an ntfy.sh topic name can read it; the random name is the
+  secret. Pushes contain the task id and the decision question or escalation headline.
+
 ## States
 
 | Status | Whose turn | Meaning |
@@ -189,6 +268,7 @@ work go where the brief's `## Deliverables` line says.
 ~/.collab/
   current                          id of the most recent task
   queue.json                       queued tasks, each with its project folder and options
+  config.json                      settings: phone_url (where --phone tasks push to)
   drafts/                          agents' drafts written before a task exists (e.g. a brief)
   tasks/<slug>-<YYYYMMDD-HHMMSS>/
     state.json                     status, turn, rounds, repos, progress, …

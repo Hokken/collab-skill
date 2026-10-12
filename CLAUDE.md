@@ -43,7 +43,8 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Task resolution**: `taskDir()` picks the task from `-t`, then `$COLLAB_TASK`, then the newest
   active (else newest) task for the current project (`latestTask(cwd)`), then `$COLLAB_HOME/current`.
   Folders are the same project when one contains the other (`sameProject`; used by `projectTasks`
-  and the queue), so a repo root and a module inside it share tasks. `init` allows one
+  and the queue), so a repo root and a module inside it share tasks. A project's tasks are ordered
+  by `created_ms` (strictly increasing per project; older tasks fall back to `created_epoch`). `init` allows one
   active task per project. So pairs in different projects don't interfere, and agents also pin
   their task id with `-t`.
 - **State**: `$COLLAB_HOME/tasks/<slug>-<stamp>/state.json`. All mutations go through
@@ -81,6 +82,19 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   marker (`index`/`total`/`parent`) that `init --from-queue` copies into `state.part`. A task with a
   `part` can't be split again. When a part ends without approval, `holdParts` marks its later parts
   `confirm` + `held`, so they wait for the user.
+- **Lessons**: a committed `.collab/lessons.md` in the project (`lessonsFile`: nearest one up to
+  the git top level; `onDiskName` keeps an existing case variant that is the same file).
+  `parseLessons` reads top-level bullets outside code fences and multi-line comments (metadata in
+  a trailing `<!-- collab: … -->`, consecutive public numbers, `tooLong` over `LESSON_MAX`);
+  `readLessons` fails on anything but ENOENT; `editLessons` edits it line-wise under the home lock,
+  keeping the rest of the file and its EOLs. `cmdSubmit` records a message's `## Lessons` bullets
+  (`lessonBullets`/`addLessons`) after a successful handoff and only reports lesson errors;
+  `cmdInit` appends `lessonsBrief`; `cmdEnd` lists the run's lessons from every file its tasks used (`runLessons`). `isLessonsPath`/`notLessons`
+  (case-insensitive when the repo's `core.ignorecase` is true) keep the file out of `collab diff`,
+  `--scope` and `treeMap`, so recording one never voids a review.
+- **Phone**: task option `--phone`; `pushPhone(st, msg)` is a no-op without it, otherwise a detached
+  `node -e` child POSTs to `COLLAB_PHONE_URL` or `config.json`'s `phone_url` (ntfy). `cmdInit`
+  carries `phone` on from a DONE, not-ended previous task and creates a topic on first use (`ensurePhoneUrl`).
 - **Dashboard**: `cmdWatch` is a raw-mode TTY UI; rendering is the pure function `renderWatch(view, cols, rows, opts)`,
   which tests exercise through `watch --once`.
 

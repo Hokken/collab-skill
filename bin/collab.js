@@ -133,6 +133,69 @@ function notify(msg) {
   }
 }
 
+// --- phone notifications (opt-in per task with --phone) -----------------------------
+
+// Read-modify-write a JSON file in COLLAB_HOME under the home lock (queue, config).
+function withHomeFile(file, read, fn) {
+  fs.mkdirSync(COLLAB_HOME, { recursive: true });
+  return withLock(COLLAB_HOME, () => {
+    const data = read();
+    const res = fn(data);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    retry(() => fs.renameSync(tmp, file));
+    return res;
+  });
+}
+
+const configPath = () => path.join(COLLAB_HOME, 'config.json');
+function readConfig() {
+  try { return retry(() => JSON.parse(fs.readFileSync(configPath(), 'utf8'))); } catch { return {}; }
+}
+const phoneUrl = () => process.env.COLLAB_PHONE_URL || readConfig().phone_url || '';
+
+// A bare ntfy topic becomes its ntfy.sh URL; anything else must be an http(s) URL.
+function phoneTarget(v) {
+  const s = String(v || '').trim();
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(s)) return `https://ntfy.sh/${s}`;
+  let u = null;
+  try { u = new URL(s); } catch { /* not a URL */ }
+  if (u && /^https?:$/.test(u.protocol) && u.hostname) return s;
+  die(`not an ntfy topic (letters, digits, '-', '_', at most 64) or an http(s) URL: ${s}`);
+}
+
+// The destination for --phone pushes; the first use creates a random ntfy.sh topic (the topic
+// name is the only secret, so it has to be unguessable).
+function ensurePhoneUrl() {
+  const url = phoneUrl();
+  if (url) return { url, created: false };
+  return withHomeFile(configPath(), readConfig, (c) => {
+    if (!c.phone_url) c.phone_url = `https://ntfy.sh/collab-${crypto.randomBytes(8).toString('hex')}`;
+    return { url: c.phone_url, created: true };
+  });
+}
+
+function phoneHelp(url) {
+  const m = url.match(/^https:\/\/ntfy\.sh\/([^/?#]+)$/);
+  return m ? `subscribe to topic '${m[1]}' in the ntfy app (https://ntfy.sh), server ntfy.sh` : `pushes go to ${url}`;
+}
+
+// POST the message (ntfy headers; other webhooks just get the text). Runs in a detached child, so
+// a slow or unreachable server never delays the command or changes its result.
+const PUSH_SCRIPT = "const [u,t,m,p]=process.argv.slice(1);fetch(u,{method:'POST',body:m,headers:{Title:t,Priority:p,Tags:'robot'},signal:AbortSignal.timeout(10000)}).then((r)=>{process.exitCode=r.ok?0:1},()=>{process.exitCode=1})";
+
+function pushPhone(st, msg, { priority = 'default' } = {}) {
+  if (!st || !st.options || !st.options.phone) return;
+  const url = phoneUrl();
+  if (!url) return;
+  try {
+    const child = spawn(process.execPath, ['-e', PUSH_SCRIPT, url, `collab: ${st.id}`, msg, priority],
+      { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* pushes are best effort */ }
+}
+
 // --- task / state helpers ------------------------------------------------------
 
 function currentId() {
@@ -402,7 +465,8 @@ function treeMap(st, d) {
     // 'h path' (assume-unchanged, any lowercase tag) or 'S path' (skip-worktree).
     for (const e of zList(digestGit(r.path, ['ls-files', '-v', '-z']))) if (/^[a-zS] /.test(e)) paths.add(e.slice(2));
     const files = Object.create(null);
-    for (const f of [...paths].sort()) files[f] = fileSig(path.join(r.path, f), covered);
+    const icase = repoIgnoresCase(r.path);
+    for (const f of [...paths].sort()) if (!isLessonsPath(f, icase)) files[f] = fileSig(path.join(r.path, f), covered);
     return { path: r.path, files };
   });
   return { id: sha256(JSON.stringify(repos)), repos };
@@ -502,7 +566,7 @@ function progressLines(d, st) {
 // Per-task options, accepted by `init` and `queue add`.
 const TASK_OPTS = {
   values: { '--max-rounds': 'max_rounds', '--check': 'check', '--scope': 'scope', '--focus': 'focus', '--branch': 'branch' },
-  flags: { '--plan': { plan: true }, '--commit': { commit: true }, '--confirm': { confirm: true } },
+  flags: { '--plan': { plan: true }, '--commit': { commit: true }, '--confirm': { confirm: true }, '--phone': { phone: true } },
 };
 
 function normTaskOpts(o) {
@@ -515,6 +579,7 @@ function normTaskOpts(o) {
   if (o.branch) res.branch = String(o.branch).trim();
   if (o.commit) res.commit = true;
   if (o.confirm) res.confirm = true;
+  if (o.phone) res.phone = true;
   return res;
 }
 
@@ -528,6 +593,7 @@ function describeOpts(o = {}) {
   if (o.branch) bits.push(`branch ${o.branch}`);
   if (o.commit) bits.push('commit on DONE');
   if (o.confirm) bits.push('confirm before starting');
+  if (o.phone) bits.push('phone notifications');
   return bits;
 }
 
@@ -566,17 +632,7 @@ function readQueue() {
 }
 
 // Read-modify-write the queue under a lock on COLLAB_HOME.
-function withQueue(fn) {
-  fs.mkdirSync(COLLAB_HOME, { recursive: true });
-  return withLock(COLLAB_HOME, () => {
-    const q = readQueue();
-    const res = fn(q);
-    const tmp = `${queuePath()}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify(q, null, 2)}\n`);
-    retry(() => fs.renameSync(tmp, queuePath()));
-    return res;
-  });
-}
+const withQueue = (fn) => withHomeFile(queuePath(), readQueue, fn);
 
 const forProject = (q, dir) => q.items.filter((it) => sameProject(it.project_dir, realDir(dir)));
 const partLabel = (p) => `part ${p.index}/${p.total} of ${p.parent}`;
@@ -598,6 +654,272 @@ const queueCount = (dir) => forProject(readQueue(), dir).length;
 function queueLine(st) {
   const n = queueCount(st.project_dir);
   return n ? `QUEUE: ${n} more task(s) waiting for this project. Implementer: start the next one ('collab queue next'). Reviewer: run 'collab join --after ${st.id}' to wait for it.` : '';
+}
+
+// --- project lessons ----------------------------------------------------------------------
+
+// Knowledge that carries over between tasks of a project: added by the user, or by the agents
+// from a '## Lessons' section in a handoff, and put into every later brief of that project.
+// They live in the project, in '.collab/lessons.md' (committed, so they travel with the repo):
+// one top-level '- ' bullet per lesson, with collab's metadata in a trailing HTML comment. People
+// can edit the file by hand; code fences, comments and anything else are left alone.
+const LESSON_MAX = 300;        // characters per lesson
+const LESSONS_IN_BRIEF = 30;   // newest ones put into a brief
+const LESSONS_PER_MESSAGE = 5;
+const LESSONS_REL = '.collab/lessons.md';
+const LESSONS_HEADER = '# Project lessons\n\n'
+  + 'Learned while working on this project. Every new collab task brief includes them (the newest 30).\n'
+  + 'One lesson per top-level bullet, at most 300 characters; edit or delete freely. The user\'s current\n'
+  + 'instructions and the project\'s own rules (CLAUDE.md / AGENTS.md) come first.\n\n';
+
+// Collab's own lessons file is not part of the work under review: diffs, scope checks and the
+// approved-tree digest leave it out, so recording a lesson at a handoff never voids a review.
+// A repo whose filesystem ignores case (git's own core.ignorecase) matches it in any case.
+const ignoreCase = new Map();
+function repoIgnoresCase(repo) {
+  if (!ignoreCase.has(repo)) ignoreCase.set(repo, git(repo, ['config', '--bool', 'core.ignorecase']).out.trim() === 'true');
+  return ignoreCase.get(repo);
+}
+const isLessonsPath = (f, icase) => new RegExp('(^|/)\\.collab/lessons\\.md$', icase ? 'i' : '').test(f.replace(/\\/g, '/'));
+const notLessons = (icase) => ['--', '.', `:(exclude,glob${icase ? ',icase' : ''})**/${LESSONS_REL}`];
+
+// The on-disk spelling of an existing path's last part: on a case-insensitive filesystem
+// '.collab/lessons.md' may be '.Collab/LESSONS.md', which is then kept (same file, by dev + inode).
+function onDiskName(p) {
+  const dir = path.dirname(p);
+  const base = path.basename(p);
+  let names;
+  let want;
+  try { names = fs.readdirSync(dir); want = fs.statSync(p, { bigint: true }); } catch { return p; }
+  if (names.includes(base)) return p;
+  for (const n of names) {
+    if (n.toLowerCase() !== base.toLowerCase()) continue;
+    try {
+      const s = fs.statSync(path.join(dir, n), { bigint: true });
+      if (s.dev === want.dev && s.ino === want.ino) return path.join(dir, n);
+    } catch { /* vanished */ }
+  }
+  return p;
+}
+
+// The project's lessons file: the nearest '.collab/lessons.md' from the folder up to its git
+// repo's top level (so a module inside a repo shares the repo's lessons), else a new one at that
+// top level. Outside git: the nearest one below the home folder, else one in the folder itself.
+function lessonsFile(dir) {
+  const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const start = realDir(dir);
+  const top = git(start, ['rev-parse', '--show-toplevel']).out.trim();
+  const root = top ? realDir(top) : null;
+  const home = norm(realDir(os.homedir()));
+  for (let d = start; ; d = path.dirname(d)) {
+    const f = path.join(d, ...LESSONS_REL.split('/'));
+    if (fs.existsSync(f)) return onDiskName(path.join(onDiskName(path.dirname(f)), path.basename(f)));
+    const up = path.dirname(d);
+    if (up === d || (root ? norm(d) === norm(root) : norm(up) === home || norm(d) === home)) break;
+  }
+  const base = path.join(root || start, '.collab');
+  return path.join(fs.existsSync(base) ? onDiskName(base) : base, 'lessons.md');
+}
+
+const normLesson = (t) => String(t).replace(/\s+/g, ' ').trim();
+const lessonKey = (t) => normLesson(t).toLowerCase().replace(/[.!;:,\s]+$/, '');
+
+// Lessons in the file's lines: top-level bullets (indented lines continue one), outside fenced
+// code blocks and multi-line HTML comments. `open` names what the file ends inside of, if anything.
+function parseLessons(lines) {
+  const raw = [];
+  let cur = null;
+  let fence = null;
+  let comment = false;
+  lines.forEach((line, i) => {
+    if (fence) {
+      const c = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (c && c[1][0] === fence[0] && c[1].length >= fence.length) fence = null;
+      cur = null;
+      return;
+    }
+    if (comment) {
+      if (line.includes('-->')) comment = line.lastIndexOf('<!--') > line.lastIndexOf('-->');
+      cur = null;
+      return;
+    }
+    const f = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (f) { fence = f[1]; cur = null; return; }
+    const m = line.match(/^[-*+]\s+(.*)$/);
+    if (m) {
+      cur = { raw: m[1], start: i, end: i };
+      raw.push(cur);
+    } else if (cur && /^\s+\S/.test(line)) {
+      cur.raw += ` ${line.trim()}`;
+      cur.end = i;
+    } else {
+      cur = null;
+    }
+    if (line.lastIndexOf('<!--') > line.lastIndexOf('-->')) {
+      // A comment opened on a lesson's own line runs on after it: removing the lesson keeps the
+      // opener, so the comment's body never turns into lessons.
+      if (cur && cur.end === i) cur.keep = line.slice(line.lastIndexOf('<!--'));
+      comment = true;
+      cur = null;
+    }
+  });
+  const items = [];
+  for (const it of raw) {
+    const meta = it.raw.match(/<!--\s*collab:([\s\S]*?)-->/);
+    const fields = meta ? `${meta[1]} ` : '';
+    const text = normLesson(it.raw.replace(/<!--[\s\S]*?(-->|$)/g, ''));
+    if (!text) continue;
+    items.push({
+      n: items.length + 1, start: it.start, end: it.end, keep: it.keep, text, tooLong: text.length > LESSON_MAX,
+      by: (fields.match(/\bby (\S+?)[,\s]/) || [])[1] || '',
+      task: (fields.match(/\btask (\S+?)[,\s]/) || [])[1] || '',
+    });
+  }
+  return { items, open: fence ? 'code fence' : comment ? 'HTML comment' : '' };
+}
+
+// { exists, eol, lines, items, open }. Only a missing file reads as empty: any other failure is
+// an error, so an unreadable file is never taken for an empty one (and replaced).
+function readLessons(file) {
+  let text = '';
+  let exists = true;
+  try {
+    text = retry(() => fs.readFileSync(file, 'utf8')).replace(/^﻿/, '');
+  } catch (e) {
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') die(`cannot read ${file}: ${e.code || e.message}`);
+    exists = false;
+  }
+  const lines = text.split(/\r?\n/);
+  return { exists, eol: text.includes('\r\n') ? '\r\n' : '\n', lines, ...parseLessons(lines) };
+}
+
+// Read-modify-write the lessons file (under the home lock); fn edits `lines` in place.
+function editLessons(file, fn) {
+  fs.mkdirSync(COLLAB_HOME, { recursive: true });
+  return withLock(COLLAB_HOME, () => {
+    const l = readLessons(file);
+    if (!l.exists) l.lines = LESSONS_HEADER.split('\n');
+    while (l.lines.length && l.lines[l.lines.length - 1] === '') l.lines.pop();
+    fn(l);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${l.lines.join(l.eol)}${l.eol}`);
+    retry(() => fs.renameSync(tmp, file));
+    return !l.exists;
+  });
+}
+
+// The bullets (or numbered items) of a message's '## Lessons' section, continuation lines joined.
+function lessonBullets(text) {
+  const body = section(text, 'Lessons');
+  if (!body) return [];
+  const items = [];
+  for (const line of body.split('\n')) {
+    const m = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*)$/);
+    if (m) items.push(m[1]);
+    else if (line.trim() && items.length) items[items.length - 1] += ` ${line.trim()}`;
+  }
+  return items.map(normLesson).filter((t) => t && !/^(none|n\/a|-)\.?$/i.test(t));
+}
+
+// Store new lessons for a project. Returns { file, created, added: [{ n, text }], known, tooLong, extra }.
+// Throws (CollabError) when the file can't be read or ends inside an unclosed fence or comment.
+function addLessons(dir, texts, by, task) {
+  const res = { file: lessonsFile(dir), created: false, added: [], known: [], tooLong: [], extra: [] };
+  const fresh = [];
+  for (const t of texts) {
+    if (t.length > LESSON_MAX) res.tooLong.push(t);
+    else if (fresh.length >= LESSONS_PER_MESSAGE) res.extra.push(t);
+    else fresh.push(t);
+  }
+  if (!fresh.length) return res;
+  const isKnown = (l) => { const k = new Set(l.items.map((it) => lessonKey(it.text))); return (t) => k.has(lessonKey(t)); };
+  if (fresh.every(isKnown(readLessons(res.file)))) { res.known.push(...fresh); return res; }
+  const added = [];
+  res.created = editLessons(res.file, (l) => {
+    if (l.open) die(`${res.file} ends inside an unclosed ${l.open}: close it, then add the lesson again`);
+    const known = isKnown(l);
+    const keys = new Set();
+    for (const text of fresh) {
+      if (known(text) || keys.has(lessonKey(text))) { res.known.push(text); continue; }
+      keys.add(lessonKey(text));
+      const meta = [`by ${by}`, ...(task ? [`task ${task}`] : []), nowIso().slice(0, 10)].join(', ');
+      // A blank line first if the file doesn't end with a bullet, so it isn't joined to a paragraph.
+      if (l.lines.length && !/^(?:[-*+]\s|\s+\S)/.test(l.lines[l.lines.length - 1])) l.lines.push('');
+      l.lines.push(`- ${text} <!-- collab: ${meta} -->`);
+      added.push(text);
+    }
+  });
+  // Report the numbers 'collab lessons' shows, from the file as written.
+  const items = readLessons(res.file).items;
+  for (const text of added) {
+    const it = items.find((x) => lessonKey(x.text) === lessonKey(text));
+    res.added.push({ n: it ? it.n : 0, text });
+  }
+  return res;
+}
+
+// The final report's '## Lessons recorded during this run': every lessons file the run's tasks
+// used (a repo root and a module in it can each have one), read one by one so an unreadable file
+// doesn't hide the others. Numbers are per file.
+function runLessons(run) {
+  const files = new Map();
+  const dirs = [];
+  for (const id of run) {
+    try {
+      const dir = realDir(readState(path.join(TASKS, id)).project_dir);
+      dirs.push(dir);
+      const f = lessonsFile(dir);
+      files.set(f, f);
+    } catch { /* task gone */ }
+  }
+  // Paths are shown from the run's outermost task folder (the run's tasks are one project).
+  const base = dirs.sort((a, b) => a.length - b.length)[0] || '';
+  const shown = (p) => {
+    const rel = path.relative(base, p);
+    return (rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : p).split(path.sep).join('/');
+  };
+  const quote = (p) => (/\s/.test(p) ? `"${p}"` : p);
+  const parts = [];
+  const errors = [];
+  for (const file of files.values()) {
+    let items;
+    try { ({ items } = readLessons(file)); } catch (e) {
+      if (!(e instanceof CollabError)) throw e;
+      errors.push(`> collab: lessons recorded during this run not listed: ${e.message}`);
+      continue;
+    }
+    const learned = items.filter((it) => run.includes(it.task));
+    if (!learned.length) continue;
+    parts.push(`### ${shown(file)} (remove with 'collab lessons rm N --dir ${quote(path.dirname(path.dirname(file)))}')\n`
+      + `${learned.map((it) => `- #${it.n} (${it.by}) ${it.text}`).join('\n')}`);
+  }
+  if (!parts.length && !errors.length) return '';
+  return '\n## Lessons recorded during this run (collected by collab)\n'
+    + 'Every later brief of their project includes them: commit them with the work. Numbers are per file; '
+    + 'remove a wrong one with the command shown for its file, or edit the file.\n'
+    + `${[...parts, ...errors].join('\n\n')}\n`;
+}
+
+// The brief's lessons: { section, file, tooLong, error }. Lessons over the limit (hand-written
+// ones) are left out, never shortened; the newest 30 of the rest go in.
+function lessonsBrief(dir) {
+  const file = lessonsFile(dir);
+  let items;
+  try { ({ items } = readLessons(file)); } catch (e) { if (e instanceof CollabError) return { section: '', file, tooLong: [], error: e.message }; throw e; }
+  const tooLong = items.filter((it) => it.tooLong);
+  const ok = items.filter((it) => !it.tooLong);
+  if (!ok.length) return { section: '', file, tooLong };
+  const shown = ok.slice(-LESSONS_IN_BRIEF);
+  const older = ok.length - shown.length;
+  const section = `\n## Project lessons (set by collab, from ${LESSONS_REL})\n`
+    + 'Learned in earlier tasks of this project. Follow them, and the reviewer checks the work against them. '
+    + "The user's current instructions (this brief, notes, answers) and the project's own rules (CLAUDE.md / AGENTS.md) "
+    + 'come first: if a lesson contradicts them or is clearly obsolete, say so with evidence instead of following it.\n'
+    + `${shown.map((it) => `- #${it.n} ${it.text}`).join('\n')}\n`
+    + (older ? `(${older} older lesson(s) not shown: 'collab lessons')\n` : '')
+    + (tooLong.length ? `(${tooLong.length} lesson(s) over ${LESSON_MAX} characters left out: shorten them in ${LESSONS_REL})\n` : '');
+  return { section, file, tooLong };
 }
 
 // --- --check and --scope ---------------------------------------------------------------
@@ -715,7 +1037,7 @@ function cmdInit(args) {
     values: { ...TASK_OPTS.values, '--dir': 'dir', '--file': 'file', '-f': 'file', '--confirmed': 'confirmed' },
     flags: { ...TASK_OPTS.flags, '--force': { force: true }, '--from-queue': { fromQueue: true } },
   }, { strict: true });
-  const usage = "usage: collab init <slug> [--from-queue] [--plan] [--max-rounds N] [--check CMD] [--scope GLOBS] [--focus TEXT] [--branch NAME] [--commit] [--dir PATH] [--force] (brief on stdin or --file PATH)";
+  const usage = "usage: collab init <slug> [--from-queue] [--plan] [--max-rounds N] [--check CMD] [--scope GLOBS] [--focus TEXT] [--branch NAME] [--commit] [--phone] [--dir PATH] [--force] (brief on stdin or --file PATH)";
   if (!rest[0]) die(usage);
   const slug = rest[0].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (!slug) die(usage);
@@ -746,14 +1068,26 @@ function cmdInit(args) {
   }
   const options = { ...(item ? item.options : {}), ...normTaskOpts(opts) };
   delete options.confirm;
+  // --phone carries on through a run: the next task after an approved one that wasn't ended.
+  // Anything else (an end, an escalation, an abort, a stall) needs a new opt-in.
+  const prevId = latestTask(dir);
+  const prev = prevId && readState(path.join(TASKS, prevId));
+  if (!options.phone && prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) options.phone = true;
+  const phone = options.phone ? ensurePhoneUrl() : null;
   const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
   brief += optionsSection(options);
+  const lessons = lessonsBrief(dir);
+  brief += lessons.section;
   const part = item && item.part;
   if (part) {
     brief += `\n## Part of a split task (set by collab)\nThis is ${partLabel(part)}, split up by the implementer. `
       + 'Only this part is in scope. The other parts are separate tasks with their own reviews, so work they will do is not missing here.\n';
   }
 
+  // Creation order within the project, to the millisecond and strictly increasing, so tasks
+  // started in the same second still sort in the order they were created.
+  const lastId = projectTasks(dir).slice(-1)[0];
+  const createdMs = Math.max(Date.now(), lastId ? taskMeta.get(lastId).created + 1 : 0);
   const id = `${slug}-${localStamp()}`;
   const d = path.join(TASKS, id);
   fs.mkdirSync(entriesDir(d), { recursive: true });
@@ -780,7 +1114,7 @@ function cmdInit(args) {
     phase: plan ? 'plan' : 'build', status: plan ? 'PLANNING' : 'IMPLEMENTING',
     turn: 'implementer', round: 1, plan_round: 1, max_rounds: max, seq: 0,
     seen: { implementer: 0, reviewer: -1 },
-    created_at: now, created_epoch: ep, updated_at: now, updated_epoch: ep, updated_by: 'implementer',
+    created_at: now, created_epoch: ep, created_ms: createdMs, updated_at: now, updated_epoch: ep, updated_by: 'implementer',
     turn_since: ep, options,
   };
   if (item) st.queue_item = item.id;
@@ -802,6 +1136,11 @@ function cmdInit(args) {
   out(`max rounds: ${max}`);
   out(`phase:   ${st.phase}`);
   if (describeOpts(options).length) out(`options: ${describeOpts(options).join(' · ')}`);
+  if (lessons.error) out(`lessons: ${lessons.error}; the brief has none`);
+  if (lessons.tooLong.length) {
+    out(`lessons: ${lessons.tooLong.map((it) => `#${it.n}`).join(', ')} over ${LESSON_MAX} characters, left out of the brief: shorten them in ${lessons.file}`);
+  }
+  if (phone) out(`phone:   ${phone.created ? 'NEW, tell the user: ' : ''}${phoneHelp(phone.url)}`);
   if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   out(`scratch: ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
@@ -848,6 +1187,7 @@ async function cmdJoin(args) {
       if (projectDir && epoch() - st.updated_epoch >= IDLE && epoch() >= (st.snooze_until || 0)) {
         const why = `the implementer has neither started a new task nor ended the run for ${Math.floor((epoch() - st.updated_epoch) / 60)} min since ${id} was approved`;
         notify(`${id}: ${why} — stop or keep waiting?`);
+        pushPhone(st, `${why}. Stop or keep waiting?`, { priority: 'high' });
         out(`OTHER AGENT LOOKS UNRESPONSIVE: ${why}.`);
         out(`Ask the user: stop here, or keep waiting ('collab -t ${id} snooze [MIN]', default 30)?`);
         exit(EXIT_IDLE);
@@ -953,6 +1293,7 @@ async function cmdWait(args) {
     const idle = idleReason(st);
     if (idle) {
       notify(`${st.id}: ${idle} — stop or keep waiting?`);
+      pushPhone(st, `${idle}. Stop or keep waiting?`, { priority: 'high' });
       out(`OTHER AGENT LOOKS UNRESPONSIVE: ${idle}.`);
       out("Ask the user: stop the task ('collab abort') or keep waiting ('collab snooze [MIN]', default 30)?");
       exit(EXIT_IDLE);
@@ -960,6 +1301,7 @@ async function cmdWait(args) {
     if (epoch() - lastActivity(st) >= STALL && epoch() >= (st.snooze_until || 0)) {
       holdParts(withLock(d, () => update(d, (s) => { s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; })));
       notify(`${st.id}: STALLED (no handoff for ${Math.floor(STALL / 60)} min)`);
+      pushPhone(st, `STALLED: no handoff for ${Math.floor(STALL / 60)} min`, { priority: 'high' });
       out(`TASK FINISHED: STALLED — the other agent has not handed off for ${Math.floor(STALL / 60)} min`);
       exit(EXIT_TERMINAL);
     }
@@ -1122,18 +1464,36 @@ async function cmdSubmit(args) {
   }
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+  // The handoff is done: a lessons problem is reported, never turned into a failed submit.
+  const bullets = kind === 'decide' ? [] : lessonBullets(body);
+  let res = null;
+  try {
+    if (bullets.length) res = addLessons(st.project_dir, bullets, role, st.id);
+  } catch (e) {
+    if (!(e instanceof CollabError)) throw e;
+    out(`lessons not recorded: ${e.message}`);
+  }
+  if (res) {
+    if (res.added.length) out(`lessons recorded: ${res.added.map((it) => `#${it.n}`).join(', ')} in ${res.file} (put into later briefs of this project)`);
+    if (res.created) out(`created ${res.file}: it belongs to the project, commit it with the work`);
+    if (res.known.length) out(`lessons already known, not added again: ${res.known.length}`);
+    for (const t of res.tooLong) out(`lesson not recorded (over ${LESSON_MAX} characters): ${[...t].slice(0, 60).join('')}…`);
+    if (res.extra.length) out(`lessons not recorded (at most ${LESSONS_PER_MESSAGE} per message): ${res.extra.length}`);
+  }
   if (role === 'reviewer' && kind === 'approve' && st.status === 'DONE' && !st.approved_digest) {
     out('note: no reviewed tree was recorded for this task (no git repos, or started before collab recorded them), so this approval is not bound to the files.');
   }
   if (st.status === 'DECISION') {
     const dec = st.decision;
     notify(`${st.id}: your decision is needed — ${dec.question}`);
+    pushPhone(st, `Decision needed: ${dec.question}`, { priority: 'high' });
     if (dec.kind === 'limit') out(`${dec.question} The user decides. Run 'collab -t ${st.id} wait ${role}': it shows you the options (exit 16).`);
     else if (dec.self) out(`Ask the user now, then record their choice with 'collab -t ${st.id} answer <N | text>'; the turn comes back to you.`);
     else out(`The other agent (or the user, with 'collab answer <N | text>') presents it. Run 'collab -t ${st.id} wait ${role}': it returns with the answer.`);
     return;
   }
   notify(`${st.id}: ${st.status}`);
+  if (st.status === 'ESCALATED') pushPhone(st, `Escalated by the ${role}: ${headline(body)}`, { priority: 'high' });
   holdParts(st);
   if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
   if (isTerminal(st.status)) exit(EXIT_TERMINAL);
@@ -1246,7 +1606,13 @@ function cmdQueue(args) {
     if (it.part) out(`split:   ${partLabel(it.part)} (queued by the implementer; don't split it again)`);
     out(`options: ${describeOpts(it.options).join(' · ') || 'none'}`);
     if (it.held) out(`HELD: ${it.held}, so this part may build on unfinished work.`);
-    if (it.options && it.options.confirm) out('CONFIRM FIRST: ask the user before starting this task (start / skip / stop).');
+    if (it.options && it.options.confirm) {
+      out('CONFIRM FIRST: ask the user before starting this task (start / skip / stop).');
+      // A run with --phone on tells the phone too (the same rule as carrying --phone on in init).
+      const prevId = latestTask(dir);
+      const prev = prevId && readState(path.join(TASKS, prevId));
+      if (prev && prev.status === 'DONE' && !prev.ended) pushPhone(prev, `Queued task #${it.id} needs your go-ahead: ${headline(it.text)}`, { priority: 'high' });
+    }
     out('----- task -----');
     process.stdout.write(it.text.endsWith('\n') ? it.text : `${it.text}\n`);
     out('----- end -----');
@@ -1349,6 +1715,138 @@ function cmdQueue(args) {
   die('usage: collab queue [list | add [options] "task" | next | skip | split [--reason TEXT] | rm N | move N M | clear [--all]]');
 }
 
+function cmdLessons(args) {
+  const { opts, rest: [sub = 'list', ...words] } = takeOpts(args, { values: { '--dir': 'dir' } });
+  const dir = path.resolve(opts.dir || process.cwd());
+  const file = lessonsFile(dir);
+  if (sub === 'list') {
+    const { items } = readLessons(file);
+    if (!items.length) { out(`no lessons yet (${file})`); return; }
+    out(`${items.length} lesson(s) in ${file}${items.length > LESSONS_IN_BRIEF ? ` (the newest ${LESSONS_IN_BRIEF} go into briefs)` : ''}`);
+    for (const it of items) {
+      const by = it.by ? `  (${it.by}${it.task ? `, ${it.task}` : ''})` : '';
+      if (it.tooLong) out(`#${String(it.n).padEnd(4)} (over ${LESSON_MAX} characters, not put into briefs: shorten it) ${[...it.text].slice(0, 60).join('')}…${by}`);
+      else out(`#${String(it.n).padEnd(4)} ${it.text}${by}`);
+    }
+    return;
+  }
+  if (sub === 'add') {
+    const text = normLesson(words.join(' '));
+    if (!text) die('usage: collab lessons add "text"');
+    if (text.length > LESSON_MAX) die(`a lesson is at most ${LESSON_MAX} characters (got ${text.length})`);
+    const res = addLessons(dir, [text], 'user', null);
+    if (!res.added.length) { out('already known for this project, not added'); return; }
+    out(`added lesson #${res.added[0].n} to ${res.file}`);
+    if (res.created) out(`created ${res.file}: commit it to share the lessons with everyone working on this project`);
+    return;
+  }
+  if (sub === 'rm') {
+    if (!words.length || words.some((w) => !/^\d+$/.test(w))) die('usage: collab lessons rm N [N…]');
+    const ns = [...new Set(words.map(Number))];
+    // Numbers are positions in the file, so either all of them are removed or none.
+    const gone = [];
+    editLessons(file, (l) => {
+      const missing = ns.filter((n) => !l.items.some((it) => it.n === n));
+      if (missing.length) die(`no lesson ${missing.map((n) => `#${n}`).join(', ')} in ${file} ('collab lessons' lists them)`);
+      const drop = l.items.filter((it) => ns.includes(it.n)).sort((x, y) => y.start - x.start);
+      for (const it of drop) l.lines.splice(it.start, it.end - it.start + 1, ...(it.keep ? [it.keep] : []));
+      gone.push(...drop.reverse().map((it) => it.text));
+    });
+    for (const t of gone) out(`removed: ${t}`);
+    return;
+  }
+  die('usage: collab lessons [add "text" | rm N…] [--dir PATH]');
+}
+
+// The text of a "waiting for you" event from an agent CLI: a Claude Code Notification hook
+// (JSON on stdin: message, cwd), a Codex PermissionRequest hook (JSON on stdin: tool_input, cwd)
+// or Codex `notify` (JSON as the argument: type, cwd, last-assistant-message).
+function waitingEvent(j) {
+  const clip = (t) => { const s = normLesson(t || ''); return s.length > 140 ? `${[...s].slice(0, 140).join('')}…` : s; };
+  if (j.hook_event_name === 'PermissionRequest') {
+    const ti = j.tool_input || {};
+    return `Codex needs your approval: ${clip(ti.description || ti.command || j.tool_name || 'a tool call')}`;
+  }
+  if (j.type === 'agent-turn-complete') return `Codex stopped and is waiting for you: ${clip(j['last-assistant-message']) || 'its turn ended'}`;
+  if (j.message) return clip(j.message);
+  return '';
+}
+
+// collab phone send: push "waiting for you" from outside collab (agent CLI hooks), but only for
+// the project's --phone task while its run is going on. Never fails a hook: problems go to stderr.
+function phoneSend(args) {
+  const { opts, rest } = takeOpts(args, { values: { '--dir': 'dir' } });
+  let text = rest.join(' ').trim();
+  let dir = opts.dir;
+  let json = null;
+  try { if (/^\s*\{/.test(text)) json = JSON.parse(text); } catch { /* plain text */ }
+  if (!text && !process.stdin.isTTY) {
+    let input = '';
+    try { input = fs.readFileSync(0, 'utf8'); } catch { /* no stdin */ }
+    try { json = JSON.parse(input); } catch { text = input.trim(); }
+  }
+  if (json) {
+    text = waitingEvent(json);
+    dir = dir || json.cwd;
+  }
+  const skip = (why) => { process.stderr.write(`collab phone send: not sent (${why})\n`); };
+  if (!text) return skip('no message');
+  const id = latestTask(path.resolve(dir || process.cwd()));
+  const d = id && path.join(TASKS, id);
+  let st = null;
+  try { st = d && readState(d); } catch { /* none */ }
+  const running = st && (!isTerminal(st.status) || (st.status === 'DONE' && !st.ended));
+  if (!running) return skip('no collab task running in this project');
+  if (!(st.options && st.options.phone)) return skip("this task wasn't started with --phone");
+  if (!phoneUrl()) return skip("no destination: 'collab phone set <topic|url>'");
+  // The same event again within a minute (a burst of prompts) is pushed once.
+  const sent = path.join(d, 'phone-sent.json');
+  try {
+    const last = JSON.parse(fs.readFileSync(sent, 'utf8'));
+    if (last.text === text && epoch() - last.epoch < 60) return skip('sent the same a moment ago');
+  } catch { /* first one */ }
+  try { fs.writeFileSync(sent, JSON.stringify({ text, epoch: epoch() })); } catch { /* best effort */ }
+  pushPhone(st, `Waiting for you: ${text}`, { priority: 'high' });
+  process.stderr.write(`collab phone send: sent for ${st.id}\n`);
+}
+
+async function cmdPhone(args) {
+  const [sub = 'show', ...rest] = args;
+  if (sub === 'show') {
+    const url = phoneUrl();
+    if (!url) { out("phone notifications aren't set up. Start a task with --phone (a private ntfy topic is created), or run 'collab phone set <topic|url>'."); return; }
+    out(`phone: ${phoneHelp(url)}${process.env.COLLAB_PHONE_URL ? ' (from COLLAB_PHONE_URL)' : ''}`);
+    out('Only tasks started with --phone (and the rest of their run) push to it.');
+    return;
+  }
+  if (sub === 'set') {
+    if (!rest[0]) die('usage: collab phone set <ntfy-topic | url>');
+    const url = phoneTarget(rest[0]);
+    withHomeFile(configPath(), readConfig, (c) => { c.phone_url = url; });
+    out(`phone: ${phoneHelp(url)}`);
+    if (process.env.COLLAB_PHONE_URL) out('note: COLLAB_PHONE_URL is set and overrides this.');
+    return;
+  }
+  if (sub === 'test') {
+    const url = phoneUrl();
+    if (!url) die("phone notifications aren't set up: 'collab phone set <topic|url>' first");
+    let res;
+    try {
+      res = await fetch(url, { method: 'POST', body: 'Test notification from collab', headers: { Title: 'collab', Tags: 'robot' }, signal: AbortSignal.timeout(10000) });
+    } catch (e) {
+      die(`push to ${url} failed: ${(e.cause && (e.cause.message || e.cause.code)) || e.message}`);
+    }
+    if (!res.ok) die(`push to ${url} failed: HTTP ${res.status}`);
+    out(`sent a test notification to ${url}`);
+    return;
+  }
+  if (sub === 'send') {
+    try { phoneSend(rest); } catch (e) { process.stderr.write(`collab phone send: not sent (${e.message})\n`); }
+    return;
+  }
+  die('usage: collab phone [set <topic|url> | test | send ["message"] [--dir PATH]]');
+}
+
 function cmdSnooze(args) {
   const mins = args[0] === undefined ? '30' : args[0];
   if (!/^\d+$/.test(mins)) die('usage: collab snooze [MINUTES]');
@@ -1430,21 +1928,22 @@ function cmdDiff(args) {
   const touched = [];
   for (const [i, r] of st.repos.entries()) {
     const idx = Number.isInteger(r.index) ? r.index : i;
-    const changed = git(r.path, ['diff', '--stat', r.base]).out.replace(/\n+$/, '');
+    const icase = repoIgnoresCase(r.path);
+    const changed = git(r.path, ['diff', '--stat', r.base, ...notLessons(icase)]).out.replace(/\n+$/, '');
     let before = [];
     try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
     const known = new Set(before);
-    const fresh = untrackedFiles(r.path).filter((f) => !known.has(f)).sort();
+    const fresh = untrackedFiles(r.path).filter((f) => !known.has(f) && !isLessonsPath(f, icase)).sort();
     // Tasks from before ignored documents were snapshotted have no list: skip them there.
     let docs = [];
     try {
       const had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean));
-      docs = ignoredDocs(r.path).filter((f) => !had.has(f)).sort();
+      docs = ignoredDocs(r.path).filter((f) => !had.has(f) && !isLessonsPath(f, icase)).sort();
     } catch { /* no snapshot */ }
     // Compare canonical paths: on Windows git and Node can spell the same folder differently
     // (8.3 short names like RUNNER~1, or different letter case).
     const rel = (f) => path.relative(realDir(st.project_dir), path.join(realDir(r.path), f)).split(path.sep).join('/');
-    for (const f of git(r.path, ['diff', '--name-only', r.base]).out.split('\n').filter(Boolean)) touched.push(rel(f));
+    for (const f of git(r.path, ['diff', '--name-only', r.base, ...notLessons(icase)]).out.split('\n').filter(Boolean)) touched.push(rel(f));
     for (const f of [...fresh, ...docs]) touched.push(rel(f));
     if (!changed && !fresh.length && !docs.length) continue;
     out(`=== ${r.path} (since ${r.base.slice(0, 10)})`);
@@ -1458,7 +1957,7 @@ function cmdDiff(args) {
       for (const f of docs) out(`  ${f}`);
     }
     if (!stat) {
-      process.stdout.write(git(r.path, ['--no-pager', 'diff', r.base]).out);
+      process.stdout.write(git(r.path, ['--no-pager', 'diff', r.base, ...notLessons(icase)]).out);
       for (const f of [...fresh, ...docs]) {
         out(`+++ new file: ${f}`);
         try {
@@ -1680,6 +2179,7 @@ function cmdEnd(args) {
   body += `\n## Closeouts (collected by collab)\n${closeouts.length ? closeouts.join('\n\n') : 'none'}\n`;
   if (briefings.length) body += `\n## For the user, from the reviewer (collected by collab)\n${briefings.join('\n\n')}\n`;
   body += `\n## Decisions recorded during this run (collected by collab)\n${decisions.length ? decisions.join('\n\n') : 'none'}\n`;
+  body += runLessons(run);
   body += `\n> collab: run ended after ${run.length} task(s): ${run.join(', ')}\n`;
 
   const st = withLock(d, () => {
@@ -1689,6 +2189,7 @@ function cmdEnd(args) {
     return update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
   });
   notify(`${st.id}: work complete`);
+  pushPhone(st, `Work complete: ${run.length} task(s). 'collab show' has the final report.`);
   out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s)${queued.length ? `, ${queued.length} queued task(s) left for the user's go-ahead` : ''}. A reviewer in 'join --after' stops now.`);
 }
 
@@ -1704,7 +2205,8 @@ function projectTasks(dir) {
     if (!taskMeta.has(id)) {
       try {
         const t = readState(path.join(TASKS, id));
-        taskMeta.set(id, { id, dir: realDir(t.project_dir), created: t.created_epoch || 0 });
+        // Older tasks have no created_ms: they count from the start of their second.
+        taskMeta.set(id, { id, dir: realDir(t.project_dir), created: t.created_ms || (t.created_epoch || 0) * 1000 });
       } catch { continue; }
     }
     metas.push(taskMeta.get(id));
@@ -1985,6 +2487,8 @@ ${B}FOR YOU (the human)${R}
   ${C}queue${R}                       List queued tasks (* = this project)
   ${C}queue add${R} [options] "task"  Queue a task; the implementer starts it after the current one
   ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
+  ${C}lessons${R} [add "…" | rm N]    Project lessons put into every new brief (agents add them too)
+  ${C}phone${R} [set T|test|send]     Where --phone tasks push to (ntfy topic or URL); test; send (hooks)
   ${C}snooze${R} [MIN]                Keep waiting on a slow agent (no idle prompt for MIN, default 30)
   ${C}clean${R} [--older-than D] [-n] Delete finished tasks and old drafts (asks first; -n dry run, -y no prompt)
   ${C}path${R}                        Folder holding the current task's files
@@ -1998,6 +2502,7 @@ ${B}TASK OPTIONS${R} ${D}(for queue add, init, or /Collab implement …)${R}
   --branch feat/x             Work on this branch
   --commit                    Commit when DONE (never pushes)
   --confirm                   Ask you before this queued task starts
+  --phone                     Push to your phone when you're needed (see 'collab phone')
   --max-rounds N · --first    Round limit · put it at the front of the queue
 
 ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
@@ -2035,6 +2540,7 @@ const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
   snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, verify: cmdVerify, status: cmdStatus,
   show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer, scratch: cmdScratch,
+  lessons: cmdLessons, phone: cmdPhone,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),
 };
