@@ -73,6 +73,10 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   3 levels, even if the outer repo ignores them, `findRepos`) with `git stash create` plus the untracked-file list, without touching the working tree.
   `cmdDiff` diffs against that snapshot and flags files outside `--scope` globs (`globRegex`).
   It also lists new gitignored `*.md` files (`ignoredDocs`, snapshotted as `untracked/<n>-ignored-md.txt`).
+  Lockfile patches (`LOCKFILES`) are left out unless `--all`, binary new files print as a size. Each build
+  `ready` records `st.review_trees` (last two, `snapshotTree`: `git add -A` + `write-tree` on a temp index copy,
+  objects in `tasks/<id>/objects/<n>` with the repo's as an alternate, so the repo is never written)
+  for `diff --since-review`.
 - **Scratch**: agents keep handoff-only files in `tasks/<id>/scratch/` (`scratchDir`, printed by
   `init`/`join`, returned by `collab scratch`), or in `$COLLAB_HOME/drafts/` before a task exists.
   `cmdClean` deletes drafts older than a day.

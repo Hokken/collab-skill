@@ -182,6 +182,68 @@ test('diff across nested repos ignores pre-existing changes', () => {
   assert.doesNotMatch(r.out, /brand new/);
 });
 
+test('diff leaves out lockfile patches and binary file bodies unless --all', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  s.run(['init', 'locks'], { input: 'b' });
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'two\n');
+  fs.writeFileSync(path.join(s.project, 'package-lock.json'), '{"lockfileVersion": 3}\n');
+  fs.writeFileSync(path.join(s.project, 'blob.bin'), Buffer.from([1, 0, 2, 3]));
+  let r = s.run(['diff']);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /\+two/);
+  assert.match(r.out, /\+\+\+ new file: blob\.bin\n\(binary, 4 bytes\)/);
+  assert.match(r.out, /new file: package-lock\.json\n\(lockfile, content omitted\)/);
+  assert.doesNotMatch(r.out, /lockfileVersion/);
+  assert.match(r.out, /lockfile patches omitted: package-lock\.json \('collab diff --all'/);
+
+  r = s.run(['diff', '--all']);
+  assert.match(r.out, /lockfileVersion/);
+  assert.doesNotMatch(r.out, /lockfile patches omitted/);
+  assert.equal(s.run(['diff', '--bogus']).code, 1);
+});
+
+test('diff --since-review shows only what changed since the reviewed handoff', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = (...a) => spawnSync('git', a, { cwd: s.project, encoding: 'utf8' }).stdout;
+  s.run(['init', 'rounds', '--scope', 'f.txt,b.txt'], { input: 'b' });
+  const id = s.state().id;
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'round one\n');
+  fs.writeFileSync(path.join(s.project, 'out.txt'), 'outside\n');
+  s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r1' });
+
+  let r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.match(r.out, /no earlier review snapshot/);
+  assert.match(r.out, /\+round one/);
+
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] more' });
+  const objects0 = g('count-objects', '-v');
+  fs.appendFileSync(path.join(s.project, 'f.txt'), 'round two\n');
+  fs.writeFileSync(path.join(s.project, 'b.txt'), 'brand new\n');
+  r = s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r2' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(s.state().review_trees.length, 2);
+
+  r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /since review handoff #001/);
+  assert.match(r.out, /\+round two/);
+  assert.match(r.out, /\+brand new/);
+  assert.doesNotMatch(r.out, /\+round one/);
+  assert.doesNotMatch(r.out, /\+outside/);
+  // The scope check still covers the whole task.
+  assert.match(r.out, /OUTSIDE SCOPE[^]*out\.txt/);
+  // The full diff still has everything; the real index and the worktree are untouched.
+  assert.match(s.run(['-t', id, 'diff']).out, /\+round one[^]*\+round two/);
+  assert.equal(g('diff', '--cached', '--name-only'), '');
+  assert.equal(g('count-objects', '-v'), objects0, 'snapshot objects stay in the task folder');
+  assert.match(g('status', '--porcelain'), /\?\? b\.txt/);
+
+  r = s.run(['-t', id, 'wait', 'reviewer', '--timeout', '1']);
+  assert.match(r.out, /diff --since-review/);
+});
+
 test('diff without git repos points to the summary', () => {
   const s = sandbox();
   s.run(['init', 'nogit'], { input: 'b' });

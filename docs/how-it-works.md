@@ -256,6 +256,19 @@ moment. `collab diff` compares against that snapshot, so the reviewer sees only 
 during the task, even when you started with uncommitted work. It also lists new `*.md` files
 that git ignores (e.g. in a gitignored plans folder), so a document written there is not missed.
 
+To keep the output to what a reviewer actually reads, `collab diff` lists changed lockfiles
+(`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`, …) in its stat and
+scope check but leaves their patch out, and shows a new binary file as `(binary, N bytes)`.
+`collab diff --all` includes the lockfile patches.
+
+At each build-phase `ready`, collab also records a tree object of every repo as handed off
+(`review_trees` in `state.json`, the last two). It is built on a temporary copy of the index,
+with its git objects in the task's `objects/` folder, so the working tree, the real index and the
+repo's object store stay untouched. From round 2 on, `collab diff --since-review` shows only what
+changed since the handoff the reviewer last reviewed, new files included, and the reviewer's
+`wait` output points to it. The `⚠ OUTSIDE SCOPE` check still covers the whole task.
+Without an earlier snapshot (round 1, or an older task) it shows the full diff.
+
 ## Files the agents write
 
 Handoff-only files (message drafts for `--file`, notes, logs) go in the task's `scratch/` folder,
@@ -281,6 +294,8 @@ work go where the brief's `## Deliverables` line says.
     untracked/<n>-ignored-md.txt   ignored *.md files per repo at the start
     digests/{review,pending,approved}.json   file signatures behind review_digest, pending_digest
                                    and approved_digest in state.json
+                                   (review_trees: git tree ids for 'collab diff --since-review')
+    objects/<n>/                   git objects of the --since-review snapshots, per repo
     scratch/                       the agents' message drafts, notes and logs for this task
 ```
 

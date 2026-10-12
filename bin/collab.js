@@ -363,9 +363,9 @@ const decisionOptions = (body) => body.split('\n').map((l) => l.match(/^\s*(\d+)
 
 // --- git snapshot helpers -----------------------------------------------------
 
-function git(cwd, args) {
+function git(cwd, args, env = {}) {
   const r = spawnSync('git', args, {
-    cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat' },
+    cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat', ...env },
   });
   return { ok: r.status === 0, out: r.stdout || '' };
 }
@@ -395,6 +395,41 @@ const untrackedFiles = (repo) =>
 // would otherwise never show up in collab diff.
 const ignoredDocs = (repo) =>
   git(repo, ['ls-files', '--others', '--ignored', '--exclude-standard', '--', '*.md']).out.split('\n').filter(Boolean);
+
+// Lockfile patches are long and not reviewed line by line: 'collab diff' lists them but leaves
+// their patch out unless --all is given.
+const LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb',
+  'Cargo.lock', 'Gemfile.lock', 'composer.lock', 'poetry.lock', 'uv.lock', 'go.sum'];
+const isLockfile = (f) => LOCKFILES.includes(path.posix.basename(f.replace(/\\/g, '/')));
+const notLockfiles = () => LOCKFILES.map((n) => `:(exclude,glob)**/${n}`);
+
+// Snapshots for 'collab diff --since-review' keep their git objects in the task folder: the repo's
+// own objects are read through an alternate, and nothing is written to the repo.
+function snapshotEnv(d, idx, repo) {
+  const own = path.resolve(repo, digestGit(repo, ['rev-parse', '--git-path', 'objects']).trim());
+  const dir = path.join(d, 'objects', String(idx));
+  fs.mkdirSync(dir, { recursive: true });
+  return { GIT_OBJECT_DIRECTORY: dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: own };
+}
+
+// A tree object of the repo as it is now (tracked and untracked files, plus the listed ignored
+// ones), built on a temporary copy of the index: the worktree, the real index and the repo's
+// object store stay untouched.
+function snapshotTree(d, r, i, extra = []) {
+  const idx = Number.isInteger(r.index) ? r.index : i;
+  const index = path.resolve(r.path, digestGit(r.path, ['rev-parse', '--git-path', 'index']).trim());
+  fs.mkdirSync(path.join(d, 'digests'), { recursive: true });
+  const copy = path.join(d, 'digests', `index-${process.pid}-${idx}-snap.tmp`);
+  try {
+    if (fs.existsSync(index)) fs.copyFileSync(index, copy);
+    const env = { ...snapshotEnv(d, idx, r.path), GIT_INDEX_FILE: copy };
+    digestGit(r.path, ['add', '-A', ...notLessons(repoIgnoresCase(r.path))], env);
+    if (extra.length) digestGit(r.path, ['add', '-f', '--', ...extra], env);
+    return digestGit(r.path, ['write-tree'], env).trim();
+  } finally {
+    try { fs.rmSync(copy, { force: true }); } catch { /* best effort */ }
+  }
+}
 
 // --- tree digests ---------------------------------------------------------------
 // An approval covers the files the reviewer saw. Per repo: every path changed since the task's base
@@ -1235,6 +1270,9 @@ function reviewRecap(d, st) {
     for (const r of found) lines.push(`${build ? '' : 'plan '}round ${r.i + 1} (#${pad3(seqOf(r.f))}):`, ...r.items);
     lines.push('----- end -----');
   }
+  if (build && (st.review_trees || []).length >= 2) {
+    lines.push(`changes since your last review: 'collab -t ${st.id} diff --since-review' (the whole task: 'collab -t ${st.id} diff')`);
+  }
   if (build && approve) {
     const plan = files.filter((f) => roleOf(f) === 'implementer' && kindOf(f) === 'plan' && seqOf(f) < seqOf(approve)).pop();
     if (plan) lines.push(`approved plan: #${pad3(seqOf(plan))} (read it with 'collab -t ${st.id} show ${seqOf(plan)}'). Review the build against it too.`);
@@ -1405,6 +1443,16 @@ async function cmdSubmit(args) {
       && ((role === 'implementer' && kind === 'ready') || (role === 'reviewer' && kind === 'approve' && pre.review_digest))) {
     tree = treeMap(pre, d);
   }
+  // What the reviewer is shown at this handoff, so the next round can diff only what changed since
+  // ('collab diff --since-review'). Optional: a failed snapshot never blocks the handoff.
+  let snap = null;
+  if (tree && role === 'implementer' && kind === 'ready') {
+    try {
+      snap = pre.repos.map((r, i) => ({ path: r.path, tree: snapshotTree(d, r, i, newIgnoredDocs(d, r, i)) }));
+    } catch (e) {
+      if (!(e instanceof CollabError)) throw e;
+    }
+  }
 
   const result = withLock(d, () => {
     const st = readState(d);
@@ -1440,6 +1488,7 @@ async function cmdSubmit(args) {
       st: update(d, (s) => {
         t.apply(s);
         if (tree && kind === 'ready') { s.review_digest = tree.id; delete s.pending_digest; }
+        if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap }].slice(-2);
         if (binding) s.approved_digest = tree.id;
         if (s.decision && s.decision.seq === undefined) {
           Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
@@ -1925,34 +1974,83 @@ function cmdScratch() {
   out(DRAFTS);
 }
 
+// New *.md files git ignores since init (none for tasks from before those were snapshotted).
+function newIgnoredDocs(d, r, i) {
+  const idx = Number.isInteger(r.index) ? r.index : i;
+  const icase = repoIgnoresCase(r.path);
+  try {
+    const had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean));
+    return ignoredDocs(r.path).filter((f) => !had.has(f) && !isLessonsPath(f, icase)).sort();
+  } catch { return []; }
+}
+
+// The first 400 lines of a new file, or a one-line note for a binary one.
+function printNewFile(abs) {
+  let buf;
+  try { buf = fs.readFileSync(abs); } catch { out('(unreadable)'); return; }
+  if (buf.subarray(0, 8000).includes(0)) { out(`(binary, ${buf.length} bytes)`); return; }
+  const head = buf.toString('utf8').split('\n').slice(0, 400).join('\n');
+  process.stdout.write(!head || head.endsWith('\n') ? head : `${head}\n`);
+}
+
 function cmdDiff(args) {
-  const stat = args[0] === '--stat';
+  const stat = args.includes('--stat');
+  const all = args.includes('--all');
+  const sinceReview = args.includes('--since-review');
+  const bad = args.find((a) => !['--stat', '--all', '--since-review'].includes(a));
+  if (bad) die(`unknown option: ${bad} (usage: collab diff [--stat] [--since-review] [--all])`);
   const d = taskDir();
   const st = readState(d);
   if (!st.repos || !st.repos.length) {
     out(`No git repos in ${st.project_dir} — rely on the file list in the implementer's summary.`);
     return;
   }
+  // The handoff the reviewer last reviewed: the one before the current handoff.
+  const trees = st.review_trees || [];
+  const prev = sinceReview && trees.length >= 2 ? trees[trees.length - 2] : null;
+  if (sinceReview && !prev) out('no earlier review snapshot for this task: showing the full task diff.');
+  const omitted = [];
   const touched = [];
   for (const [i, r] of st.repos.entries()) {
     const idx = Number.isInteger(r.index) ? r.index : i;
     const icase = repoIgnoresCase(r.path);
-    const changed = git(r.path, ['diff', '--stat', r.base, ...notLessons(icase)]).out.replace(/\n+$/, '');
+    const skipLocks = all ? [] : notLockfiles();
     let before = [];
     try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
     const known = new Set(before);
     const fresh = untrackedFiles(r.path).filter((f) => !known.has(f) && !isLessonsPath(f, icase)).sort();
-    // Tasks from before ignored documents were snapshotted have no list: skip them there.
-    let docs = [];
-    try {
-      const had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean));
-      docs = ignoredDocs(r.path).filter((f) => !had.has(f) && !isLessonsPath(f, icase)).sort();
-    } catch { /* no snapshot */ }
+    const docs = newIgnoredDocs(d, r, i);
     // Compare canonical paths: on Windows git and Node can spell the same folder differently
     // (8.3 short names like RUNNER~1, or different letter case).
     const rel = (f) => path.relative(realDir(st.project_dir), path.join(realDir(r.path), f)).split(path.sep).join('/');
-    for (const f of git(r.path, ['diff', '--name-only', r.base, ...notLessons(icase)]).out.split('\n').filter(Boolean)) touched.push(rel(f));
-    for (const f of [...fresh, ...docs]) touched.push(rel(f));
+    const names = git(r.path, ['diff', '--name-only', r.base, ...notLessons(icase)]).out.split('\n').filter(Boolean);
+    for (const f of [...names, ...fresh, ...docs]) touched.push(rel(f));
+
+    const old = prev && (prev.repos.find((p) => p.path === r.path) || {}).tree;
+    if (prev) {
+      // Only what changed since the reviewed handoff, new untracked files included.
+      if (!old) { out(`=== ${r.path}: not in the earlier review snapshot, see 'collab diff'`); continue; }
+      let now;
+      let env;
+      try { now = snapshotTree(d, r, i, docs); env = snapshotEnv(d, idx, r.path); } catch (e) {
+        if (!(e instanceof CollabError)) throw e;
+        out(`=== ${r.path}: ${e.message}; see 'collab diff'`);
+        continue;
+      }
+      const changed = git(r.path, ['diff', '--stat', old, now, ...notLessons(icase)], env).out.replace(/\n+$/, '');
+      if (!changed) continue;
+      out(`=== ${r.path} (since review handoff #${pad3(prev.seq)})`);
+      out(changed);
+      if (!stat) {
+        const files = git(r.path, ['diff', '--name-only', old, now, ...notLessons(icase)], env).out.split('\n').filter(Boolean);
+        if (!all) omitted.push(...files.filter(isLockfile));
+        process.stdout.write(git(r.path, ['--no-pager', 'diff', old, now, ...notLessons(icase), ...skipLocks], env).out);
+      }
+      out();
+      continue;
+    }
+
+    const changed = git(r.path, ['diff', '--stat', r.base, ...notLessons(icase)]).out.replace(/\n+$/, '');
     if (!changed && !fresh.length && !docs.length) continue;
     out(`=== ${r.path} (since ${r.base.slice(0, 10)})`);
     if (changed) out(changed);
@@ -1965,17 +2063,17 @@ function cmdDiff(args) {
       for (const f of docs) out(`  ${f}`);
     }
     if (!stat) {
-      process.stdout.write(git(r.path, ['--no-pager', 'diff', r.base, ...notLessons(icase)]).out);
+      if (!all) omitted.push(...names.filter(isLockfile));
+      process.stdout.write(git(r.path, ['--no-pager', 'diff', r.base, ...notLessons(icase), ...skipLocks]).out);
       for (const f of [...fresh, ...docs]) {
         out(`+++ new file: ${f}`);
-        try {
-          const head = fs.readFileSync(path.join(r.path, f), 'utf8').split('\n').slice(0, 400).join('\n');
-          process.stdout.write(!head || head.endsWith('\n') ? head : `${head}\n`);
-        } catch { out('(unreadable)'); }
+        if (!all && isLockfile(f)) { omitted.push(f); out('(lockfile, content omitted)'); continue; }
+        printNewFile(path.join(r.path, f));
       }
     }
     out();
   }
+  if (omitted.length) out(`lockfile patches omitted: ${[...new Set(omitted)].join(', ')} ('collab diff --all' shows them)`);
   const scope = st.options && st.options.scope;
   if (scope && scope.length) {
     const res = scope.map(globRegex);
@@ -2489,6 +2587,8 @@ ${B}FOR YOU (the human)${R}
   ${C}log${R}                         Full history: brief, summaries, reviews, notes
   ${C}show${R} [N]                    Print entry #N (default: the latest one)
   ${C}diff${R} [--stat]               What changed in the project since the task started
+                              (lockfile patches omitted: --all shows them;
+                              --since-review: only what changed since the last review)
   ${C}list${R}                        All tasks (* = current) with status and round
   ${C}abort${R}                       Stop the current task; both agents exit their loop
   ${C}answer${R} <N | text>           Answer a pending decision (option N, or your own words)

@@ -343,7 +343,10 @@ EOF
 2. **Wait** with `collab wait reviewer`.
 3. **Review** (on exit 0):
    - Treat the implementer's summary as a guide, not proof. Run `collab diff --stat`, then
-     `collab diff` (or read the files) to see the real changes.
+     `collab diff` (or read the files) to see the real changes. From round 2 on, start with
+     `collab diff --since-review` (only what changed since your last review) and open the full
+     diff where the new changes touch earlier code. Lockfile patches are left out and binary
+     files shown as a size: `collab diff --all` includes lockfiles.
    - Check the summary's `## Closeout`: anything under `Verified` that wasn't actually run or
      checked (a test claimed to pass that doesn't, a check that never ran) is a blocking item.
    - From round 2 on, `wait` recaps the `[blocking]` items of your earlier reviews. Check that
