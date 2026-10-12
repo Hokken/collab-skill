@@ -267,7 +267,12 @@ with its git objects in the task's `objects/` folder, so the working tree, the r
 repo's object store stay untouched. From round 2 on, `collab diff --since-review` shows only what
 changed since the handoff the reviewer last reviewed, new files included, and the reviewer's
 `wait` output points to it. The `⚠ OUTSIDE SCOPE` check still covers the whole task.
-Without an earlier snapshot (round 1, or an older task) it shows the full diff.
+Without a snapshot of the reviewed handoff (round 1, an older task, or a handoff whose optional
+snapshot failed) it shows the full diff. A repo with no changes is named as such, and one whose
+snapshot can't be read points to `collab diff`. The snapshot holds the files on disk even behind
+assume-unchanged / skip-worktree flags or outside a sparse checkout (a sparse path that isn't on
+disk keeps its index content, so it never shows as deleted), and a split index is unsplit in the copy, so no
+`sharedindex.*` file is written to the repo.
 
 ## Files the agents write
 

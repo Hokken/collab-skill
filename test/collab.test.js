@@ -242,6 +242,111 @@ test('diff --since-review shows only what changed since the reviewed handoff', (
 
   r = s.run(['-t', id, 'wait', 'reviewer', '--timeout', '1']);
   assert.match(r.out, /diff --since-review/);
+
+  // Nothing changed since the handoff: said so, not an empty output.
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] again' });
+  s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r3' });
+  r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.match(r.out, /no changes since review handoff #00\d in: /);
+  // A lost snapshot never reads as "nothing changed".
+  fs.rmSync(path.join(s.taskDir(), 'objects'), { recursive: true, force: true });
+  fs.appendFileSync(path.join(s.project, 'b.txt'), 'later\n');
+  r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /(can't be read|cannot compute)[^\n]*see 'collab diff'/);
+  assert.doesNotMatch(r.out, /no changes since/);
+});
+
+test('diff --since-review falls back to the full diff when the reviewed handoff has no snapshot', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  s.run(['init', 'gap'], { input: 'b' });
+  const id = s.state().id;
+  const f = path.join(s.project, 'f.txt');
+  const objects = path.join(s.taskDir(), 'objects');
+  const round = (text, input) => {
+    fs.writeFileSync(f, text);
+    assert.equal(s.run(['-t', id, 'submit', 'implementer', 'ready'], { input }).code, 0);
+  };
+  round('A\n', 'r1');
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] x' });
+  // The snapshot of round 2 fails (objects/ is a file), the handoff still goes through.
+  fs.rmSync(objects, { recursive: true, force: true });
+  fs.writeFileSync(objects, 'not a folder');
+  round('B\n', 'r2');
+  assert.equal(s.state().review_trees.at(-1).repos, null);
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] y' });
+  fs.rmSync(objects, { force: true });
+  // Back to A: diffing against round 1 would hide the B -> A change the reviewer hasn't seen.
+  round('A\n', 'r3');
+  const r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /no snapshot of the reviewed handoff #00\d: showing the full task diff/);
+  assert.doesNotMatch(r.out, /no changes since/);
+  assert.match(r.out, /\+A/);
+});
+
+test('diff --since-review sees files behind index flags and never writes a split index', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  fs.writeFileSync(path.join(s.project, 'k.txt'), 'k\n');
+  const g = (...a) => spawnSync('git', a, { cwd: s.project, encoding: 'utf8' });
+  g('add', 'k.txt');
+  g('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'k');
+  g('config', 'core.splitIndex', 'true');
+  g('update-index', '--split-index');
+  const shared = () => fs.readdirSync(path.join(s.project, '.git')).filter((n) => n.startsWith('sharedindex.')).sort();
+  s.run(['init', 'flags'], { input: 'b' });
+  const id = s.state().id;
+  fs.writeFileSync(path.join(s.project, 'f.txt'), 'round1\n');
+  fs.writeFileSync(path.join(s.project, 'new.txt'), 'n\n');
+  const before = shared();
+  assert.equal(s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r1' }).code, 0);
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] x' });
+  assert.deepEqual(shared(), before);
+  g('update-index', '--assume-unchanged', 'f.txt');
+  g('update-index', '--skip-worktree', 'k.txt');
+  const flags = g('ls-files', '-v').stdout;
+  fs.writeFileSync(path.join(s.project, 'f.txt'), 'round2\n');
+  fs.writeFileSync(path.join(s.project, 'k.txt'), 'k2\n');
+  const before2 = shared();
+  assert.equal(s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r2' }).code, 0);
+  const r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /-round1\n\+round2/);
+  assert.match(r.out, /-k\n\+k2/);
+  // collab wrote no shared index and left the real index flags alone.
+  assert.deepEqual(shared(), before2);
+  assert.ok(before.length >= 1, 'the repo uses a split index');
+  assert.equal(g('ls-files', '-v').stdout, flags);
+});
+
+test('diff --since-review sees present files outside a sparse checkout, not absent ones as deleted', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const g = (...a) => spawnSync('git', a, { cwd: s.project, encoding: 'utf8' });
+  for (const dir of ['keep', 'omit', 'gone']) {
+    fs.mkdirSync(path.join(s.project, dir));
+    fs.writeFileSync(path.join(s.project, dir, 'file'), `${dir}\n`);
+  }
+  g('add', '.');
+  g('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'dirs');
+  assert.equal(g('sparse-checkout', 'init', '--cone').status, 0);
+  assert.equal(g('sparse-checkout', 'set', 'keep').status, 0);
+  assert.ok(!fs.existsSync(path.join(s.project, 'omit')), 'sparse checkout removed omit/');
+  s.run(['init', 'sparse'], { input: 'b' });
+  const id = s.state().id;
+  fs.writeFileSync(path.join(s.project, 'keep', 'file'), 'keep 1\n');
+  assert.equal(s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r1' }).code, 0);
+  s.run(['-t', id, 'submit', 'reviewer', 'changes'], { input: '1. [blocking] x' });
+  fs.mkdirSync(path.join(s.project, 'omit'));
+  fs.writeFileSync(path.join(s.project, 'omit', 'file'), 'changed\n');
+  assert.equal(s.run(['-t', id, 'submit', 'implementer', 'ready'], { input: 'r2' }).code, 0);
+  const r = s.run(['-t', id, 'diff', '--since-review']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /-omit\n\+changed/);
+  assert.doesNotMatch(r.out, /gone\/file/);
+  assert.doesNotMatch(r.out, /keep\/file/);
 });
 
 test('diff without git repos points to the summary', () => {

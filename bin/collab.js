@@ -414,18 +414,35 @@ function snapshotEnv(d, idx, repo) {
 
 // A tree object of the repo as it is now (tracked and untracked files, plus the listed ignored
 // ones), built on a temporary copy of the index: the worktree, the real index and the repo's
-// object store stay untouched.
+// object store stay untouched. The copy is unsplit (a split index would write a new
+// sharedindex.* into the repo) and loses its assume-unchanged / skip-worktree flags, so it holds
+// the files on disk, inside the sparse-checkout selection or not; a skip-worktree path that isn't
+// on disk keeps its entry.
 function snapshotTree(d, r, i, extra = []) {
   const idx = Number.isInteger(r.index) ? r.index : i;
   const index = path.resolve(r.path, digestGit(r.path, ['rev-parse', '--git-path', 'index']).trim());
   fs.mkdirSync(path.join(d, 'digests'), { recursive: true });
   const copy = path.join(d, 'digests', `index-${process.pid}-${idx}-snap.tmp`);
+  // Sparse checkout off for the copy too, or 'add -A' skips present files outside the selection.
+  const cfg = ['-c', 'core.splitIndex=false', '-c', 'core.sparseCheckout=false', '-c', 'index.sparse=false'];
+  const g = (args, input) => digestGit(r.path, [...cfg, ...args], env, input);
+  let env;
   try {
     if (fs.existsSync(index)) fs.copyFileSync(index, copy);
-    const env = { ...snapshotEnv(d, idx, r.path), GIT_INDEX_FILE: copy };
-    digestGit(r.path, ['add', '-A', ...notLessons(repoIgnoresCase(r.path))], env);
-    if (extra.length) digestGit(r.path, ['add', '-f', '--', ...extra], env);
-    return digestGit(r.path, ['write-tree'], env).trim();
+    env = { ...snapshotEnv(d, idx, r.path), GIT_INDEX_FILE: copy };
+    if (fs.existsSync(copy)) {
+      g(['update-index', '--no-split-index']);
+      const flagged = zList(g(['ls-files', '-v', '-z'])).filter((e) => /^[a-zS] /.test(e))
+        .filter((e) => !/^[sS] /.test(e) || fs.existsSync(path.join(r.path, e.slice(2))))
+        .map((e) => e.slice(2));
+      // One flag per call: with --stdin, update-index applies only one of them.
+      for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) {
+        if (flagged.length) g(['update-index', flag, '-z', '--stdin'], flagged.join('\0'));
+      }
+    }
+    g(['add', '-A', ...notLessons(repoIgnoresCase(r.path))]);
+    if (extra.length) g(['add', '-f', '--', ...extra]);
+    return g(['write-tree']).trim();
   } finally {
     try { fs.rmSync(copy, { force: true }); } catch { /* best effort */ }
   }
@@ -443,9 +460,9 @@ const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
 const zList = (s) => s.split('\0').filter(Boolean);
 const noDigest = (why) => die(`cannot compute the tree digest: ${why}`);
 
-function digestGit(cwd, args, env = {}) {
+function digestGit(cwd, args, env = {}, input = undefined) {
   const r = spawnSync('git', args, {
-    cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0', ...env },
+    cwd, input, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0', ...env },
   });
   if (r.status !== 0) noDigest(`'git ${args.join(' ')}' failed in ${cwd}${r.stderr ? `: ${r.stderr.trim().split('\n')[0]}` : ''}`);
   return r.stdout || '';
@@ -1445,13 +1462,14 @@ async function cmdSubmit(args) {
   }
   // What the reviewer is shown at this handoff, so the next round can diff only what changed since
   // ('collab diff --since-review'). Optional: a failed snapshot never blocks the handoff.
+  // A failed one is recorded as missing (repos: null), so the next round falls back to the full diff.
   let snap = null;
   if (tree && role === 'implementer' && kind === 'ready') {
+    let repos = null;
     try {
-      snap = pre.repos.map((r, i) => ({ path: r.path, tree: snapshotTree(d, r, i, newIgnoredDocs(d, r, i)) }));
-    } catch (e) {
-      if (!(e instanceof CollabError)) throw e;
-    }
+      repos = pre.repos.map((r, i) => ({ path: r.path, tree: snapshotTree(d, r, i, newIgnoredDocs(d, r, i)) }));
+    } catch { /* recorded as missing */ }
+    snap = { repos };
   }
 
   const result = withLock(d, () => {
@@ -1488,7 +1506,7 @@ async function cmdSubmit(args) {
       st: update(d, (s) => {
         t.apply(s);
         if (tree && kind === 'ready') { s.review_digest = tree.id; delete s.pending_digest; }
-        if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap }].slice(-2);
+        if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap.repos }].slice(-2);
         if (binding) s.approved_digest = tree.id;
         if (s.decision && s.decision.seq === undefined) {
           Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
@@ -2007,10 +2025,15 @@ function cmdDiff(args) {
   }
   // The handoff the reviewer last reviewed: the one before the current handoff.
   const trees = st.review_trees || [];
-  const prev = sinceReview && trees.length >= 2 ? trees[trees.length - 2] : null;
+  let prev = sinceReview && trees.length >= 2 ? trees[trees.length - 2] : null;
   if (sinceReview && !prev) out('no earlier review snapshot for this task: showing the full task diff.');
+  if (prev && !prev.repos) {
+    out(`no snapshot of the reviewed handoff #${pad3(prev.seq)}: showing the full task diff.`);
+    prev = null;
+  }
   const omitted = [];
   const touched = [];
+  const unchanged = [];
   for (const [i, r] of st.repos.entries()) {
     const idx = Number.isInteger(r.index) ? r.index : i;
     const icase = repoIgnoresCase(r.path);
@@ -2037,8 +2060,11 @@ function cmdDiff(args) {
         out(`=== ${r.path}: ${e.message}; see 'collab diff'`);
         continue;
       }
-      const changed = git(r.path, ['diff', '--stat', old, now, ...notLessons(icase)], env).out.replace(/\n+$/, '');
-      if (!changed) continue;
+      const sr = git(r.path, ['diff', '--stat', old, now, ...notLessons(icase)], env);
+      // A missing or unreadable snapshot must not read as "nothing changed".
+      if (!sr.ok) { out(`=== ${r.path}: the earlier review snapshot can't be read, see 'collab diff'`); continue; }
+      const changed = sr.out.replace(/\n+$/, '');
+      if (!changed) { unchanged.push(r.path); continue; }
       out(`=== ${r.path} (since review handoff #${pad3(prev.seq)})`);
       out(changed);
       if (!stat) {
@@ -2073,6 +2099,7 @@ function cmdDiff(args) {
     }
     out();
   }
+  if (unchanged.length) out(`no changes since review handoff #${pad3(prev.seq)} in: ${unchanged.join(', ')}`);
   if (omitted.length) out(`lockfile patches omitted: ${[...new Set(omitted)].join(', ')} ('collab diff --all' shows them)`);
   const scope = st.options && st.options.scope;
   if (scope && scope.length) {
@@ -2586,7 +2613,7 @@ ${B}FOR YOU (the human)${R}
   ${C}status${R}                      One-shot summary of the current task
   ${C}log${R}                         Full history: brief, summaries, reviews, notes
   ${C}show${R} [N]                    Print entry #N (default: the latest one)
-  ${C}diff${R} [--stat]               What changed in the project since the task started
+  ${C}diff${R} [--stat] [--all]       What changed in the project since the task started
                               (lockfile patches omitted: --all shows them;
                               --since-review: only what changed since the last review)
   ${C}list${R}                        All tasks (* = current) with status and round
