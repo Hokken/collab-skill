@@ -1925,3 +1925,32 @@ test('phone send: agent hooks push "waiting for you", only for a running --phone
     assert.equal(p.got.length, 6, JSON.stringify(p.got.map((g) => g.body)));
   } finally { p.close(); }
 });
+
+test('phone: Claude Code questions (PreToolUse AskUserQuestion) and a first confirm-first task with --phone push', async () => {
+  const p = await pushServer();
+  try {
+    const s = sandbox({ COLLAB_PHONE_URL: p.url });
+    // The first queued task of a run: no earlier task, the item itself has --phone.
+    s.run(['queue', 'add', '--confirm', '--phone', 'Run the DB migration']);
+    assert.match(s.run(['queue', 'next']).out, /CONFIRM FIRST/);
+    let got = await p.until(1);
+    assert.equal(got[0].body, 'Queued task #1 needs your go-ahead: Run the DB migration');
+    assert.equal(got[0].title, 'collab: queued task #1');
+    s.run(['queue', 'add', '--confirm', 'No phone for this one']);
+    s.run(['queue', 'rm', '1']);
+    s.run(['queue', 'next']);
+
+    s.run(['init', 'ask', '--phone'], { input: 'b' });
+    const ask = JSON.stringify({
+      session_id: 'x', cwd: s.project, hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Which database?', header: 'DB', options: [] }, { question: 'Which port?' }] },
+    });
+    const r = s.run(['phone', 'send'], { input: ask });
+    assert.equal(r.code, 0);
+    assert.equal(r.out, '', 'no hook decision: the question shows as usual');
+    got = await p.until(2);
+    assert.equal(got[1].body, 'Waiting for you: Claude asks: Which database? (+1 more)');
+    await pause(800);
+    assert.equal(p.got.length, 2, JSON.stringify(p.got.map((g) => g.body)));
+  } finally { p.close(); }
+});

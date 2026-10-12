@@ -179,11 +179,13 @@ task needs the flag again. Queued items carry it like any other option.
   `collab phone test` sends a test push and reports a failure (exit 1).
 - **What pushes:** a decision for the user (including the round limit), an escalation through
   `submit`, an unresponsive agent (`wait`/`join --after` exit 13), a stall, a confirm-first
-  queued task shown by `queue next` during a `--phone` run, and `collab end`. Ordinary handoffs,
+  queued task shown by `queue next` during a `--phone` run (or one queued with `--phone` itself),
+  and `collab end`. Ordinary handoffs,
   a `DONE` inside a run and `abort` don't.
 - **From the agent CLIs:** `collab phone send ["message"] [--dir PATH]` lets hooks report waits
-  collab can't see (an agent's own permission prompt). It reads a Claude Code `Notification`
-  hook's JSON on stdin (`message`, `cwd`), a Codex `PermissionRequest` hook's (`tool_input`,
+  collab can't see (an agent's own question or permission prompt). It reads a Claude Code
+  `Notification` hook's JSON on stdin (`message`, `cwd`), a Claude Code `PreToolUse` hook's on
+  `AskUserQuestion` (`tool_input.questions`: "Claude asks: …"), a Codex `PermissionRequest` hook's (`tool_input`,
   `cwd`) or Codex `notify`'s JSON argument (`type`, `last-assistant-message`, `cwd`), or plain
   text. It pushes `Waiting for you: …` (high) only when the folder's project has a `--phone` task
   that is running (or `DONE` with the run not ended), once per identical message per minute. It

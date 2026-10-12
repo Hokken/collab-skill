@@ -267,17 +267,22 @@ command?") looks merely quiet until the 30-minute idle check. To hear about thos
 let the agent CLI call `collab phone send`. It pushes "Waiting for you: …" only when the project
 has a running `--phone` task, and does nothing otherwise:
 
-- **Claude Code** (`~/.claude/settings.json`):
+- **Claude Code** (`~/.claude/settings.json`): its questions (AskUserQuestion) fire no
+  notification, so they need a `PreToolUse` hook; permission prompts come through `Notification`:
   ```json
   "hooks": {
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion",
+        "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
+    ],
     "Notification": [
       { "matcher": "permission_prompt|elicitation_dialog",
         "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
     ]
   }
   ```
-  Don't add `idle_prompt`: Claude Code ends its turn while it waits in the loop, so that one would
-  fire all the time.
+  The hook prints nothing, so the question or prompt shows as usual. Don't add `idle_prompt`:
+  Claude Code ends its turn while it waits in the loop, so that one would fire all the time.
 - **Codex** (`~/.codex/hooks.json`; hooks are on by default, and Codex asks you once to trust a
   new hook):
   ```json

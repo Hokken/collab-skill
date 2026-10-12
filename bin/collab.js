@@ -1608,10 +1608,13 @@ function cmdQueue(args) {
     if (it.held) out(`HELD: ${it.held}, so this part may build on unfinished work.`);
     if (it.options && it.options.confirm) {
       out('CONFIRM FIRST: ask the user before starting this task (start / skip / stop).');
-      // A run with --phone on tells the phone too (the same rule as carrying --phone on in init).
+      // The phone hears about it when the run has --phone on (the same rule as carrying --phone on
+      // in init), or when the queued task itself has it (e.g. the first task of a run).
       const prevId = latestTask(dir);
       const prev = prevId && readState(path.join(TASKS, prevId));
-      if (prev && prev.status === 'DONE' && !prev.ended) pushPhone(prev, `Queued task #${it.id} needs your go-ahead: ${headline(it.text)}`, { priority: 'high' });
+      const msg = `Queued task #${it.id} needs your go-ahead: ${headline(it.text)}`;
+      if (prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) pushPhone(prev, msg, { priority: 'high' });
+      else if (it.options && it.options.phone) pushPhone({ id: `queued task #${it.id}`, options: it.options }, msg, { priority: 'high' });
     }
     out('----- task -----');
     process.stdout.write(it.text.endsWith('\n') ? it.text : `${it.text}\n`);
@@ -1768,6 +1771,11 @@ function waitingEvent(j) {
     return `Codex needs your approval: ${clip(ti.description || ti.command || j.tool_name || 'a tool call')}`;
   }
   if (j.type === 'agent-turn-complete') return `Codex stopped and is waiting for you: ${clip(j['last-assistant-message']) || 'its turn ended'}`;
+  // Claude Code's own questions fire no Notification: a PreToolUse hook on AskUserQuestion sends them.
+  if (j.tool_name === 'AskUserQuestion') {
+    const qs = ((j.tool_input || {}).questions || []).map((q) => q && q.question).filter(Boolean);
+    return `Claude asks: ${clip(qs[0]) || 'a question'}${qs.length > 1 ? ` (+${qs.length - 1} more)` : ''}`;
+  }
   if (j.message) return clip(j.message);
   return '';
 }
