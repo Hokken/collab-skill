@@ -220,21 +220,28 @@ Agents branch on these, so they are part of the protocol:
 | `1` | error (message on stderr) |
 | `10` | the task is finished; stop looping (`join --after`: the run ended, or a task ended without approval) |
 | `11` | `wait` timed out and it's still not your turn; run it again |
-| `12` | submit refused: the user added a note during your turn |
+| `12` | submit refused: a note for you is not acknowledged (`Note #N`) in your message |
 | `13` | the other agent looks unresponsive; ask the user whether to stop or keep waiting |
 | `14` | submit refused: the task's `--check` command failed |
 | `15` | the queue has no task for this project |
 | `16` | the other agent asked the user to decide; show them the options, record the answer with `collab answer` |
 | `17` | the project files changed since the review (`approve` refused; inspect, then `approve --rereviewed`) or since the approval (`collab verify`; don't commit) |
 
-## Human notes
+## Notes
 
-`collab note` adds an entry for `all`, `implementer` or `reviewer`. Each role tracks the last entry
-it has been shown. A note reaches its target in one of three ways:
+`collab note` adds an entry for `all`, `implementer` or `reviewer`: from the user by default
+(`NNN-human-note-<to>.md`, shown as `!!! HUMAN NOTE`), or from an agent with `--from <role>`
+(`NNN-peer-note-<to>.md`, shown as `>>> NOTE FROM THE OTHER AGENT`, always addressed to the other
+agent). A plain `collab note` from an agent's shell (`CLAUDECODE=1`, `COLLAB_AGENT`, or Codex's
+`CODEX_THREAD_ID` / `CODEX_SESSION_ID` / sandbox variables) is refused, so an agent can't post as the user; a user typing inside an agent
+session adds `--as-user`.
 
-1. in the `wait` output at the start of its next turn;
-2. in the output of its next `collab progress`;
-3. by refusing its next `submit` (exit 12) until it has seen the note.
+A note is **shown** to its target at its next `wait` or `progress`, and it must be **acknowledged**:
+the target's next `submit` is refused (exit 12) until its message names every note addressed to it
+since its previous handoff (`Note #N`). Being shown is not enough, because an agent may discard that
+output. Escalations are never blocked. A task started before acknowledgements gets its baseline
+frozen, for both roles, from what each had been shown, at its first state change after the
+upgrade: notes shown before count as handled, every later one must be acknowledged.
 
 A note for one role is never shown to, and never blocks, the other one.
 

@@ -54,7 +54,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   as agent activity (e.g. snooze).
 - **Turns**: `transition(st, role, kind)` is the state machine (PLANNING/PLAN_REVIEW/PLAN_CHANGES →
   IMPLEMENTING → READY_FOR_REVIEW ⇄ CHANGES_REQUESTED → DONE, plus ESCALATED/ABORTED/STALLED terminals).
-  `cmdSubmit` validates the turn, enforces unseen notes (exit 12) and `--check` (exit 14, via `runCheck`),
+  `cmdSubmit` validates the turn, enforces note acknowledgements (exit 12: every note for the role since its last handoff must be named as `Note #N`) and `--check` (exit 14, via `runCheck`),
   writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`.
 - **Decisions**: `submit <role> decide` (numbered options, `decisionOptions`) parks the task in the
   non-terminal `DECISION` status with `turn: 'human'` and saves the previous status/turn in
@@ -67,8 +67,11 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Waiting**: `cmdWait`/`cmdJoin` poll `state.json` every `COLLAB_POLL_SECS`. Idle detection
   (`idleReason`, exit 13) combines time since last handoff, `collab progress` pings, and (on the
   implementer's turn) project file mtimes via `lastFileChange`, which skips `SKIP_DIRS`.
-- **Notes**: `pendingNotes`/`markSeen` track, per role, the last entry shown; notes surface in `wait`,
-  `progress`, or by refusing `submit`.
+- **Notes**: user notes (`NNN-human-note-<to>`) and agent notes (`--from`, `NNN-peer-note-<to>`, only to
+  the other agent). `pendingNotes`/`markSeen` track, per role, the last entry shown (notes surface in
+  `wait`, `progress` or a refused `submit`); `unackedNotes`/`acked` track what each role has
+  acknowledged. Tasks from before acknowledgements get `acked` frozen from `seen` (`freezeAcked`) at
+  their first state change. `agentShell()` refuses a plain `collab note` from an agent's shell.
 - **Diffs**: `cmdInit` snapshots every git repo under the project (its own repo + nested ones up to
   3 levels, even if the outer repo ignores them, `findRepos`) with `git stash create` plus the untracked-file list, without touching the working tree.
   `cmdDiff` diffs against that snapshot and flags files outside `--scope` globs (`globRegex`).

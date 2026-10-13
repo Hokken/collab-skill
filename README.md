@@ -61,7 +61,8 @@ in the dashboard and in the log.
 - **Live dashboard.** `collab watch` shows whose turn it is, what they're doing right now, and
   every step so far. Browse them with the arrow keys.
 - **Steer while it runs.** `collab note "don't touch the i18n files"` reaches the agents at their
-  next step, and they must address it.
+  next step, and they must acknowledge it (`Note #N`) before they can hand off. A note can't be lost
+  in discarded output, and an agent's own notes are always labelled as the agent's, never as yours.
 - **Queue up work.** Line up several tasks and the pair works through them one after another.
   Each task can carry its own options: tests that must pass, a scope, a branch, a commit when done.
 - **Plan first (optional).** With `--plan`, the reviewer approves the approach before any code is
@@ -303,7 +304,7 @@ also run themselves.
 | Command | What it does |
 |---|---|
 | `collab watch [--interval S]` | Interactive dashboard: steps (↑↓), tasks (←→), live progress |
-| `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer) |
+| `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer). Each must be acknowledged as `Note #N` in the agent's next handoff |
 | `collab snooze [MIN]` | Keep waiting on a slow agent: no idle prompt for MIN minutes (default 30). 🤖 when you answer *keep waiting* |
 | `collab abort` | Stop the current task; both agents exit their loop. 🤖 when you answer *stop* |
 | `collab answer <N \| text>` | Answer a pending decision: option N, or your own words. 🤖 when you pick an option in Claude Code |

@@ -9,6 +9,9 @@ const { spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'collab.js');
 
+// The tests act as the user unless a test sets an agent marker itself.
+const NO_AGENT = { CLAUDECODE: '', COLLAB_AGENT: '', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '', CODEX_SANDBOX: '', CODEX_SANDBOX_NETWORK_DISABLED: '' };
+
 const CLOSEOUT = '## Closeout\nVerified: none\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n';
 
 function sandbox(extraEnv = {}) {
@@ -18,7 +21,7 @@ function sandbox(extraEnv = {}) {
   fs.mkdirSync(project, { recursive: true });
   const env = {
     ...process.env, COLLAB_HOME: home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0',
-    COLLAB_TASK: '', ...extraEnv,
+    COLLAB_TASK: '', ...NO_AGENT, ...extraEnv,
   };
   // A build 'ready' needs a closeout; tests that aren't about it get a minimal one (raw: send as is).
   const run = (args, { input, cwd = project, env: more = {}, raw = false } = {}) => {
@@ -355,37 +358,140 @@ test('diff without git repos points to the summary', () => {
   assert.match(s.run(['diff']).out, /No git repos/);
 });
 
+const noteNum = (r) => Number(/note #(\d+)/.exec(r.out)[1]);
+
 test('notes: gate, routing and finished tasks', () => {
   const s = sandbox();
   s.run(['init', 'notes'], { input: 'brief' });
   let r = s.run(['note', 'also', 'handle', 'empty', 'strings']);
   assert.match(r.out, /note #1 added for all/);
+  const n1 = noteNum(r);
 
   r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
   assert.equal(r.code, 12);
-  assert.match(r.out, /NOT SUBMITTED/);
+  assert.match(r.out, /NOT SUBMITTED: Note #1 is not acknowledged/);
   assert.match(r.out, /!!! HUMAN NOTE[\s\S]*also handle empty strings/);
-  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v2' }).code, 0);
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  assert.equal(r.code, 12, 'shown is not handled: still refused until acknowledged');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v2\n## Review responses\nNote #${n1} — done` }).code, 0);
 
-  s.run(['note', '-r', 'check perf']);
+  const nr = noteNum(s.run(['note', '-r', 'check perf']));
   s.run(['note', '--implementer', 'impl only']);
   r = s.run(['wait', 'reviewer', '--timeout', '1']);
   assert.match(r.out, /check perf/);
   assert.doesNotMatch(r.out, /impl only/);
-  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' }).code, 0, 'implementer-only note does not gate the reviewer');
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: `1. fix\nnote #${nr}: checked; Note #${n1}: seen` }).code, 0, 'implementer-only note does not gate the reviewer (a note for all does)');
 
-  s.run(['note', '--to', 'reviewer', 'reviewer note during impl turn']);
+  const nrr = noteNum(s.run(['note', '--to', 'reviewer', 'reviewer note during impl turn']));
   r = s.run(['wait', 'implementer', '--timeout', '1']);
   assert.match(r.out, /impl only/);
   assert.doesNotMatch(r.out, /reviewer note during impl turn/);
-  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'fixed' }).code, 0);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'fixed' }).code, 12, 'the implementer-only note needs its acknowledgement');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `fixed\nNote #${nr + 1} — done` }).code, 0);
 
   r = s.run(['wait', 'reviewer', '--timeout', '1']);
   assert.match(r.out, /reviewer note during impl turn/);
-  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: `ok (Note #${nrr} considered)` }).code, 10);
   r = s.run(['note', 'late']);
   assert.equal(r.code, 1);
   assert.match(r.err, /already finished/);
+});
+
+test('notes from an agent: labelled as its own, routed to the other agent, never as the user', () => {
+  const s = sandbox();
+  s.run(['init', 'peer'], { input: 'brief' });
+  // An agent shell may not record a note as the user's.
+  let r = s.run(['note', 'looks wrong'], { env: { CLAUDECODE: '1' } });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--from reviewer/);
+  r = s.run(['note', 'from me, the user', '--as-user'], { env: { CLAUDECODE: '1' } });
+  assert.equal(r.code, 0, r.err);
+  const user = noteNum(r);
+  r = s.run(['note', '--from', 'reviewer', 'preliminary finding: X races Y'], { env: { CLAUDECODE: '1' } });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /from the reviewer added for implementer/);
+  const peer = noteNum(r);
+  assert.equal(s.run(['note', '--from', 'reviewer', '--to', 'reviewer', 'x']).code, 1, 'goes to the other agent only');
+  assert.equal(s.run(['note', '--from', 'tester', 'x']).code, 1);
+  r = s.run(['progress', 'working'], { env: { CLAUDECODE: '1' } });
+  assert.match(r.out, />>> NOTE FROM THE OTHER AGENT[\s\S]*From: the reviewer[\s\S]*X races Y/);
+  assert.doesNotMatch(r.out.split('From: the reviewer')[1] ?? '', /!!! HUMAN NOTE/);
+  // Discarding that output (progress > /dev/null) loses nothing: both notes still gate the handoff.
+  r = s.run(['submit', 'implementer', 'ready'], { input: `v1 Note #${user}` });
+  assert.equal(r.code, 12);
+  assert.match(r.out, new RegExp(`Note #${peer} is not acknowledged`));
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${user} — done\nNote #${peer} — fixed` }).code, 0);
+  // The reviewer is not gated by its own note (only by the user's note for both agents).
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 12);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: `ok (Note #${user} seen)` }).code, 10);
+});
+
+test('a task from before acknowledgements: notes already shown stay handled, every later one must be acknowledged (both roles)', () => {
+  const s = sandbox();
+  s.run(['init', 'legacy'], { input: 'brief' });
+  const oldI = noteNum(s.run(['note', '-i', 'old implementer note']));
+  s.run(['progress', 'reading']); // shown under the old rule
+  const stateFile = path.join(s.taskDir(), 'state.json');
+  const legacy = () => {
+    const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    delete st.acked;
+    fs.writeFileSync(stateFile, JSON.stringify(st));
+  };
+  legacy();
+  // A new note, delivered by progress (which advances `seen`): it must still be acknowledged.
+  const newI = noteNum(s.run(['note', '-i', 'new implementer note']));
+  assert.match(s.run(['progress', 'coding']).out, /new implementer note/);
+  let r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 12);
+  assert.match(r.out, new RegExp(`Note #${newI} is not acknowledged`));
+  assert.doesNotMatch(r.out, new RegExp(`Note #${oldI}\\b`), 'the note shown before the upgrade counts as handled');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1 again' }).code, 12, 'a refused submit does not move the baseline');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${newI} — done` }).code, 0);
+  assert.ok(s.state().acked, 'the baseline is now stored');
+
+  // The other role, before its first handoff after the upgrade: same rule.
+  const t = sandbox();
+  t.run(['init', 'legacy2'], { input: 'brief' });
+  const oldR = noteNum(t.run(['note', '-r', 'old reviewer note']));
+  t.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  t.run(['wait', 'reviewer', '--timeout', '1']); // the reviewer is shown its old note
+  const tf = path.join(t.taskDir(), 'state.json');
+  const st = JSON.parse(fs.readFileSync(tf, 'utf8'));
+  delete st.acked;
+  fs.writeFileSync(tf, JSON.stringify(st));
+  const newR = noteNum(t.run(['note', '-r', 'new reviewer note']));
+  t.run(['progress', 'reviewing']);
+  r = t.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(r.code, 12);
+  assert.match(r.out, new RegExp(`Note #${newR} is not acknowledged`));
+  assert.doesNotMatch(r.out, new RegExp(`Note #${oldR}\\b`));
+  assert.equal(t.run(['submit', 'reviewer', 'approve'], { input: `ok (Note #${newR} considered)` }).code, 10);
+});
+
+test('agent shells are recognised (Claude Code, Codex sessions sandboxed or not, COLLAB_AGENT); the user override stays', () => {
+  const s = sandbox();
+  s.run(['init', 'shells'], { input: 'brief' });
+  for (const env of [{ CLAUDECODE: '1' }, { CODEX_THREAD_ID: 't-1' }, { CODEX_SESSION_ID: 's-1' }, { CODEX_SANDBOX: 'seatbelt' }, { COLLAB_AGENT: '1' }]) {
+    const r = s.run(['note', 'as the user?'], { env });
+    assert.equal(r.code, 1, JSON.stringify(env));
+    assert.match(r.err, /--from/);
+  }
+  assert.equal(s.run(['note', 'typed by the user', '--as-user'], { env: { CODEX_THREAD_ID: 't-1' } }).code, 0);
+  assert.equal(s.run(['note', '--from', 'reviewer', 'a finding'], { env: { CODEX_THREAD_ID: 't-1' } }).code, 0);
+  assert.equal(s.run(['note', 'plain user shell']).code, 0);
+});
+
+test('a failed check keeps its whole output in the scratch folder (a path with spaces too)', () => {
+  const s = sandbox({ COLLAB_HOME: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'collab test ')), 'home dir') });
+  s.run(['init', 'chk', '--check', `node -e "console.log('first line'); for (let i = 0; i < 100; i++) console.log('noise ' + i); process.exit(3)"`], { input: 'b' });
+  const r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 14);
+  const file = /Full output: (.+?\.log) Last lines:/.exec(r.out)?.[1];
+  assert.ok(file, r.out);
+  const log = fs.readFileSync(file, 'utf8');
+  assert.match(log, /first line/, 'the beginning is kept even though the printed tail drops it');
+  assert.match(log, /exit code 3/);
+  assert.doesNotMatch(r.out.split('Last lines:')[1] ?? '', /first line/);
 });
 
 test('plan mode', () => {
@@ -555,15 +661,16 @@ test('output piped into a reader that exits early does not crash or lose state',
   s.run(['init', 'pipe'], { input: 'b' });
   s.run(['note', 'a note for everyone']);
   s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-  s.run(['submit', 'implementer', 'ready'], { input: 'v1 (note handled)' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1 (Note #1 handled)' });
   const big = 'line\n'.repeat(20000);
-  s.run(['note', '-r', big]);
+  const big2 = noteNum(s.run(['note', '-r', big]));
   const r = spawnSync('sh', ['-c', `"${process.execPath}" "${CLI}" wait reviewer --timeout 1 | head -1`], {
     cwd: s.project, encoding: 'utf8', env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0' },
   });
   assert.equal(r.stderr, '');
   assert.match(r.stdout, /^YOUR TURN/);
-  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10, 'notes shown before the pipe closed count as seen');
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 12, 'a note whose output was cut off is not lost');
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: `ok (Note #1 and Note #${big2} considered)` }).code, 10);
 });
 
 test('progress: attribution, notes hand-over, wait output and finished tasks', () => {
@@ -581,10 +688,12 @@ test('progress: attribution, notes hand-over, wait output and finished tasks', (
   assert.equal(r.code, 11);
   assert.match(r.out, /^still waiting — .*latest implementer progress: "reading the brief" \(\d+s ago\)/);
 
-  s.run(['note', '-i', 'use 2 decimals']);
+  const n = noteNum(s.run(['note', '-i', 'use 2 decimals']));
   r = s.run(['progress', 'writing code']);
   assert.match(r.out, /HUMAN NOTE[\s\S]*use 2 decimals/);
-  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0, 'a note shown via progress no longer blocks the submit');
+  assert.match(r.out, /acknowledge it as 'Note #N/);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 12, 'shown via progress is not handled (that output may have been discarded)');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${n} — done` }).code, 0);
 
   r = s.run(['wait', 'implementer', '--timeout', '1']);
   assert.match(r.out, /no progress update from the reviewer yet/);
@@ -746,7 +855,7 @@ test('a stale lock is broken only when its owner is gone', () => {
   fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} live`);
   let r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'collab.js'), 'note', 'hi'], {
     cwd: s.project, encoding: 'utf8', timeout: 4000,
-    env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0', COLLAB_TASK: '', COLLAB_LOCK_SECS: '1' },
+    env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0', COLLAB_TASK: '', COLLAB_LOCK_SECS: '1', ...NO_AGENT },
   });
   assert.ok(r.error && r.error.code === 'ETIMEDOUT', 'still waiting on a live owner');
   assert.ok(fs.existsSync(lock));
@@ -1498,7 +1607,7 @@ test("lessons: agents record them from handoffs, briefs carry them, end lists th
 
   const long = `- ${'y'.repeat(301)}`;
   r = s.run(['submit', 'implementer', 'ready'], {
-    input: `v1\n${CLOSEOUT}## Lessons\n- Tests on Windows need\n  forward slashes in globs\n- keep collab.js dependency-free.\n${long}\n- none\n`,
+    input: `v1 (Note #1 done)\n${CLOSEOUT}## Lessons\n- Tests on Windows need\n  forward slashes in globs\n- keep collab.js dependency-free.\n${long}\n- none\n`,
   });
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /lessons recorded: #2 in .*lessons\.md/);

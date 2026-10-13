@@ -5,7 +5,7 @@
 // Exit codes: 0 ok / your turn, 1 error, 10 task finished (DONE, ESCALATED,
 // ABORTED, STALLED) or, for 'join --after', the implementer ended the run,
 // 11 wait timed out (not your turn yet — just run it again),
-// 12 submit refused because the user added a note during your turn,
+// 12 submit refused because a note for you is not acknowledged ("Note #N") in your message,
 // 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
 // 14 submit refused because the task's --check command failed, 15 the queue is empty,
 // 16 the other agent asked the user to decide something — show them the options,
@@ -319,9 +319,17 @@ function addEntry(d, st, role, kind, body) {
     `\n---\n## #${pad3(st.seq)} · ${role} · ${kind} · round ${st.round} · ${nowIso()}\n\n${body}\n`);
 }
 
+// Notes: `NNN-human-note-<to>.md` (the user) or `NNN-peer-note-<to>.md` (the other agent, with
+// `collab note --from <role>`). Their target is all, implementer or reviewer.
+const NOTE_RE = /^\d+-(human|peer)-note-(all|implementer|reviewer)\.md$/;
+const noteTarget = (f) => { const m = NOTE_RE.exec(f); return m ? m[2] : null; };
+const isNoteFor = (f, role) => { const t = noteTarget(f); return t === 'all' || t === role; };
+
 function printEntry(d, name) {
   if (name.includes('-human-note-')) {
     out('!!! HUMAN NOTE — from the user, takes priority over the brief and the other agent !!!');
+  } else if (name.includes('-peer-note-')) {
+    out('>>> NOTE FROM THE OTHER AGENT — not from the user. Weigh it like a review item; the user\'s instructions come first. <<<');
   }
   out(`----- ${name} -----`);
   process.stdout.write(fs.readFileSync(path.join(entriesDir(d), name), 'utf8'));
@@ -329,14 +337,37 @@ function printEntry(d, name) {
   out('----- end -----');
 }
 
-// Human notes for <role> it has not been shown yet.
+// Notes for <role> it has not been shown yet.
 function pendingNotes(d, st, role) {
   const seen = st.seen && Number.isInteger(st.seen[role]) ? st.seen[role] : -1;
-  const re = new RegExp(`-human-note-(all|${role})\\.md$`);
-  return entriesAfter(d, seen).filter((f) => re.test(f));
+  return entriesAfter(d, seen).filter((f) => isNoteFor(f, role));
+}
+
+// Notes for <role> its handoff `body` does not acknowledge ("Note #N"). Being shown is not enough:
+// output an agent discards (e.g. progress piped to /dev/null) must never lose a note. Tasks from
+// before acknowledgements count what they were already shown as handled.
+function unackedNotes(d, st, role, body) {
+  const base = ackBase(st, role);
+  const named = new Set([...String(body).matchAll(/\bnote\s*#\s*0*(\d+)\b/gi)].map((m) => Number(m[1])));
+  return entriesAfter(d, base).filter((f) => isNoteFor(f, role) && !named.has(seqOf(f)));
+}
+
+// A task from before acknowledgements has no `acked`: its baseline is frozen, for BOTH roles, from
+// what each had been shown, before anything advances `seen` again. Notes shown before that stay
+// handled (the old rule); every later note must be acknowledged.
+function freezeAcked(st) {
+  if (st.acked) return;
+  const at = (role) => (st.seen && Number.isInteger(st.seen[role]) ? st.seen[role] : -1);
+  st.acked = { implementer: at('implementer'), reviewer: at('reviewer') };
+}
+
+function ackBase(st, role) {
+  if (st.acked) return Number.isInteger(st.acked[role]) ? st.acked[role] : -1;
+  return st.seen && Number.isInteger(st.seen[role]) ? st.seen[role] : -1;
 }
 
 function markSeen(st, role) {
+  freezeAcked(st);
   st.seen = st.seen || {};
   st.seen[role] = st.seq - 1;
 }
@@ -1017,7 +1048,7 @@ function runCheck(st) {
       if (timedOut) why = `timed out after ${CHECK_TIMEOUT}s`;
       else if (error) why = error.message;
       else if (code !== 0) why = `exit code ${code}`;
-      resolve({ ok: !why, cmd, secs, why, tail });
+      resolve({ ok: !why, cmd, secs, why, tail, output });
     };
     child.on('error', (e) => { error = e; finish(); });
     // 'close' waits for the output pipes; a background process that keeps them open
@@ -1027,12 +1058,21 @@ function runCheck(st) {
   });
 }
 
-function printCheck(res) {
+function printCheck(res, d) {
   if (res.ok) {
     out(`CHECK PASSED: \`${res.cmd}\` (${res.secs}s)`);
     return;
   }
-  out(`CHECK FAILED: \`${res.cmd}\` — ${res.why} (${res.secs}s). Last lines of output:`);
+  // The whole output (its last 256 KB) is kept: an intermittent failure can still be diagnosed.
+  let saved = '';
+  if (d) {
+    try {
+      const file = path.join(scratchDir(d), `check-failed-${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
+      fs.writeFileSync(file, `$ ${res.cmd}\n${res.why}\n\n${res.output || ''}`);
+      saved = file;
+    } catch { /* best effort */ }
+  }
+  out(`CHECK FAILED: \`${res.cmd}\` — ${res.why} (${res.secs}s).${saved ? ` Full output: ${saved}` : ''} Last lines:`);
   out(res.tail || '(no output)');
 }
 
@@ -1165,7 +1205,7 @@ function cmdInit(args) {
     id, project_dir: dir, repos,
     phase: plan ? 'plan' : 'build', status: plan ? 'PLANNING' : 'IMPLEMENTING',
     turn: 'implementer', round: 1, plan_round: 1, max_rounds: max, seq: 0,
-    seen: { implementer: 0, reviewer: -1 },
+    seen: { implementer: 0, reviewer: -1 }, acked: { implementer: -1, reviewer: -1 },
     created_at: now, created_epoch: ep, created_ms: createdMs, updated_at: now, updated_epoch: ep, updated_by: 'implementer',
     turn_since: ep, options,
   };
@@ -1317,7 +1357,7 @@ async function cmdWait(args) {
       // Everything since my last own entry: the other agent's message plus any human notes.
       // Mark it seen before printing, so a reader that closes the pipe early can't lose that.
       const mine = listEntries(d).filter((f) => roleOf(f) === role).slice(-1)[0];
-      let fresh = entriesAfter(d, mine ? seqOf(mine) : -1).filter((f) => !f.endsWith(`-human-note-${other}.md`));
+      let fresh = entriesAfter(d, mine ? seqOf(mine) : -1).filter((f) => !noteTarget(f) || isNoteFor(f, role));
       if (!fresh.length) fresh = [latestEntry(d)];
       withLock(d, () => update(d, (s) => markSeen(s, role)));
       out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
@@ -1446,7 +1486,7 @@ async function cmdSubmit(args) {
     const res = await runCheck(pre);
     if (!res.ok) {
       out('NOT SUBMITTED: the task check failed. Fix it and submit again (or escalate if it cannot pass).');
-      printCheck(res);
+      printCheck(res, d);
       exit(EXIT_CHECK);
     }
     body += `\n\n> collab: check passed: \`${res.cmd}\` (${res.secs}s)\n`;
@@ -1477,9 +1517,9 @@ async function cmdSubmit(args) {
     if (isTerminal(st.status)) die(`task already finished (${st.status})`);
     if (kind !== 'escalate' && st.turn !== role) die(`not your turn (${role}); current turn: ${st.turn}, status: ${st.status}`);
 
-    // A note the user added during this turn must be handled before handing off.
+    // Every note for this agent since its last handoff must be acknowledged ("Note #N") in it.
     if (kind !== 'escalate') {
-      const pending = pendingNotes(d, st, role);
+      const pending = unackedNotes(d, st, role, body);
       if (pending.length) {
         update(d, (s) => markSeen(s, role));
         return { pending };
@@ -1511,13 +1551,17 @@ async function cmdSubmit(args) {
         if (s.decision && s.decision.seq === undefined) {
           Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
         }
+        freezeAcked(s);
+        if (kind !== 'escalate') s.acked = { ...s.acked, [role]: s.seq };
         s.seq += 1; s.updated_by = role; s.turn_since = epoch();
       }),
     };
   });
 
   if (result.pending) {
-    out('NOT SUBMITTED: the user added note(s) during your turn. Address them, then submit again with your full, updated message.');
+    const nums = result.pending.map((f) => `Note #${seqOf(f)}`).join(', ');
+    out(`NOT SUBMITTED: ${nums} ${result.pending.length > 1 ? 'are' : 'is'} not acknowledged in your message. Handle each, add a line`);
+    out("'Note #N — what you did' (under ## Review responses), then submit again with your full, updated message.");
     for (const f of result.pending) printEntry(d, f);
     exit(EXIT_NOTES);
   }
@@ -1566,26 +1610,48 @@ async function cmdSubmit(args) {
   if (isTerminal(st.status)) exit(EXIT_TERMINAL);
 }
 
+// An agent running `collab note` would otherwise be recorded as the user: agents pass --from.
+function agentShell() {
+  const e = process.env;
+  // Claude Code sets CLAUDECODE=1 in its shells; Codex sets CODEX_THREAD_ID / CODEX_SESSION_ID in
+  // every session (its sandbox variables only when sandboxed). COLLAB_AGENT=1 marks any other agent.
+  return e.CLAUDECODE === '1' || !!e.COLLAB_AGENT || !!e.CODEX_THREAD_ID || !!e.CODEX_SESSION_ID
+    || !!e.CODEX_SANDBOX || !!e.CODEX_SANDBOX_NETWORK_DISABLED;
+}
+
 function cmdNote(args) {
   const { opts, rest } = takeOpts(args, {
-    values: { '--to': 'to', '--file': 'file', '-f': 'file' },
-    flags: { '--implementer': { to: 'implementer' }, '-i': { to: 'implementer' }, '--reviewer': { to: 'reviewer' }, '-r': { to: 'reviewer' } },
+    values: { '--to': 'to', '--file': 'file', '-f': 'file', '--from': 'from' },
+    flags: {
+      '--implementer': { to: 'implementer' }, '-i': { to: 'implementer' }, '--reviewer': { to: 'reviewer' }, '-r': { to: 'reviewer' },
+      '--as-user': { asUser: true },
+    },
   });
-  const to = opts.to || 'all';
+  if (opts.from && !ROLES.includes(opts.from)) die('--from must be implementer or reviewer');
+  if (opts.from && opts.asUser) die('--from and --as-user exclude each other');
+  if (!opts.from && !opts.asUser && agentShell()) {
+    die('collab note records a note FROM THE USER. An agent passes its role: collab note --from reviewer "…"'
+      + ' (it reaches the other agent, labelled as yours). If you are the user typing inside an agent session, add --as-user.');
+  }
+  const other = opts.from === 'implementer' ? 'reviewer' : 'implementer';
+  const to = opts.from ? (opts.to || other) : (opts.to || 'all');
   if (!['all', ...ROLES].includes(to)) die('--to must be implementer or reviewer');
+  if (opts.from && to !== other) die(`a note from the ${opts.from} goes to the ${other}`);
   const d = taskDir();
   const text = rest.join(' ');
-  const body = text && !opts.file ? `${text}\n` : readBody(opts.file);
+  let body = text && !opts.file ? `${text}\n` : readBody(opts.file);
+  if (opts.from) body = `From: the ${opts.from} (mid-turn feedback; not from the user)\n\n${body}`;
 
   const res = withLock(d, () => {
     const st = readState(d);
     if (isTerminal(st.status)) die(`task already finished (${st.status}) — start a new task instead`);
     const seq = st.seq;
-    addEntry(d, st, 'human', `note-${to}`, body);
-    const nst = update(d, (s) => { s.seq += 1; s.updated_by = 'human'; });
+    addEntry(d, st, opts.from ? 'peer' : 'human', `note-${to}`, body);
+    const nst = update(d, (s) => { s.seq += 1; s.updated_by = opts.from || 'human'; });
     return { seq, turn: nst.turn };
   });
-  out(`note #${res.seq} added for ${to} (turn: ${res.turn}). It is delivered at that agent's next turn start, or blocks its next handoff until handled.`);
+  out(`note #${res.seq} ${opts.from ? `from the ${opts.from} ` : ''}added for ${to} (turn: ${res.turn}). It is delivered at that agent's`
+    + " next turn start or progress update, and its next handoff is refused until it acknowledges 'Note #" + res.seq + "'.");
 }
 
 function cmdProgress(args) {
@@ -1606,7 +1672,7 @@ function cmdProgress(args) {
   });
   out(`progress (${res.p.role}): ${res.p.text}`);
   if (res.pending.length) {
-    out('The user added note(s) during your turn. Handle them before you hand off:');
+    out("Note(s) arrived during your turn. Handle each and acknowledge it as 'Note #N — …' in your next handoff (it is refused otherwise):");
     for (const f of res.pending) printEntry(d, f);
   }
 }
@@ -1619,7 +1685,7 @@ async function cmdCheck() {
     return;
   }
   const res = await runCheck(st);
-  printCheck(res);
+  printCheck(res, d);
   if (!res.ok) exit(EXIT_CHECK);
 }
 
@@ -2609,7 +2675,10 @@ function usage() {
 ${B}FOR YOU (the human)${R}
   ${C}watch${R} [--interval S]        Interactive dashboard: steps (↑↓), tasks (←→), live progress
   ${C}note${R} "text" [-i | -r]       Steer a running task (default: both agents;
-                              -i/--implementer or -r/--reviewer for just one)
+                              -i/--implementer or -r/--reviewer for just one).
+                              Agents: --from <role> (to the other agent, never
+                              as the user). Each note must be acknowledged as
+                              "Note #N" in its target's next handoff
   ${C}status${R}                      One-shot summary of the current task
   ${C}log${R}                         Full history: brief, summaries, reviews, notes
   ${C}show${R} [N]                    Print entry #N (default: the latest one)
@@ -2666,7 +2735,7 @@ ${B}START A SESSION${R}
   Codex:        $Collab implement   ·  $Collab review
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
-Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 new note · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 17 tree changed since review/approval · 1 error${R}`);
+Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 note not acknowledged · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 17 tree changed since review/approval · 1 error${R}`);
 }
 
 // --- main -------------------------------------------------------------------

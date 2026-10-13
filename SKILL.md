@@ -74,7 +74,8 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
 - In PowerShell, read a command's exit code from `$LASTEXITCODE`.
 - Exit codes: `0` = OK / your turn, `10` = task finished (DONE, ESCALATED, ABORTED, STALLED),
   `11` = wait timed out and it's still not your turn (just run the same command again),
-  `12` = submit refused because the user added a note during your turn (see below),
+  `12` = submit refused because a note for you (from the user, or from the other agent) is not
+  acknowledged as `Note #N` in your message (see *Notes*),
   `13` = the other agent looks unresponsive (see below),
   `14` = submit refused because the task's `--check` failed, `15` = the queue is empty,
   `16` = the user has to choose: the other agent asked, or the round limit was reached (see
@@ -130,15 +131,26 @@ got a desktop notification.
   Then run `collab -t <id> snooze 30` and go back to waiting. After 2 hours without a handoff, the
   task ends by itself (`STALLED`).
 
-## Human notes (the user steering a running task)
+## Notes (the user steering a running task, or the other agent mid-turn)
 
 The user can add a note at any time with `collab note "…"`. Notes show up as
-`!!! HUMAN NOTE` entries, either in your `wait` output or as a refused submit (exit 12).
+`!!! HUMAN NOTE` entries in your `wait` or `progress` output, or in a refused submit (exit 12).
 - A human note **takes priority** over the brief and over the other agent's feedback.
-- Implementer: act on it, and list it under `## Review responses` as `Note #N — done / how`.
-- Reviewer: take it into account, and check that the implementer followed earlier notes.
-- On exit 12, nothing was submitted. Handle the note, then submit again with your **full,
+- **Acknowledge every note addressed to you in your next handoff**, as a line `Note #N — what you
+  did` (implementer: under `## Review responses`; reviewer: anywhere in the review). The CLI
+  refuses a submit (exit 12) that leaves a note for you unacknowledged, even one you were already
+  shown: output you discarded (e.g. a `progress` call piped to `/dev/null`) never loses a note.
+- Implementer: act on it. Reviewer: take it into account, and check that the implementer followed
+  earlier notes.
+- On exit 12, nothing was submitted. Handle the listed notes, then submit again with your **full,
   updated** message (not just a diff of it).
+
+**Never post a note as the user.** To flag something to the other agent outside a handoff (e.g. a
+reviewer's early finding while the implementer is still working), use
+`collab -t <id> note --from <your role> "…"`. It goes to the other agent, shown as
+`>>> NOTE FROM THE OTHER AGENT` (not from the user), and it must be acknowledged like any note.
+A plain `collab note` from an agent's shell is refused. Prefer putting findings in your handoff;
+use `--from` only when waiting would waste the other agent's work.
 
 ## Progress updates while it's your turn
 
@@ -156,8 +168,9 @@ collab -t <id> progress "fixing item 2: missing null check in parser.ts"
 - Keep it short and concrete (under ~80 characters): *what* you're doing, not how you feel.
 - It isn't a handoff: it doesn't pass the turn or add a timeline entry. It does count as a sign
   of life, so a long but active turn won't be flagged as unresponsive.
-- If its output shows a `!!! HUMAN NOTE`, the user added a note during your turn. Handle it
-  like any other note (see *Human notes*).
+- If its output shows a note (`!!! HUMAN NOTE` or `>>> NOTE FROM THE OTHER AGENT`), handle it like
+  any other note and acknowledge it in your next handoff (see *Notes*). Don't send progress output
+  to `/dev/null` if you can avoid it: that is where mid-turn notes arrive.
 - When `wait` times out (exit 11), its output includes the other agent's latest progress. A
   recent update means the wait is normal, so just keep waiting.
 
@@ -454,7 +467,9 @@ report to the user.
 ## Human controls
 
 - `collab watch`: interactive dashboard: ↑↓ steps in full, ←→ earlier tasks, live progress, timers
-- `collab note "…"`: steer a running task (add `--implementer` or `--reviewer` to target one agent)
+- `collab note "…"`: steer a running task (add `--implementer` or `--reviewer` to target one agent).
+  Agents use `collab note --from <their role> "…"` (see *Notes*); every note must be acknowledged
+  as `Note #N` in the target's next handoff.
 - `collab answer <N | text>`: answer a pending decision
 - `collab status`, `collab log`, `collab list`, `collab abort` (stops both loops)
 - `collab snooze [MIN]`: keep waiting on a slow agent; `collab clean`: delete finished tasks
