@@ -116,6 +116,6 @@ tolerant of slow CI runners.
 ## Install / distribution
 
 `install.sh` / `install.ps1` only create links (symlinks on Unix, directory junctions on Windows) from
-`~/.agents/skills/Collab` and `~/.claude/skills/Collab` to the repo, and put `collab` in `~/.local/bin`,
+`~/.agents/skills/collab` and `~/.claude/skills/collab` to the repo, and put `collab` in `~/.local/bin`,
 so edits in this repo are live for installed agents. They must also handle the `npx skills add` layout,
 where the repo itself already lives in `~/.agents/skills/`. `package.json` `files` controls what ships.

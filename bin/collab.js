@@ -2698,7 +2698,7 @@ ${B}FOR YOU (the human)${R}
   ${C}path${R}                        Folder holding the current task's files
   ${C}help${R}                        This screen
 
-${B}TASK OPTIONS${R} ${D}(for queue add, init, or /Collab implement …)${R}
+${B}TASK OPTIONS${R} ${D}(for queue add, init, or /collab implement …)${R}
   --plan                      Reviewer approves a plan before any code
   --check "npm test"          Must pass before every handoff (collab runs it)
   --scope "src/auth/**"       Files the task may change; collab diff flags the rest
@@ -2731,8 +2731,8 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
                               the user to pick a numbered option (--self: I ask them myself)
 
 ${B}START A SESSION${R}
-  Claude Code:  /Collab implement   ·  /Collab review     ${D}(add --plan to plan first)${R}
-  Codex:        $Collab implement   ·  $Collab review
+  Claude Code:  /collab implement   ·  /collab review     ${D}(add --plan to plan first)${R}
+  Codex:        $collab implement   ·  $collab review
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
 Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 note not acknowledged · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 17 tree changed since review/approval · 1 error${R}`);

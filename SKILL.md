@@ -1,5 +1,5 @@
 ---
-name: Collab
+name: collab
 description: Autonomous implementer/reviewer loop between two coding agents (e.g. Claude Code and Codex CLI) coordinated through the shared `collab` CLI in ~/.collab. Use when the user says "collab implement", "collab review", "collab 1" (implementer) or "collab 0" (reviewer).
 ---
 
@@ -36,7 +36,7 @@ directory. If it shows a queued task, take it (see *Queued tasks*). If the queue
 (exit 15), reply only with "Collab implementer ready, what should I build?" and end your turn.
 Treat the user's next message as the task and start the implementer loop from step 1.
 
-**Task options** can come with the request, e.g. `/Collab implement --plan --check "npm test" add
+**Task options** can come with the request, e.g. `/collab implement --plan --check "npm test" add
 dark mode`. Pass them straight to `collab init`:
 
 | Option | Meaning |
@@ -216,7 +216,7 @@ you to stop, they will interrupt you.
    ```
    The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
    shows only what changed during this task. Tell the user the task id and that the reviewer can now
-   be started with `collab review` (Claude Code: `/Collab review`, Codex: `$Collab review`),
+   be started with `collab review` (Claude Code: `/collab review`, Codex: `$collab review`),
    and that they can watch live with `collab watch` and steer with `collab note "…"`.
    If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
    If the request has several stages (a staged plan, a list of deliverables) or is too big for
@@ -272,7 +272,7 @@ you to stop, they will interrupt you.
      Then stop, and give the user that report (`collab -t <id> show`), all of it included.
    - **ESCALATED, STALLED or ABORTED:** stop. Give the user a short report and explain what needs
      a decision. **Don't start queued tasks**: the queue waits until the user runs
-     `/Collab implement` again.
+     `/collab implement` again.
 
 ## Queued tasks
 

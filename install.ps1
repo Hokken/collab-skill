@@ -11,9 +11,9 @@ $ErrorActionPreference = 'Stop'
 
 $Repo       = $PSScriptRoot
 $UserHome   = $env:USERPROFILE
-$SkillLink  = Join-Path $UserHome '.agents\skills\Collab'
-$ClaudeLink = Join-Path $UserHome '.claude\skills\Collab'
-$CodexLink  = Join-Path $UserHome '.codex\skills\Collab'
+$SkillLink  = Join-Path $UserHome '.agents\skills\collab'
+$ClaudeLink = Join-Path $UserHome '.claude\skills\collab'
+$CodexLink  = Join-Path $UserHome '.codex\skills\collab'
 $Bin        = Join-Path $UserHome '.local\bin'
 $CollabHome = if ($env:COLLAB_HOME) { $env:COLLAB_HOME } else { Join-Path $UserHome '.collab' }
 $Backups    = Join-Path $CollabHome 'backups'   # outside any skills folder, so no duplicate skill

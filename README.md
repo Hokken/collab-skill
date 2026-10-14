@@ -35,10 +35,10 @@ You get a notification when it's done, or when they need you.
 ## How it feels
 
 ```text
-You ▸ /Collab implement            (in Claude Code)
+You ▸ /collab implement            (in Claude Code)
      "Add input validation to the signup form, with tests."
 
-You ▸ $Collab review               (in Codex, another terminal)
+You ▸ $collab review               (in Codex, another terminal)
 
   #000  implementer  brief     Add input validation to the signup form…
   #001  implementer  ready     Added zod schema, 9 tests, all passing
@@ -115,8 +115,8 @@ npx skills add Hokken/collab-skill -g --agent claude-code codex
 On Windows, run `~\.agents\skills\collab\install.ps1` for the second step. Update later with
 `npx skills update`.
 
-The git installer links the skill into `~/.agents/skills/Collab` (Codex) and
-`~/.claude/skills/Collab` (Claude Code), and puts a `collab` command on your PATH. It only creates
+The git installer links the skill into `~/.agents/skills/collab` (Codex) and
+`~/.claude/skills/collab` (Claude Code), and puts a `collab` command on your PATH. It only creates
 links, so **updating is just `git pull`**. Windows users: see [docs/windows.md](docs/windows.md)
 for a few tips.
 
@@ -137,7 +137,7 @@ and Claude Code as the implementer.
 2. **Start the reviewer in terminal 1.** Launch Codex CLI, then send this message in its chat:
 
    ```text
-   $Collab review
+   $collab review
    ```
 
    The reviewer will wait for the implementer to create a task. Leave it running.
@@ -146,10 +146,10 @@ and Claude Code as the implementer.
    its chat, replacing the example task with your own:
 
    ```text
-   /Collab implement Add input validation to the signup form, with tests.
+   /collab implement Add input validation to the signup form, with tests.
    ```
 
-   You don't have to include the task in the initial command. You can send `/Collab implement`
+   You don't have to include the task in the initial command. You can send `/collab implement`
    on its own, wait for the agent to ask what to build, then describe your task in your next
    message. (If you already have queued tasks, it starts the first one instead.)
 
@@ -165,14 +165,14 @@ and Claude Code as the implementer.
    Use ↑↓ to browse steps, ←→ for earlier tasks, and `q` to leave the dashboard. When the task
    finishes or needs your input, Collab notifies you and the agents report back.
 
-You can swap the roles: use `/Collab review` in Claude Code and `$Collab implement` followed by
+You can swap the roles: use `/collab review` in Claude Code and `$collab implement` followed by
 your task in Codex.
 
 > 💡 Let the agents run without permission prompts (e.g. Claude Code's auto mode, or allow
 > `Bash(collab:*)`), otherwise every handoff stops to ask you.
 
 Want the approach agreed first? Add `--plan` before your task in step 3, for example:
-`/Collab implement --plan Add input validation to the signup form, with tests.`
+`/collab implement --plan Add input validation to the signup form, with tests.`
 
 ## Queue up a morning's work
 
@@ -182,7 +182,7 @@ collab queue add --plan --focus security --scope "src/auth/**" --check "npm test
 collab queue add --confirm "Run the DB migration for user roles"
 ```
 
-Then start the pair as usual, with `/Collab implement` and no task. The implementer takes the first
+Then start the pair as usual, with `/collab implement` and no task. The implementer takes the first
 queued task. When it's done, it moves on to the next one, and the reviewer follows. If a task gets
 escalated, the queue pauses until you've had a look. You can add tasks any time, even while they
 work.
@@ -200,7 +200,7 @@ work.
 | `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
 | `--first` | Put it at the front of the queue |
 
-The same options work for a single task: `/Collab implement --check "npm test" fix the login redirect`.
+The same options work for a single task: `/collab implement --check "npm test" fix the login redirect`.
 Manage the queue with `collab queue` (list), `collab queue rm 2`, `collab queue move 3 1` and
 `collab queue clear`.
 
@@ -251,7 +251,7 @@ committing. The final report lists the lessons recorded during the run, so you c
 
 ### Phone notifications
 
-Off unless you ask: add `--phone` to a task (`/Collab implement --phone …` or
+Off unless you ask: add `--phone` to a task (`/collab implement --phone …` or
 `collab queue add --phone …`). You then get a push when a decision is waiting for you, a task is
 escalated or stalls, an agent looks unresponsive, a confirm-first queued task needs your go-ahead,
 and when the whole run is done. Ordinary handoffs don't notify you. The rest of the run keeps

@@ -4,8 +4,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_LINK="$HOME/.agents/skills/Collab"        # Codex reads ~/.agents/skills
-CLAUDE_LINK="$HOME/.claude/skills/Collab"
+SKILL_LINK="$HOME/.agents/skills/collab"        # Codex reads ~/.agents/skills
+CLAUDE_LINK="$HOME/.claude/skills/collab"
 BIN="$HOME/.local/bin"
 BACKUPS="${COLLAB_HOME:-$HOME/.collab}/backups" # outside any skills folder, so no duplicate skill
 

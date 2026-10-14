@@ -167,7 +167,7 @@ works on it.
 
 ## Phone notifications
 
-Off unless a task has `--phone` (`init`, `queue add`, or the `/Collab implement` request). The
+Off unless a task has `--phone` (`init`, `queue add`, or the `/collab implement` request). The
 next task started after an approved one (`DONE`, run not ended) keeps it, so one flag covers a
 split, a queue or a staged plan. After `collab end`, an escalation, an abort or a stall, a new
 task needs the flag again. Queued items carry it like any other option.

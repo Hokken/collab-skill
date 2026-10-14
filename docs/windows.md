@@ -14,8 +14,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 The installer:
 
 - links the skill with **directory junctions** (no admin rights or Developer Mode needed):
-  - `%USERPROFILE%\.agents\skills\Collab` → the repo (Codex reads this folder)
-  - `%USERPROFILE%\.claude\skills\Collab` → the repo (Claude Code)
+  - `%USERPROFILE%\.agents\skills\collab` → the repo (Codex reads this folder)
+  - `%USERPROFILE%\.claude\skills\collab` → the repo (Claude Code)
 - adds two small shims in `%USERPROFILE%\.local\bin`: `collab.cmd` for PowerShell and cmd, and
   `collab` for Git Bash;
 - asks before adding `%USERPROFILE%\.local\bin` to your user PATH.
