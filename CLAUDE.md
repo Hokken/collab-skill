@@ -42,6 +42,9 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   `process.exit` directly.
 - **Task resolution**: `taskDir()` picks the task from `-t`, then `$COLLAB_TASK`, then the newest
   active (else newest) task for the current project (`latestTask(cwd)`), then `$COLLAB_HOME/current`.
+  `join` never uses `current`: without `-t`/`$COLLAB_TASK` it takes the folder's project
+  (`joinableTask`, exit 1 when a parent folder matches several active projects) and refuses a task
+  whose reviewer claim is live (`reviewer.seen` heartbeat, `touchReviewer`/`liveReviewer`) unless `--force`.
   Folders are the same project when one contains the other (`sameProject`; used by `projectTasks`
   and the queue), so a repo root and a module inside it share tasks. A project's tasks are ordered
   by `created_ms` (strictly increasing per project; older tasks fall back to `created_epoch`). `init` allows one
@@ -60,7 +63,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   non-terminal `DECISION` status with `turn: 'human'` and saves the previous status/turn in
   `st.decision`. `cmdAnswer` restores them. The other agent's `wait` returns exit 16 once (unless
   `--self`), and idle/stall checks are skipped meanwhile. Hitting the round limit makes a
-  `kind: 'limit'` decision (`LIMIT_OPTIONS`, shown to both agents) instead of escalating.
+  `kind: 'limit'` decision (`LIMIT_OPTIONS`, presented by the implementer; `decisionPresenter` names the one agent that shows a decision) instead of escalating.
 - **Runs**: after DONE the reviewer waits in `join --after <id>`, which follows the project's newest
   task. `cmdEnd` sets `st.ended` on the last DONE task (`join --after` then exits 10) and collects
   the run's user answers and `## Decisions taken` sections (`collectDecisions`).

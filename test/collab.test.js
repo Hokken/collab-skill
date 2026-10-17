@@ -110,6 +110,67 @@ test('init refuses while a task is active unless --force', () => {
   assert.equal(r.code, 0);
 });
 
+test('pairs stay apart: join takes only its own project, and one reviewer per task', () => {
+  const s = sandbox();
+  const [a, b, empty] = ['a', 'b', 'empty'].map((n) => path.join(s.project, n));
+  for (const dir of [a, b, empty]) fs.mkdirSync(dir);
+  const init = (cwd, slug) => {
+    const r = s.run(['init', slug], { input: 'b', cwd });
+    assert.match(r.out, new RegExp(`^reviewer: /collab review ${slug}-\\S+ {2}\\(Codex: \\$collab review ${slug}-`, 'm'));
+    return r.out.match(/^task:\s+(\S+)/m)[1];
+  };
+  const ta = init(a, 'task-a');
+  const tb = init(b, 'task-b');
+
+  let r = s.run(['join', '--timeout', '1'], { cwd: empty });
+  assert.equal(r.code, 11, "a folder without tasks waits; it never falls back to another project's last task");
+  r = s.run(['join', '--timeout', '1'], { cwd: s.project });
+  assert.equal(r.code, 1, 'a parent folder of two active projects is ambiguous');
+  assert.match(r.err, /several projects[\s\S]*task-a-[\s\S]*task-b-/);
+  assert.match(s.run(['-t', 'nope', 'join', '--timeout', '1']).err, /task not found: nope/);
+
+  r = s.run(['join', '--timeout', '1'], { cwd: a });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, new RegExp(`joined task: ${ta}`));
+  r = s.run(['join', '--timeout', '1'], { cwd: a });
+  assert.equal(r.code, 1, 'a second reviewer is refused');
+  assert.match(r.err, new RegExp(`task ${ta} \\(project [^)]*\\) already has a reviewer, last active \\d+s ago[\\s\\S]*collab -t ${ta} join --force`));
+  assert.equal(s.run(['-t', ta, 'join', '--force', '--timeout', '1']).code, 0, '--force takes over');
+  assert.match(s.run(['-t', tb, 'join', '--timeout', '1']).out, new RegExp(`joined task: ${tb}`), '-t pairs with that task');
+
+  // The reviewer's waits keep its claim fresh.
+  const seen = path.join(s.home, 'tasks', ta, 'reviewer.seen');
+  const old = new Date(Date.now() - 3600e3);
+  fs.utimesSync(seen, old, old);
+  s.run(['-t', ta, 'wait', 'reviewer', '--timeout', '1']);
+  assert.ok(Date.now() - fs.statSync(seen).mtimeMs < 60e3, 'wait refreshes the claim');
+});
+
+test('two reviewers joining at once: exactly one gets the task', async () => {
+  const s = sandbox();
+  s.run(['init', 'race'], { input: 'b' });
+  const env = { ...process.env, COLLAB_HOME: s.home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0', COLLAB_TASK: '', ...NO_AGENT };
+  const join = () => new Promise((resolve) => {
+    const c = require('child_process').spawn(process.execPath, [CLI, 'join', '--timeout', '1'], { cwd: s.project, env, stdio: 'ignore' });
+    c.on('close', resolve);
+  });
+  for (let i = 0; i < 3; i++) {
+    fs.rmSync(path.join(s.taskDir(), 'reviewer.seen'), { force: true });
+    const codes = (await Promise.all([join(), join()])).sort();
+    assert.deepEqual(codes, [0, 1], `attempt ${i + 1}`);
+  }
+});
+
+test('a stale reviewer claim lets a new reviewer join', async () => {
+  const s = sandbox({ COLLAB_IDLE_SECS: '1' });
+  s.run(['init', 'stale'], { input: 'b' });
+  assert.equal(s.run(['join', '--timeout', '1']).code, 0);
+  await pause(1500);
+  const r = s.run(['join', '--timeout', '1']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /joined task: stale-/);
+});
+
 test('the round limit asks the user: more rounds, approve, or stop', () => {
   const s = sandbox();
   const toLimit = (slug) => {
@@ -121,14 +182,15 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
   };
   let r = toLimit('a-more');
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /Round limit reached \(2 review rounds\)[\s\S]*exit 16/);
+  assert.match(r.out, /Round limit reached \(2 review rounds\)[\s\S]*the implementer presents the options, don't ask the user yourself/);
   assert.equal(s.state().status, 'DECISION');
   assert.equal(s.state().round, 2, 'no round counter overflow');
-  for (const role of ['implementer', 'reviewer']) {
-    r = s.run(['wait', role, '--timeout', '1']);
-    assert.equal(r.code, 16, `${role} can show the menu`);
-    assert.match(r.out, /round limit is reached[\s\S]*1\. still broken[\s\S]*1\. Give them 2 more rounds[\s\S]*3\. Stop the task/);
-  }
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.equal(r.code, 11, 'only the implementer presents the menu');
+  assert.match(r.out, /the implementer presents the round-limit question to the user; don't ask the user about it yourself/);
+  r = s.run(['wait', 'implementer', '--timeout', '1']);
+  assert.equal(r.code, 16, 'the implementer shows the menu');
+  assert.match(r.out, /round limit is reached[\s\S]*1\. still broken[\s\S]*1\. Give them 2 more rounds[\s\S]*3\. Stop the task/);
   assert.match(s.run(['answer', '1.']).out, /back to the implementer \(status: CHANGES_REQUESTED\)/);
   assert.equal(s.state().round, 3);
   assert.equal(s.state().max_rounds, 4);
@@ -1110,7 +1172,9 @@ test('decide: the user picks an option, the turn returns to the asker, and the e
   r = s.run(['wait', 'implementer', '--timeout', '1']);
   assert.equal(r.code, 11, 'shown once, and no idle or stall while the user decides');
   assert.match(r.out, /has not answered/);
-  assert.equal(s.run(['wait', 'reviewer', '--timeout', '1']).code, 11, 'the asker waits for the answer');
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.equal(r.code, 11, 'the asker waits for the answer');
+  assert.match(r.out, /the implementer presents the reviewer's question to the user; don't ask the user about it yourself/);
   assert.equal(s.state().status, 'DECISION');
   assert.match(s.run(['watch', '--once']).out, /your decision: Drop stale replies or strip the snapshot\?/);
 
@@ -1135,7 +1199,9 @@ test('decide --self: the asker presents the options, so the other agent keeps wa
   s.run(['init', 'self'], { input: 'b' });
   const r = s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
   assert.match(r.out, /Ask the user now/);
-  assert.equal(s.run(['wait', 'reviewer', '--timeout', '1']).code, 11);
+  const w = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.equal(w.code, 11);
+  assert.match(w.out, /the implementer presents the implementer's question to the user; don't ask the user about it yourself/);
   assert.match(s.run(['answer', 'neither, do c']).out, /back to the implementer \(status: IMPLEMENTING\)/);
   assert.match(fs.readFileSync(path.join(s.taskDir(), 'log.md'), 'utf8'), /## User decision\nneither, do c/);
 });

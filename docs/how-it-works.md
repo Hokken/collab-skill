@@ -39,15 +39,16 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   and in a `--plan` task's build phase, which entry is the approved plan. Both come from `entries/`:
   the plan approval is the only reviewer `approve` of an unfinished task, so it separates the phases.
 - **Round limits:** a `changes` beyond `max_rounds` (or the plan rounds) becomes a `DECISION`
-  for the user, shown to both agents: `1` gives 2 more rounds and passes the review on, `2`
-  approves (`DONE`), `3` stops (`ESCALATED`). An answer in the user's own words counts as `1`, and
-  the implementer gets the words.
+  for the user, presented by the implementer (its `wait` returns 16; the reviewer keeps waiting):
+  `1` gives 2 more rounds and passes the review on, `2` approves (`DONE`), `3` stops
+  (`ESCALATED`). An answer in the user's own words counts as `1`, and the implementer gets the words.
 - **Decisions:** the agent holding the turn can `submit <role> decide` a question with numbered
   options. The task goes to `DECISION` (turn: `human`) until someone runs `collab answer <N | text>`.
   Then it returns to the status and turn it came from, and the asker gets the answer. The other
   agent's `wait` returns 16 once, so a Claude Code agent can show the options as an interactive
-  choice. With `--self`, the asker shows them itself and the other agent keeps waiting. No idle or
-  stall checks run while the user decides.
+  choice. With `--self`, the asker shows them itself and the other agent keeps waiting. Exactly one
+  agent presents each decision (`decisionPresenter`), so the user answers in one place; the other
+  agent's `wait` timeouts tell it not to ask. No idle or stall checks run while the user decides.
 
 ## Runs: from one request to the end
 
@@ -78,6 +79,13 @@ previous `end` in that project.
   this, so agents started from different levels of the same tree still find each other. Unrelated
   folders, siblings included, stay separate. When several tasks match, the newest active one is
   the default.
+- **Pairs stay apart:** `init` prints `reviewer: /collab review <task-id>`, and a reviewer started
+  with a task id joins with `collab -t <task-id> join`. A bare `join` only looks at the folder's
+  project (no fallback to `$COLLAB_HOME/current`, the last task started anywhere), and refuses
+  (exit 1, listing them) when the folder contains several projects with an active task. Each task
+  has one reviewer: `join` writes `tasks/<id>/reviewer.seen`, whose mtime the reviewer's `wait`,
+  `progress` and `submit` refresh. While it is live (within `COLLAB_IDLE_SECS`, or the reviewer
+  holds the turn and isn't idle), another `join` is refused (exit 1); `join --force` takes over.
 - `collab queue next` shows the first item for the current folder. `collab init <slug> --from-queue`
   removes it and applies its options (flags given to `init` override them).
 - When a task ends `DONE` and more items are waiting, `wait` and the reviewer's `approve` print a
@@ -224,7 +232,7 @@ Agents branch on these, so they are part of the protocol:
 | `13` | the other agent looks unresponsive; ask the user whether to stop or keep waiting |
 | `14` | submit refused: the task's `--check` command failed |
 | `15` | the queue has no task for this project |
-| `16` | the other agent asked the user to decide; show them the options, record the answer with `collab answer` |
+| `16` | the user has to decide (the other agent asked, or the round limit for the implementer) and you present it; show them the options, record the answer with `collab answer` |
 | `17` | the project files changed since the review (`approve` refused; inspect, then `approve --rereviewed`) or since the approval (`collab verify`; don't commit) |
 
 ## Notes

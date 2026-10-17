@@ -29,7 +29,9 @@ Read the argument from the user's message:
 | `review`, `0`          | **reviewer**    |
 
 Anything after the role (e.g. `collab implement add dark mode to the tarot app`) is the
-task for the implementer. If the role is missing, ask the user once, then continue on your own.
+task for the implementer. For the reviewer, a task id after the role (e.g.
+`collab review dark-mode-20260926-120000`, as `init` prints it) pairs you with that task: join it
+with `collab -t <task-id> join`. If the role is missing, ask the user once, then continue on your own.
 
 If you are the implementer and no task was given, first run `collab queue next` from the project
 directory. If it shows a queued task, take it (see *Queued tasks*). If the queue is empty
@@ -78,9 +80,9 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   acknowledged as `Note #N` in your message (see *Notes*),
   `13` = the other agent looks unresponsive (see below),
   `14` = submit refused because the task's `--check` failed, `15` = the queue is empty,
-  `16` = the user has to choose: the other agent asked, or the round limit was reached (see
-  *Decisions for the user*), `17` = the project files changed since the review (a refused
-  `approve`) or since the approval (`collab verify`), `1` = error.
+  `16` = the user has to choose and you present it: the other agent asked, or (implementer only)
+  the round limit was reached (see *Decisions for the user*), `17` = the project files changed
+  since the review (a refused `approve`) or since the approval (`collab verify`), `1` = error.
   For `join --after`, `10` also means the implementer ended the run.
 - **Start both agents from the same project folder** when you can. A folder and the folders
   inside it count as one project (e.g. a repo root and a module in it), so tasks and the queue
@@ -215,9 +217,10 @@ you to stop, they will interrupt you.
    EOF
    ```
    The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
-   shows only what changed during this task. Tell the user the task id and that the reviewer can now
-   be started with `collab review` (Claude Code: `/collab review`, Codex: `$collab review`),
-   and that they can watch live with `collab watch` and steer with `collab note "…"`.
+   shows only what changed during this task. Tell the user the task id and the `reviewer:` command
+   `init` printed (e.g. `/collab review <task-id>`, Codex: `$collab review <task-id>`), which pairs
+   the reviewer with this task even if another pair is running, and that they can watch live with
+   `collab watch` and steer with `collab note "…"`.
    If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
    If the request has several stages (a staged plan, a list of deliverables) or is too big for
    one review, split it now into **all** its parts (see *Splitting a task*), not just the first
@@ -350,9 +353,16 @@ EOF
 
 ## Reviewer loop
 
-1. **Join** with `collab join`. It blocks until an active task exists, then prints the brief.
-   The implementer may take several minutes to write the brief. On exit 11, run `collab join`
-   again, as many times as it takes (see *How to wait*). Never end your turn with "no active task".
+1. **Join** with `collab -t <task-id> join` if you were given a task id, else `collab join` (it
+   only looks at the project of the folder you're in). It blocks until an active task exists,
+   then prints the brief. The implementer may take several minutes to write the brief. On exit 11,
+   run the same `join` again, as many times as it takes (see *How to wait*). Never end your turn
+   with "no active task".
+   **Exit 1 with "already has a reviewer"** means another reviewer is working on that task (often
+   another pair's), and **"several projects"** means your folder matches more than one active
+   task. Don't pick one yourself: stop, show the user the message, and let them restart you with
+   the right task id or folder. Use `join --force` only when the user says the earlier reviewer
+   of that task is gone.
 2. **Wait** with `collab wait reviewer`.
 3. **Review** (on exit 0):
    - Treat the implementer's summary as a guide, not proof. Run `collab diff --stat`, then
@@ -440,12 +450,19 @@ task pauses (`DECISION`) and continues as soon as the user picks an option.
      carry on.
    - **Codex CLI:** without `--self`. Then run `collab -t <id> wait <role>` as usual. It returns
      (exit 0) with the user's answer once they have chosen.
-3. **Exit 16 from `wait`** means the user has to choose: the other agent asked, or the round
-   limit was reached (see *Escalation*). Claude Code: ask the user with AskUserQuestion as in
+3. **Exit 16 from `wait`** means the user has to choose and **you** present it: the other agent
+   asked (without `--self`), or you are the implementer and the round limit was reached (see
+   *Escalation*). Claude Code: ask the user with AskUserQuestion as in
    step 2, run `collab -t <id> answer …`, then go back to waiting. Codex: post the question and
    options as plain text, tell the user to answer with `collab answer <N>` in any terminal, and
    go back to waiting (**don't end your turn**). If `answer` says no decision is pending, the
    user already answered elsewhere: just go back to waiting.
+
+**One agent presents each decision**, so the user answers in one place: the asker with `--self`,
+the implementer for the round limit, otherwise the agent whose `wait` returned 16. If you are not
+that agent, **never ask the user about it** (no AskUserQuestion, no plain-text question, no relay):
+keep running `wait` until it returns with the answer. If the user mentions the decision in your
+thread anyway, tell them to answer it where it was presented or with `collab answer <N | text>`.
 
 The user's answer takes priority, like a human note.
 
@@ -453,9 +470,8 @@ The user's answer takes priority, like a human note.
 
 Don't escalate a disagreement or a technical judgment call. Keep reviewing. If the reviewer
 still requests changes once the round limit (default 4) is reached, the CLI asks the user
-(exit 16 for both agents): 2 more rounds, approve as it is, or stop. The task continues
-with their choice. For a
-technical choice you can make yourself, pick the safest option (or the one the codebase already
+through the implementer (its `wait` returns 16; the reviewer just keeps waiting): 2 more rounds,
+approve as it is, or stop. The task continues with their choice. For a technical choice you can make yourself, pick the safest option (or the one the codebase already
 leans towards), carry on, and note it under `## Decisions taken` in your summary or review. The
 final report lists these for the user.
 

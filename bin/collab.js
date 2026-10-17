@@ -8,7 +8,7 @@
 // 12 submit refused because a note for you is not acknowledged ("Note #N") in your message,
 // 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
 // 14 submit refused because the task's --check command failed, 15 the queue is empty,
-// 16 the other agent asked the user to decide something — show them the options,
+// 16 the user has to decide (the other agent asked, or the round limit for the implementer) — show them the options,
 // 17 the tree changed since the review (refused approve) or since the approval ('verify').
 //
 // Zero dependencies; runs on macOS, Linux and Windows (Node >= 18).
@@ -211,6 +211,22 @@ function latestTask(dir) {
   return active.slice(-1)[0] || ids.slice(-1)[0] || '';
 }
 const rawTaskId = () => TASK_OVERRIDE || process.env.COLLAB_TASK || projectTaskId() || currentId();
+
+// The reviewer's claim on a task, so a second reviewer (another pair's, or one started in the wrong
+// folder) can't join it: a heartbeat file whose mtime its join, waits, progress and submits refresh.
+const reviewerSeenPath = (d) => path.join(d, 'reviewer.seen');
+function touchReviewer(d) {
+  const f = reviewerSeenPath(d);
+  const now = new Date();
+  try { fs.utimesSync(f, now, now); } catch { try { fs.writeFileSync(f, ''); } catch { /* best effort */ } }
+}
+// When the task's reviewer was last active, while its claim is live: recent, or it holds the turn
+// and isn't idle. null without a live claim (older tasks have no file).
+function liveReviewer(d, st) {
+  let seen;
+  try { seen = Math.floor(fs.statSync(reviewerSeenPath(d)).mtimeMs / 1000); } catch { return null; }
+  return epoch() - seen < IDLE || (st.turn === 'reviewer' && !idleReason(st)) ? seen : null;
+}
 
 function taskDir() {
   const id = rawTaskId();
@@ -1236,15 +1252,28 @@ function cmdInit(args) {
   if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   out(`scratch: ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
+  out(`reviewer: /collab review ${id}  (Codex: $collab review ${id}): tell the user, so the reviewer joins this task`);
   if (plan) out("Next: write a plan (no code yet), then 'collab submit implementer plan' with it on stdin.");
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
+}
+
+// The task a bare 'join' takes: this folder's project's newest active (else newest) task. A parent
+// folder of several projects with active tasks is ambiguous: the user picks one with -t.
+function joinableTask(dir) {
+  const active = projectTasks(dir).filter((id) => { try { return !isTerminal(readState(path.join(TASKS, id)).status); } catch { return false; } });
+  const dirs = new Set(active.map((id) => realDir(readState(path.join(TASKS, id)).project_dir)));
+  if (dirs.size > 1) {
+    die(`several projects under this folder have an active task; pick yours with 'collab -t <task-id> join', or start from its project folder:\n${
+      active.map((id) => `  ${id}  ${readState(path.join(TASKS, id)).project_dir}`).join('\n')}`);
+  }
+  return latestTask(dir);
 }
 
 // --after <task-id>: the reviewer just finished that task and waits for the implementer's next
 // one. Then the newest task of that project decides: a new active task is joined, `collab end`
 // on it stops the reviewer too (exit 10), and a long silence after DONE asks the user (exit 13).
 async function cmdJoin(args) {
-  const { opts } = takeOpts(args, { values: { ...timeoutOpt.values, '--after': 'after' } });
+  const { opts } = takeOpts(args, { values: { ...timeoutOpt.values, '--after': 'after' }, flags: { '--force': { force: true } } });
   const timeout = toSecs(opts.timeout, 540);
   const start = epoch();
   let projectDir = '';
@@ -1253,12 +1282,25 @@ async function cmdJoin(args) {
     if (!fs.existsSync(statePath(ad))) die(`task not found: ${opts.after}`);
     projectDir = readState(ad).project_dir;
   }
+  // A pinned task (-t, $COLLAB_TASK) or this folder's project, never another project's task.
+  const pinned = TASK_OVERRIDE || process.env.COLLAB_TASK;
+  if (pinned && !opts.after && !fs.existsSync(statePath(path.join(TASKS, pinned)))) die(`task not found: ${pinned}`);
   for (;;) {
-    const id = projectDir ? latestTask(projectDir) : rawTaskId();
+    const id = projectDir ? latestTask(projectDir) : pinned || joinableTask(process.cwd());
     const d = id && path.join(TASKS, id);
     if (d && fs.existsSync(statePath(d))) {
       const st = readState(d);
       if (!isTerminal(st.status)) {
+        // Check and claim under the task lock, so two reviewers joining at once can't both get in.
+        withLock(d, () => {
+          const seen = !opts.force && liveReviewer(d, readState(d));
+          if (seen) {
+            die(`task ${id} (project ${st.project_dir}) already has a reviewer, last active ${fmtDur(Math.max(0, epoch() - seen))} ago. `
+              + "To review another pair's task, start the reviewer from that project's folder or with 'collab -t <task-id> join'. "
+              + `If that reviewer is gone, take over with 'collab -t ${id} join --force'.`);
+          }
+          touchReviewer(d);
+        });
         out(`joined task: ${id}`);
         out(`project:     ${st.project_dir}`);
         out(`status:      ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
@@ -1346,6 +1388,7 @@ async function cmdWait(args) {
   const start = epoch();
   const d = taskDir();
   for (;;) {
+    if (role === 'reviewer') touchReviewer(d);
     const st = readState(d);
     if (isTerminal(st.status)) {
       out(`TASK FINISHED: ${st.status} (round ${st.round})`);
@@ -1366,12 +1409,13 @@ async function cmdWait(args) {
       if (role === 'reviewer') for (const l of reviewRecap(d, st)) out(l);
       return;
     }
-    // A decision for the user: the agent that asked waits for the answer; the other one shows
-    // the options once, unless the asker presents them itself (--self). The round-limit menu goes
-    // to both agents, whichever can show it. No idle or stall meanwhile.
+    // A decision for the user: exactly one agent presents it, so the user answers in one place.
+    // The asker with --self, else the other agent; the round-limit menu goes to the implementer.
+    // The presenter is shown the options once; the other agent just waits. No idle or stall meanwhile.
     if (st.status === 'DECISION') {
       const dec = st.decision || {};
-      if ((dec.role !== role || dec.kind === 'limit') && !dec.self && !(dec.shown || {})[role]) {
+      const presenter = decisionPresenter(dec);
+      if (presenter === role && !dec.self && !(dec.shown || {})[role]) {
         withLock(d, () => update(d, (s) => { if (s.decision) s.decision.shown = { ...s.decision.shown, [role]: true }; }, { touch: false }));
         out(`DECISION NEEDED: ${dec.kind === 'limit' ? 'the round limit is reached' : `the ${dec.role} asks the user to choose`}. Show the user the options below, then record`);
         out(`their choice with 'collab -t ${st.id} answer <N | text>' and go back to waiting.`);
@@ -1379,7 +1423,8 @@ async function cmdWait(args) {
         exit(EXIT_DECISION);
       }
       if (epoch() - start >= timeout) {
-        out(`still waiting — the user has not answered the ${dec.role}'s question yet ('collab answer <N | text>'). Run 'collab wait ${role}' again.`);
+        if (presenter === role) out(`still waiting — the user has not answered the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question yet ('collab answer <N | text>'). Run 'collab wait ${role}' again.`);
+        else out(`still waiting — the ${presenter} presents the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question to the user; don't ask the user about it yourself. Run 'collab wait ${role}' again.`);
         exit(EXIT_TIMEOUT);
       }
       await sleep(POLL * 1000);
@@ -1416,6 +1461,14 @@ async function cmdWait(args) {
 function requestChanges(s) {
   if ((s.phase || 'build') === 'plan') { s.status = 'PLAN_CHANGES'; s.plan_round = (s.plan_round || 1) + 1; } else { s.status = 'CHANGES_REQUESTED'; s.round += 1; }
   s.turn = 'implementer';
+}
+
+// The one agent that shows a decision to the user: the asker with --self, the implementer for the
+// round limit, otherwise the agent that didn't ask.
+function decisionPresenter(dec) {
+  if (dec.kind === 'limit') return 'implementer';
+  if (dec.self) return dec.role;
+  return dec.role === 'implementer' ? 'reviewer' : 'implementer';
 }
 
 const LIMIT_OPTIONS = [
@@ -1462,6 +1515,7 @@ async function cmdSubmit(args) {
   const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' }, flags: { '--self': { self: true }, '--rereviewed': { rereviewed: true } } });
   const [role, kind] = rest;
   const d = taskDir();
+  if (role === 'reviewer') touchReviewer(d);
   let body = readBody(opts.file);
   const options = kind === 'decide' ? decisionOptions(body) : [];
   if (kind === 'decide' && options.length < 2) die("a decision needs at least 2 numbered options ('1. …', '2. …'), one per line");
@@ -1598,9 +1652,9 @@ async function cmdSubmit(args) {
     const dec = st.decision;
     notify(`${st.id}: your decision is needed — ${dec.question}`);
     pushPhone(st, `Decision needed: ${dec.question}`, { priority: 'high' });
-    if (dec.kind === 'limit') out(`${dec.question} The user decides. Run 'collab -t ${st.id} wait ${role}': it shows you the options (exit 16).`);
+    if (dec.kind === 'limit') out(`${dec.question} The user decides; the implementer presents the options, don't ask the user yourself. Run 'collab -t ${st.id} wait ${role}': it returns with the outcome.`);
     else if (dec.self) out(`Ask the user now, then record their choice with 'collab -t ${st.id} answer <N | text>'; the turn comes back to you.`);
-    else out(`The other agent (or the user, with 'collab answer <N | text>') presents it. Run 'collab -t ${st.id} wait ${role}': it returns with the answer.`);
+    else out(`The other agent presents it to the user (or the user runs 'collab answer <N | text>'); don't ask the user yourself. Run 'collab -t ${st.id} wait ${role}': it returns with the answer.`);
     return;
   }
   notify(`${st.id}: ${st.status}`);
@@ -1664,6 +1718,7 @@ function cmdProgress(args) {
     if (isTerminal(st.status)) die(`task already finished (${st.status})`);
     if (!ROLES.includes(st.turn)) die('no agent has the turn');
     const p = { role: st.turn, round: st.round, text, at: nowIso(), epoch: epoch() };
+    if (st.turn === 'reviewer') touchReviewer(d);
     fs.appendFileSync(path.join(d, 'progress.log'), `${JSON.stringify(p)}\n`);
     // Notes that arrived mid-turn are handed over right away instead of at the next submit.
     const pending = pendingNotes(d, st, st.turn);
@@ -2719,8 +2774,10 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}verify${R}                      Implementer: is the tree still the approved one? (before a --commit commit)
   ${C}scratch${R}                     Folder for message drafts, notes and logs (the task's own, or
                               a shared drafts folder before 'init'); never write them in the project
-  ${C}join${R} [--after ID]           Reviewer: wait until a task exists, print its brief; with
-                              --after (the task it just finished), stop when the run ends
+  ${C}join${R} [--after ID] [--force]   Reviewer: wait until a task exists in this folder's project (or
+                              the -t task), print its brief; with --after (the task it just
+                              finished), stop when the run ends. Refused when the task already
+                              has a live reviewer; --force takes over from a dead one
   ${C}end${R}                         Implementer: the whole request is done; ends the run for both
                               (final report on stdin or --file)
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
