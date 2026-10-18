@@ -57,7 +57,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   as agent activity (e.g. snooze).
 - **Turns**: `transition(st, role, kind)` is the state machine (PLANNING/PLAN_REVIEW/PLAN_CHANGES →
   IMPLEMENTING → READY_FOR_REVIEW ⇄ CHANGES_REQUESTED → DONE, plus ESCALATED/ABORTED/STALLED terminals).
-  `cmdSubmit` validates the turn, enforces note acknowledgements (exit 12: every note for the role since its last handoff must be named as `Note #N`) and `--check` (exit 14, via `runCheck`),
+  `cmdSubmit` validates the turn, enforces note acknowledgements (exit 12: every note for the role since its last handoff must be named as `Note #N`; checked before the check runs and again under the lock; `decide`/`escalate` are exempt and don't advance `acked`) and `--check` (exit 14, via `runCheck`),
   refuses an implementer `plan`/`ready` identical to its previous one (`handoffText`),
   writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`. On the reviewer's turn,
   `wait` prints a revised plan as a line diff (`printPlanDelta`/`lineDiff`) and `reviewRecap` adds its

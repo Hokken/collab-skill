@@ -256,7 +256,10 @@ session adds `--as-user`.
 A note is **shown** to its target at its next `wait` or `progress`, and it must be **acknowledged**:
 the target's next `submit` is refused (exit 12) until its message names every note addressed to it
 since its previous handoff (`Note #N`). Being shown is not enough, because an agent may discard that
-output. Escalations are never blocked. A task started before acknowledgements gets its baseline
+output. This is checked before the task's `--check` runs, so a refused handoff costs no check run,
+and again under the lock, for a note that arrives while the check runs. Escalations and decisions
+are never blocked, and neither counts as acknowledging: the notes stay pending for the role's next
+handoff. A task started before acknowledgements gets its baseline
 frozen, for both roles, from what each had been shown, at its first state change after the
 upgrade: notes shown before count as handled, every later one must be acknowledged.
 

@@ -422,6 +422,59 @@ test('diff without git repos points to the summary', () => {
 
 const noteNum = (r) => Number(/note #(\d+)/.exec(r.out)[1]);
 
+test('a decision is never refused for notes, and does not acknowledge them', () => {
+  const s = sandbox();
+  s.run(['init', 'ask-with-notes'], { input: 'b' });
+  const n = noteNum(s.run(['note', '--from', 'reviewer', 'early finding']));
+  const acked = s.state().acked.implementer;
+  let r = s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Which?\n1. a\n2. b\n' });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(s.state().status, 'DECISION');
+  assert.equal(s.state().acked.implementer, acked, 'a decision acknowledges nothing');
+  s.run(['answer', '1']);
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 12, 'the note still gates the next real handoff');
+  assert.match(r.out, new RegExp(`Note #${n} is not acknowledged`));
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${n} — fixed` }).code, 0);
+  // The reviewer's side: its decision goes through with the user's note pending, its review doesn't.
+  const u = noteNum(s.run(['note', '--reviewer', 'look at X']));
+  assert.equal(s.run(['submit', 'reviewer', 'decide', '--self'], { input: 'Which?\n1. a\n2. b\n' }).code, 0);
+  s.run(['answer', '2']);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 12);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: `ok, Note #${u} checked` }).code, 10);
+});
+
+test('unacknowledged notes refuse a handoff before the check runs, and a note sent during the check still does', () => {
+  const s = sandbox();
+  // The check counts its runs and, on its first one only, has the reviewer send a note mid-check.
+  fs.writeFileSync(path.join(s.project, 'check.js'), [
+    "const fs = require('fs');",
+    "fs.appendFileSync('runs', 'x');",
+    "if (fs.readFileSync('runs', 'utf8').length === 2) {",
+    `  require('child_process').execFileSync(process.execPath, [${JSON.stringify(CLI)}, 'note', '--from', 'reviewer', 'sent during the check']);`,
+    '}',
+  ].join('\n'));
+  const runs = () => { try { return fs.readFileSync(path.join(s.project, 'runs'), 'utf8').length; } catch { return 0; } };
+  s.run(['init', 'early-notes', '--check', 'node check.js'], { input: 'b' });
+  const n = noteNum(s.run(['note', '--from', 'reviewer', 'before the handoff']));
+  let r = s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  assert.equal(r.code, 12);
+  assert.match(r.out, new RegExp(`Note #${n} is not acknowledged`));
+  assert.equal(runs(), 0, 'the check did not run');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${n} — done`, raw: true }).code, 1, 'closeout is still enforced');
+  r = s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${n} — done` });
+  assert.equal(runs(), 1);
+  assert.equal(r.code, 0, r.out + r.err);
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  assert.equal(runs(), 2, 'the check ran and sent its note');
+  assert.equal(r.code, 12, 'the locked re-check catches the note sent while the check ran');
+  assert.match(r.out, /sent during the check/);
+  const late = s.state().seq - 1;
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: `v2\nNote #${late} — done` }).code, 0);
+  assert.equal(runs(), 3);
+});
+
 test('notes: gate, routing and finished tasks', () => {
   const s = sandbox();
   s.run(['init', 'notes'], { input: 'brief' });

@@ -1608,6 +1608,14 @@ function transition(st, role, kind) {
   }
 }
 
+function refuseUnacked(d, pending) {
+  const nums = pending.map((f) => `Note #${seqOf(f)}`).join(', ');
+  out(`NOT SUBMITTED: ${nums} ${pending.length > 1 ? 'are' : 'is'} not acknowledged in your message. Handle each, add a line`);
+  out("'Note #N — what you did' (under ## Review responses), then submit again with your full, updated message.");
+  for (const f of pending) printEntry(d, f);
+  exit(EXIT_NOTES);
+}
+
 async function cmdSubmit(args) {
   const { opts, rest } = takeOpts(args, { values: { '--file': 'file', '-f': 'file' }, flags: { '--self': { self: true }, '--rereviewed': { rereviewed: true } } });
   const [role, kind] = rest;
@@ -1632,6 +1640,17 @@ async function cmdSubmit(args) {
     if (prev && handoffText(fs.readFileSync(path.join(entriesDir(d), prev), 'utf8')) === handoffText(body)) {
       die(`this ${kind} is identical to your previous one (#${pad3(seqOf(prev))}), so nothing was submitted.`
         + ' If writing the message file failed, write it again, then submit the updated message.');
+    }
+  }
+  // Notes are checked before the check runs, so a refused handoff never spends a check run.
+  // An escalation never waits on notes, and a decision doesn't count as handling them: they
+  // stay pending for the next real handoff.
+  const acks = kind !== 'escalate' && kind !== 'decide';
+  if (acks && pre.turn === role && !isTerminal(pre.status)) {
+    const pending = unackedNotes(d, pre, role, body);
+    if (pending.length) {
+      withLock(d, () => update(d, (s) => markSeen(s, role)));
+      refuseUnacked(d, pending);
     }
   }
   // A build handoff says what was verified and what wasn't (see SKILL.md), before the check runs.
@@ -1678,7 +1697,8 @@ async function cmdSubmit(args) {
     if (kind !== 'escalate' && st.turn !== role) die(`not your turn (${role}); current turn: ${st.turn}, status: ${st.status}`);
 
     // Every note for this agent since its last handoff must be acknowledged ("Note #N") in it.
-    if (kind !== 'escalate') {
+    // Checked again here: a note can arrive while the check runs.
+    if (acks) {
       const pending = unackedNotes(d, st, role, body);
       if (pending.length) {
         update(d, (s) => markSeen(s, role));
@@ -1712,19 +1732,13 @@ async function cmdSubmit(args) {
           Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
         }
         freezeAcked(s);
-        if (kind !== 'escalate') s.acked = { ...s.acked, [role]: s.seq };
+        if (acks) s.acked = { ...s.acked, [role]: s.seq };
         s.seq += 1; s.updated_by = role; s.turn_since = epoch();
       }),
     };
   });
 
-  if (result.pending) {
-    const nums = result.pending.map((f) => `Note #${seqOf(f)}`).join(', ');
-    out(`NOT SUBMITTED: ${nums} ${result.pending.length > 1 ? 'are' : 'is'} not acknowledged in your message. Handle each, add a line`);
-    out("'Note #N — what you did' (under ## Review responses), then submit again with your full, updated message.");
-    for (const f of result.pending) printEntry(d, f);
-    exit(EXIT_NOTES);
-  }
+  if (result.pending) refuseUnacked(d, result.pending);
   if (result.stale) {
     out(`NOT APPROVED: the tree changed since ${result.stale.since === 'pending' ? 'your approve was refused' : "the implementer's handoff"}`
       + ' (+ newly changed, ~ changed again, - back to its base content):');

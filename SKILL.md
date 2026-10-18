@@ -142,6 +142,7 @@ The user can add a note at any time with `collab note "…"`. Notes show up as
   did` (implementer: under `## Review responses`; reviewer: anywhere in the review). The CLI
   refuses a submit (exit 12) that leaves a note for you unacknowledged, even one you were already
   shown: output you discarded (e.g. a `progress` call piped to `/dev/null`) never loses a note.
+  A `decide` or `escalate` is never refused for notes; the notes stay pending for your next handoff.
 - Implementer: act on it. Reviewer: take it into account, and check that the implementer followed
   earlier notes.
 - On exit 12, nothing was submitted. Handle the listed notes, then submit again with your **full,
@@ -228,8 +229,9 @@ you to stop, they will interrupt you.
    In plan mode, go through the *Plan phase* first, then continue at step 2.
 2. **Implement.** Follow the project's own rules (CLAUDE.md / AGENTS.md: commits, dev servers
    and so on). If the task has a `--branch`, create or switch to it before changing anything.
-   Run the relevant lint, type-check or tests yourself before handing off, plus `collab check`
-   if the task has a check command.
+   Run the relevant lint, type-check or tests yourself before handing off. If the task has a
+   check command, `collab check` runs it while you work; don't run it just before `submit`,
+   which runs it again.
 3. **Hand off** with `collab submit implementer ready`, using this summary:
    ```
    ## Summary
