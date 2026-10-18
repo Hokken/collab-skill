@@ -38,6 +38,15 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   (with their continuation lines) of the earlier `changes` entries of the current phase, by round,
   and in a `--plan` task's build phase, which entry is the approved plan. Both come from `entries/`:
   the plan approval is the only reviewer `approve` of an unfinished task, so it separates the phases.
+  It also lists the reviewer's own notes (`--from reviewer`) since its last review, one line each,
+  with the implementer's latest `Note #N` line about each, so the reviewer verifies the fixes.
+- **Revised plans:** from the second `plan` on, the reviewer's `wait` prints a line diff against
+  the previous plan (hunks with 2 lines of context, labelled with the heading above them) instead
+  of the whole plan, unless the diff is over 60% of the plan's size (then the plan is printed
+  whole). `collab show N` prints the full entry.
+- **No identical resubmissions:** an implementer `plan` or `ready` whose text matches its previous
+  entry of the same kind (ignoring trailing whitespace and the appended `check passed` line) is
+  refused with exit 1 before the check runs, and nothing is written.
 - **Round limits:** a `changes` beyond `max_rounds` (or the plan rounds) becomes a `DECISION`
   for the user, presented by the implementer (its `wait` returns 16; the reviewer keeps waiting):
   `1` gives 2 more rounds and passes the review on, `2` approves (`DONE`), `3` stops

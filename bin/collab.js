@@ -403,6 +403,9 @@ function readBody(file) {
 }
 
 // First meaningful line of a message, without markdown heading marks.
+// A handoff's own text, for comparing two of them: without the check line collab appends, or
+// trailing whitespace.
+const handoffText = (t) => t.replace(/\n*> collab: check passed: .*\n*$/, '').split('\n').map((l) => l.trimEnd()).join('\n').trim();
 const headline = (t) => (t.split('\n').find((l) => /\w/.test(l)) || '').replace(/^[#>*\s-]+/, '').trim();
 
 // Numbered options ("1. …" or "2) …") of a decision, in order.
@@ -1196,7 +1199,15 @@ function cmdInit(args) {
   // started in the same second still sort in the order they were created.
   const lastId = projectTasks(dir).slice(-1)[0];
   const createdMs = Math.max(Date.now(), lastId ? taskMeta.get(lastId).created + 1 : 0);
-  const id = `${slug}-${localStamp()}`;
+  // A task started in the same second as one with the same slug gets a suffix: reusing that
+  // folder would carry the other task's entries over. Creating the folder claims the id.
+  const stamp = `${slug}-${localStamp()}`;
+  fs.mkdirSync(TASKS, { recursive: true });
+  let id = stamp;
+  for (let n = 2; ; n++) {
+    try { fs.mkdirSync(path.join(TASKS, id)); break; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    id = `${stamp}-${n}`;
+  }
   const d = path.join(TASKS, id);
   fs.mkdirSync(entriesDir(d), { recursive: true });
   fs.mkdirSync(path.join(d, 'untracked'), { recursive: true });
@@ -1352,6 +1363,27 @@ function blockingItems(text) {
   return items.map((l) => l.join('\n'));
 }
 
+const oneLine = (t, n) => { const s = t.replace(/\s+/g, ' ').trim(); return [...s].length > n ? `${[...s].slice(0, n - 1).join('')}…` : s; };
+
+// The reviewer's notes to the implementer since its last review verdict (a decision it asked
+// isn't one), each with the implementer's latest 'Note #N' line about it. The reviewer has the
+// notes in full already: one line each.
+function noteReplies(d, files) {
+  const last = files.filter((f) => roleOf(f) === 'reviewer' && ['changes', 'approve'].includes(kindOf(f))).pop();
+  const handoffs = files.filter((f) => roleOf(f) === 'implementer').reverse();
+  return files.filter((f) => f.includes('-peer-note-implementer') && (!last || seqOf(f) > seqOf(last))).map((f) => {
+    const seq = seqOf(f);
+    const text = fs.readFileSync(path.join(entriesDir(d), f), 'utf8').replace(/^From: .*\n/, '');
+    const re = new RegExp(`\\bnote\\s*#\\s*0*${seq}\\b`, 'i');
+    let reply = null;
+    for (const h of handoffs.filter((e) => seqOf(e) > seq)) {
+      const line = fs.readFileSync(path.join(entriesDir(d), h), 'utf8').split('\n').find((l) => re.test(l));
+      if (line) { reply = `#${pad3(seqOf(h))}: ${oneLine(line.replace(/^[\s>*-]+/, ''), 200)}`; break; }
+    }
+    return { seq, text: oneLine(text, 160), reply };
+  });
+}
+
 // What the reviewer gets besides the latest messages: the blocking items of the current phase's
 // earlier reviews, and (in a --plan task's build phase) which entry is the approved plan. The plan
 // approval is the only reviewer approve of an unfinished task, so it splits the phases.
@@ -1369,6 +1401,12 @@ function reviewRecap(d, st) {
     for (const r of found) lines.push(`${build ? '' : 'plan '}round ${r.i + 1} (#${pad3(seqOf(r.f))}):`, ...r.items);
     lines.push('----- end -----');
   }
+  const notes = noteReplies(d, files);
+  if (notes.length) {
+    lines.push('----- your notes since your last review (from collab): check each fix in the code, not just its acknowledgement -----');
+    for (const n of notes) lines.push(`Note #${n.seq}: ${n.text}`, `   → ${n.reply || 'not acknowledged yet'}`);
+    lines.push('----- end -----');
+  }
   if (build && (st.review_trees || []).length >= 2) {
     lines.push(`changes since your last review: 'collab -t ${st.id} diff --since-review' (the whole task: 'collab -t ${st.id} diff')`);
   }
@@ -1377,6 +1415,65 @@ function reviewRecap(d, st) {
     if (plan) lines.push(`approved plan: #${pad3(seqOf(plan))} (read it with 'collab -t ${st.id} show ${seqOf(plan)}'). Review the build against it too.`);
   }
   return lines;
+}
+
+// Line diff (LCS) of a and b as [op, line] pairs, op ' ', '-' or '+'; null when too large to compute.
+function lineDiff(a, b) {
+  const n = a.length; const m = b.length;
+  if ((n + 1) * (m + 1) > 4e6) return null;
+  const w = m + 1;
+  const L = new Uint32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      L[i * w + j] = a[i] === b[j] ? L[(i + 1) * w + j + 1] + 1 : Math.max(L[(i + 1) * w + j], L[i * w + j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0; let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && a[i] === b[j]) { ops.push([' ', a[i]]); i++; j++; }
+    else if (j < m && (i === n || L[i * w + j + 1] >= L[(i + 1) * w + j])) { ops.push(['+', b[j]]); j++; }
+    else { ops.push(['-', a[i]]); i++; }
+  }
+  return ops;
+}
+
+// Hunks of a line diff with `ctx` lines of context, each labelled with the heading above it.
+function diffHunks(ops, ctx = 2) {
+  const keep = new Set();
+  ops.forEach(([op], k) => { if (op !== ' ') for (let c = k - ctx; c <= k + ctx; c++) keep.add(c); });
+  const lines = [];
+  let heading = null; let newLine = 0; let prev = -2;
+  ops.forEach(([op, line], k) => {
+    if (op !== '-') newLine++;
+    if (op !== '-' && /^#{1,6}\s/.test(line)) heading = line.replace(/^#+\s*/, '').trim();
+    if (keep.has(k)) {
+      if (k !== prev + 1) lines.push(`@@ line ${newLine}${heading ? `, under "${heading}"` : ''}`);
+      lines.push(`${op} ${line}`);
+      prev = k;
+    }
+  });
+  return lines;
+}
+
+// A revised plan reaches the reviewer as the changes since the previous plan, which it has
+// already reviewed, unless they are most of it. Returns false when the entry must be printed whole.
+function printPlanDelta(d, st, f) {
+  if (roleOf(f) !== 'implementer' || kindOf(f) !== 'plan') return false;
+  const prev = listEntries(d).filter((e) => roleOf(e) === 'implementer' && kindOf(e) === 'plan' && seqOf(e) < seqOf(f)).pop();
+  if (!prev) return false;
+  const read = (e) => fs.readFileSync(path.join(entriesDir(d), e), 'utf8');
+  const body = read(f);
+  const ops = lineDiff(read(prev).replace(/\n+$/, '').split('\n'), body.replace(/\n+$/, '').split('\n'));
+  if (!ops) return false;
+  const hunks = diffHunks(ops);
+  if (hunks.join('\n').length > body.length * 0.6) return false;
+  out(`>>> REVISED PLAN: only the changes since plan #${pad3(seqOf(prev))}, which you reviewed ('-' removed, '+' added).`
+    + ` Full text: 'collab -t ${st.id} show ${seqOf(f)}'. <<<`);
+  out(`----- ${f} (changes since #${pad3(seqOf(prev))}) -----`);
+  for (const l of hunks.length ? hunks : ['(no changes)']) out(l);
+  out('----- end -----');
+  return true;
 }
 
 async function cmdWait(args) {
@@ -1405,7 +1502,7 @@ async function cmdWait(args) {
       withLock(d, () => update(d, (s) => markSeen(s, role)));
       out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
       out(`project: ${st.project_dir}`);
-      for (const f of fresh) printEntry(d, f);
+      for (const f of fresh) if (!(role === 'reviewer' && printPlanDelta(d, st, f))) printEntry(d, f);
       if (role === 'reviewer') for (const l of reviewRecap(d, st)) out(l);
       return;
     }
@@ -1528,6 +1625,15 @@ async function cmdSubmit(args) {
   }
 
   const pre = readState(d);
+  // A plan or build handoff identical to the previous one is a stale file (e.g. a failed write),
+  // never a revision: refuse it before the check runs, so it can't spend a review round.
+  if (role === 'implementer' && (kind === 'plan' || kind === 'ready') && pre.turn === role && !isTerminal(pre.status)) {
+    const prev = listEntries(d).filter((f) => roleOf(f) === role && kindOf(f) === kind).pop();
+    if (prev && handoffText(fs.readFileSync(path.join(entriesDir(d), prev), 'utf8')) === handoffText(body)) {
+      die(`this ${kind} is identical to your previous one (#${pad3(seqOf(prev))}), so nothing was submitted.`
+        + ' If writing the message file failed, write it again, then submit the updated message.');
+    }
+  }
   // A build handoff says what was verified and what wasn't (see SKILL.md), before the check runs.
   if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build') {
     const missing = closeoutMissing(body);

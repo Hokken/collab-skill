@@ -1480,6 +1480,119 @@ test('the reviewer gets earlier blocking items of its phase and the approved pla
   assert.ok(out.includes(`approved plan: #003 (read it with 'collab -t ${id} show 3')`), out);
 });
 
+test('the reviewer gets its notes since its last review, each with the implementer\'s acknowledgement', () => {
+  const s = sandbox();
+  const note = (text) => noteNum(s.run(['note', '--from', 'reviewer', text]));
+  s.run(['init', 'notes-recap'], { input: 'b' });
+  const a = note('close() skips the amount check');
+  const b = note(`batch order starves new rows ${'x'.repeat(200)}`);
+  s.run(['submit', 'implementer', 'ready'], { input: `v1\n## Review responses\n- Note #${a} — fixed, amount checked in close()\nNote #${b} — declined: batch is fair\n` });
+  let out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, new RegExp(`----- your notes since your last review \\(from collab\\)[^\\n]*\\nNote #${a}: close\\(\\) skips the amount check\\n {3}→ #\\d{3}: Note #${a} — fixed, amount checked in close\\(\\)\\nNote #${b}: batch order starves new rows x+…\\n {3}→ #\\d{3}: Note #${b} — declined: batch is fair\\n----- end -----`));
+  assert.doesNotMatch(out, /From: the reviewer/, 'the recap leaves out the note header');
+
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. more' });
+  const c = note('one more thing');
+  s.run(['submit', 'implementer', 'ready'], { input: `v2 (Note #${c} handled)` });
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, new RegExp(`Note #${c}: one more thing\\n {3}→ #\\d{3}: v2 \\(Note #${c} handled\\)`));
+  assert.doesNotMatch(out, new RegExp(`Note #${a}:`), 'notes covered by an earlier review are not repeated');
+  // A decision the reviewer asks is not a review: the notes it has not verified yet stay listed.
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. once more' });
+  const f = note('decide keeps me');
+  s.run(['submit', 'implementer', 'ready'], { input: `v2b Note #${f} fixed` });
+  assert.equal(s.run(['submit', 'reviewer', 'decide', '--self'], { input: 'Which?\n1. a\n2. b\n' }).code, 0);
+  s.run(['answer', '1']);
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, new RegExp(`Note #${f}: decide keeps me\\n {3}→ #\\d{3}: v2b Note #${f} fixed`));
+
+  // The user's notes are not the reviewer's: no recap without a note of its own.
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. again' });
+  const user = noteNum(s.run(['note', '--implementer', 'from the user']));
+  s.run(['submit', 'implementer', 'ready'], { input: `v3 Note #${user} done` });
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.doesNotMatch(out, /your notes since/);
+});
+
+test('a plan or ready identical to the previous one is refused before the check runs', () => {
+  const s = sandbox();
+  const marker = path.join(s.project, 'check-ran');
+  s.run(['init', 'same', '--plan', '--check', `node -e "require('fs').appendFileSync('check-ran', 'x')"`], { input: 'b' });
+  assert.equal(s.run(['submit', 'implementer', 'plan'], { input: 'plan A\n' }).code, 0);
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. add step 3' });
+  let r = s.run(['submit', 'implementer', 'plan'], { input: 'plan A  \n\n' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /this plan is identical to your previous one \(#001\), so nothing was submitted/);
+  assert.equal(s.state().status, 'PLAN_CHANGES');
+  assert.equal(s.run(['submit', 'implementer', 'plan'], { input: 'plan A\nstep 3\n' }).code, 0);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'built' }).code, 0);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'x');
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix X' });
+  const seq = s.state().seq;
+  r = s.run(['submit', 'implementer', 'ready'], { input: 'built' });
+  assert.equal(r.code, 1, 'the appended check line does not make the stored entry differ');
+  assert.match(r.err, /this ready is identical to your previous one/);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'x', 'the check did not run');
+  assert.equal(s.state().seq, seq, 'nothing was written');
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'built, X fixed' }).code, 0);
+});
+
+test('a revised plan reaches the reviewer as the changes since the previous plan', () => {
+  const s = sandbox();
+  const plan = (extra = '') => ['## Approach', ...Array.from({ length: 30 }, (_, i) => `- point ${i}`), '## Steps', '1. a.ts — change', extra, '## Risks', 'none', ''].join('\n');
+  s.run(['init', 'delta', '--plan'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: plan() });
+  let out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, /----- 001-implementer-plan\.md -----\n## Approach/, 'the first plan is shown whole');
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. add a step' });
+  s.run(['submit', 'implementer', 'plan'], { input: plan('2. b.ts — new step') });
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  const id = s.state().id;
+  assert.ok(out.includes(`>>> REVISED PLAN: only the changes since plan #001, which you reviewed ('-' removed, '+' added). Full text: 'collab -t ${id} show 3'. <<<`), out);
+  assert.match(out, /----- 003-implementer-plan\.md \(changes since #001\) -----\n@@ line \d+, under "Steps"\n {2}## Steps\n {2}1\. a\.ts — change\n\+ 2\. b\.ts — new step\n- \n {2}## Risks\n {2}none\n----- end -----/);
+  assert.doesNotMatch(out, /point 5/, 'unchanged lines far from a change are left out');
+  assert.match(s.run(['show', '3']).out, /point 5[\s\S]*b\.ts — new step/, 'show still prints the whole plan');
+
+  // A rewrite is shown whole: the diff would be most of it.
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' });
+  s.run(['submit', 'implementer', 'plan'], { input: '## Approach\nsomething else entirely\n' });
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.doesNotMatch(out, /REVISED PLAN/);
+  assert.match(out, /----- 005-implementer-plan\.md -----\n## Approach\nsomething else entirely/);
+});
+
+test('tasks started in the same second never share a folder', () => {
+  const s = sandbox();
+  s.run(['init', 'twin'], { input: 'first' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  const first = s.state().id;
+  const firstDir = s.taskDir();
+  s.run(['abort']);
+  // Occupy every folder name the next init can get (even on a slow runner), each with the first
+  // task's entries, so the init always meets an existing folder.
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = (d) => `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const taken = new Set([first]);
+  for (let t = 0; t < 30; t++) {
+    const id = `twin-${stamp(new Date(Date.now() + t * 1000))}`;
+    if (taken.has(id)) continue;
+    taken.add(id);
+    const dir = path.join(s.home, 'tasks', id);
+    fs.cpSync(firstDir, dir, { recursive: true });
+    const st = JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ ...st, id }));
+  }
+  const r = s.run(['init', 'twin'], { input: 'second' });
+  assert.equal(r.code, 0, r.err);
+  const second = s.state().id;
+  assert.match(second, /^twin-\d{8}-\d{6}-2$/);
+  assert.ok(taken.has(second.slice(0, -2)), `${second} collided with an occupied folder`);
+  assert.deepEqual(fs.readdirSync(path.join(s.taskDir(), 'entries')), ['000-implementer-brief.md']);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+});
+
 test('a build ready needs a closeout with all four labels', () => {
   const s = sandbox();
   const ready = (input) => s.run(['submit', 'implementer', 'ready'], { input, raw: true });
@@ -1770,7 +1883,7 @@ test('phone: only --phone tasks push, ordinary handoffs never do, end does', asy
     s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
     s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
     s.run(['progress', 'fixing']);
-    approveCurrent(s);
+    approveCurrent(s, 'ok', 'v2');
     assert.equal(s.state().status, 'DONE');
     r = s.run(['end'], { input: 'all done' });
     assert.equal(r.code, 0, r.err);

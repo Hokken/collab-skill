@@ -50,7 +50,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   by `created_ms` (strictly increasing per project; older tasks fall back to `created_epoch`). `init` allows one
   active task per project. So pairs in different projects don't interfere, and agents also pin
   their task id with `-t`.
-- **State**: `$COLLAB_HOME/tasks/<slug>-<stamp>/state.json`. All mutations go through
+- **State**: `$COLLAB_HOME/tasks/<slug>-<stamp>/state.json` (`-2`, `-3`… when that folder already exists). All mutations go through
   `withLock(d, () => update(d, fn))`: the lock is an exclusive `.lock` directory with an `owner` file
   (broken only when held past `COLLAB_LOCK_SECS` and its owner pid is gone),
   and writes are temp-file + rename. `update(..., { touch: false })` is for changes that must not count
@@ -58,7 +58,10 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Turns**: `transition(st, role, kind)` is the state machine (PLANNING/PLAN_REVIEW/PLAN_CHANGES →
   IMPLEMENTING → READY_FOR_REVIEW ⇄ CHANGES_REQUESTED → DONE, plus ESCALATED/ABORTED/STALLED terminals).
   `cmdSubmit` validates the turn, enforces note acknowledgements (exit 12: every note for the role since its last handoff must be named as `Note #N`) and `--check` (exit 14, via `runCheck`),
-  writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`.
+  refuses an implementer `plan`/`ready` identical to its previous one (`handoffText`),
+  writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`. On the reviewer's turn,
+  `wait` prints a revised plan as a line diff (`printPlanDelta`/`lineDiff`) and `reviewRecap` adds its
+  notes since its last review with the implementer's acknowledgements (`noteReplies`).
 - **Decisions**: `submit <role> decide` (numbered options, `decisionOptions`) parks the task in the
   non-terminal `DECISION` status with `turn: 'human'` and saves the previous status/turn in
   `st.decision`. `cmdAnswer` restores them. The other agent's `wait` returns exit 16 once (unless

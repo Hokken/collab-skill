@@ -343,11 +343,15 @@ EOF
   ## Risks / open questions
   ## How it will be verified
   ```
-  Then wait. If you get `PLAN_CHANGES`, revise the plan and submit it again with `plan`.
+  Then wait. If you get `PLAN_CHANGES`, revise the plan and submit it again with `plan`. A
+  `plan` or `ready` identical to your previous one is refused (exit 1, nothing written): it
+  usually means writing the message file failed, so write it again before resubmitting.
   Once the status is `IMPLEMENTING`, the plan is approved and you start coding (step 2).
 - **Reviewer:** when the status is `PLAN_REVIEW`, judge the plan against the brief and the
   codebase: whether it's the right approach, fits existing patterns, misses a step, carries a
-  risk, or is over-engineered. If the implementer split the task, judge the split too. Use
+  risk, or is over-engineered. If the implementer split the task, judge the split too. From
+  the second plan on, `wait` usually shows only the changes since the plan you reviewed; read
+  the whole one with `collab show N` if you no longer have the earlier plan in mind. Use
   `changes` (numbered items) or `approve`. In this phase,
   `approve` starts the implementation; it does **not** end the task.
 
@@ -374,6 +378,9 @@ EOF
      checked (a test claimed to pass that doesn't, a check that never ran) is a blocking item.
    - From round 2 on, `wait` recaps the `[blocking]` items of your earlier reviews. Check that
      each one is resolved in intent, not just in wording, and raise it again if it isn't.
+   - `wait` also lists the notes you sent since your last review, each with the implementer's
+     `Note #N` line. Check each fix in the code, not just the acknowledgement; an unfixed or
+     wrongly declined note is a blocking item.
    - In a `--plan` task, `wait` names the approved plan entry (`collab show N`). Review the build
      against it too. A substantive divergence the summary doesn't declare under
      `## Divergence from plan` is blocking; a declared one is judged on its merits.
