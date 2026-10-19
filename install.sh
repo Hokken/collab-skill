@@ -47,8 +47,8 @@ link "$REPO/bin/collab.js" "$BIN/collab"
 
 case ":$PATH:" in
   *":$BIN:"*) ;;
-  *) echo; echo "note: $BIN is not on your PATH — add it to your shell profile, e.g.:"
-     echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+  *) echo; echo "note: $BIN is not on your PATH. Add this line to your shell profile (~/.zshrc or ~/.bashrc):"
+     echo "  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
 echo
