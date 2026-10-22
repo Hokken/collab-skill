@@ -93,7 +93,7 @@ sessions so they load the skill. Check it with:
 collab help
 ```
 
-<details>
+
 <summary>Prefer the <a href="https://skills.sh">skills</a> installer?</summary>
 
 ```bash
@@ -105,7 +105,6 @@ On Windows, run `~\.agents\skills\collab\install.ps1` for the second step. Updat
 `npx skills update`. With the git install, updating is just `git pull`. Windows tips:
 [docs/windows.md](docs/windows.md).
 
-</details>
 
 ### Run your first task
 
@@ -310,7 +309,6 @@ also run themselves. Add `-t <task-id>` to any command to target a task other th
 | `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks and drafts older than a day (asks first; `-n` dry run, `-y` no prompt) |
 | `collab help` | Print the command list |
 
-<details>
 <summary><b>Commands the agents run</b> (the skill handles these; you normally don't need them)</summary>
 
 | Command | What it does |
@@ -333,7 +331,6 @@ Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` note not ackn
 agent idle · `14` check failed · `15` queue empty · `16` decision for the user · `17` files changed
 since review/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md#exit-codes).
 
-</details>
 
 ## FAQ
 
