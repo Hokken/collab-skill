@@ -5,8 +5,8 @@
 <h1 align="center">Collab</h1>
 
 <p align="center">
-  <b>Let two AI coding agents pair-program with each other, one building and one reviewing, while you watch.</b><br>
-  No more copy-pasting summaries and reviews between terminals.
+  <b>Pair programming for AI coding agents: one builds, the other reviews the real changes and steers it.</b><br>
+  You watch, step in whenever you like, and only get asked when a choice is yours.
 </p>
 
 <p align="center">
@@ -16,96 +16,85 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-a-run-looks-like">What a run looks like</a> ·
+  <a href="#everyday-use">Everyday use</a> ·
+  <a href="#command-reference">Commands</a> ·
+  <a href="#faq">FAQ</a>
+</p>
+
 ---
 
-## Why
+## What you get
 
-If you use two coding agents, say **Claude Code** and **Codex CLI**, you've probably found that
-one writes better code when the other reviews it. The workflow is great. The plumbing is not:
+Collab brings **pair programming** to coding agents. The idea is the same as with two human
+developers: one *drives* (writes the code), the other *navigates* (reads it critically). Two
+perspectives catch what one misses. The navigator questions implementation choices, brings
+insights from another angle, and the pair settles on an implementation both agree on before it
+counts as done. Using two different agents (say **Claude Code** and **Codex CLI**) makes those
+perspectives genuinely different.
 
-1. Ask the implementer for a summary of what it did.
-2. Copy it into the reviewer's terminal.
-3. Copy the review back.
-4. Repeat until they agree.
+**Collab turns that into a loop that runs by itself**: you give a task to one agent, start the
+other as the reviewer, and they work it through together until the reviewer approves, then move
+on to the next task.
 
-**Collab automates the plumbing.** You give the task to one agent, start the other as the
-reviewer, and they hand the work back and forth by themselves until the reviewer approves it.
-You get a notification when it's done, or when they need you.
-
-## How it feels
+It's more than taking turns:
 
 ```text
-You ▸ /collab implement            (in Claude Code)
-     "Add input validation to the signup form, with tests."
-
-You ▸ $collab review               (in Codex, another terminal)
-
-  #000  implementer  brief     Add input validation to the signup form…
-  #001  implementer  ready     Added zod schema, 9 tests, all passing
-  #002  reviewer     changes   1. [blocking] email regex accepts "a@b" …
-  #003  implementer  ready     Fixed 1: switched to zod .email(), +2 tests
-  #004  reviewer     approve   Verdict: approved ✔
-
-  🔔 collab: DONE
+                    You:  collab watch · collab note · answer decisions
+                         │                                       │
+                         v                                       v
+  ┌──────────────────────────┐   hand off: summary    ┌──────────────────────────┐
+  │       Implementer        │ ─────────────────────> │         Reviewer         │
+  │  builds, runs checks,    │                        │  reads the real git diff │
+  │  posts progress          │ <───────────────────── │  numbered findings,      │
+  │                          │   changes / approve    │  or approve              │
+  │                          │ < ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │                          │
+  └──────────────────────────┘  note, mid-turn (opt.) └──────────────────────────┘
 ```
 
-The agents took four turns and nobody copy-pasted anything. Each step, in full, stays browsable
-in the dashboard and in the log.
+- **The reviewer reads the real code.** Collab snapshots your git repos when a task starts, so
+  the review covers what actually changed, not what the implementer says it changed.
+- **Steering goes both ways, mid-flight.** You can send the agents a note at any time with
+  `collab note "…"`, and the reviewer can send the implementer one too, for example after looking
+  at the live diff when you ask it to ([how](#while-it-runs)). A note reaches the agent at its next step and must be acknowledged
+  (`Note #N`) before it can hand off, so nothing is silently ignored.
+- **You stay in charge without babysitting.** When a choice is really yours (product behaviour,
+  an ambiguous requirement), the pair asks with a short list of options and carries on once you
+  pick one.
 
-## Features
+## Quick start
 
-- **Autonomous loop.** Implement → review → fix → review, task after task, until your whole
-  request is done. It only stops for a real fault, a blocker, or when you say so.
-- **Asks, doesn't stall.** When a choice is yours to make, you get a short list of options. Pick
-  one and the pair carries on. The final report lists every decision made along the way.
-- **Live dashboard.** `collab watch` shows whose turn it is, what they're doing right now, and
-  every step so far. Browse them with the arrow keys.
-- **Steer while it runs.** `collab note "don't touch the i18n files"` reaches the agents at their
-  next step, and they must acknowledge it (`Note #N`) before they can hand off. A note can't be lost
-  in discarded output, and an agent's own notes are always labelled as the agent's, never as yours.
-- **Queue up work.** Line up several tasks and the pair works through them one after another.
-  Each task can carry its own options: tests that must pass, a scope, a branch, a commit when done.
-- **Plan first (optional).** With `--plan`, the reviewer approves the approach before any code is
-  written.
-- **Reviews the real changes.** Each task snapshots your git repos (even several nested ones),
-  so the reviewer sees exactly what changed, not just the implementer's summary.
-- **Approval means what it says.** An approval covers the exact files the reviewer saw: if they
-  change afterwards, it is refused, and `collab verify` checks them again before a commit. Verdicts
-  must match their findings, and every handoff states what was verified and what wasn't.
-- **Learns your project.** Recurring review findings and conventions become *project lessons*,
-  put into every later brief, so the same mistake isn't made twice. You can list and prune them.
-- **Pings your phone (optional).** With `--phone`, decisions, escalations, stalls and the end of
-  the run reach your phone through the free [ntfy](https://ntfy.sh) app. No account needed.
-- **Never gets stuck silently.** Agents post short progress updates. If one goes quiet, the other
-  asks you: *stop, or keep waiting?*
-- **Cheap to run.** Waiting is a blocking shell command, so no tokens are spent while an agent waits.
-- **Tiny.** One Node.js file, no dependencies, works on macOS, Linux and Windows.
+**You need:** Node.js 18+, git, and two agent CLIs that load
+[agent skills](https://docs.claude.com/en/docs/claude-code/skills), e.g. **Claude Code** and
+**Codex CLI** (either can take either role).
 
-## Requirements
-
-- **Node.js 18+**, and **git** (for reviewing diffs).
-- Two agents that can load [agent skills](https://docs.claude.com/en/docs/claude-code/skills) and
-  run shell commands. Tested with **Claude Code** and **Codex CLI**, in either role.
-
-## Install
-
-**macOS / Linux**
+### Install
 
 ```bash
+# macOS / Linux
 git clone https://github.com/Hokken/collab-skill.git
-cd collab-skill
-./install.sh
+cd collab-skill && ./install.sh
 ```
-
-**Windows** (PowerShell)
 
 ```powershell
+# Windows (PowerShell)
 git clone https://github.com/Hokken/collab-skill.git
-cd collab-skill
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+cd collab-skill; powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-**Or with the [skills](https://skills.sh) installer:**
+The installer links the skill into Claude Code and Codex and puts a `collab` command in
+`~/.local/bin`. If that folder isn't on your PATH, it tells you what to add (on Windows it offers
+to add it). Then **open a new terminal** (on Windows, restart VS Code too) and restart your agent
+sessions so they load the skill. Check it with:
+
+```bash
+collab help
+```
+
+<details>
+<summary>Prefer the <a href="https://skills.sh">skills</a> installer?</summary>
 
 ```bash
 npx skills add Hokken/collab-skill -g --agent claude-code codex
@@ -113,122 +102,148 @@ npx skills add Hokken/collab-skill -g --agent claude-code codex
 ```
 
 On Windows, run `~\.agents\skills\collab\install.ps1` for the second step. Update later with
-`npx skills update`.
+`npx skills update`. With the git install, updating is just `git pull`. Windows tips:
+[docs/windows.md](docs/windows.md).
 
-The git installer links the skill into `~/.agents/skills/collab` (Codex) and
-`~/.claude/skills/collab` (Claude Code), and puts a `collab` command on your PATH. It only creates
-links, so **updating is just `git pull`**. Windows users: see [docs/windows.md](docs/windows.md)
-for a few tips.
+</details>
 
-Check it worked:
+### Run your first task
 
-```bash
-collab help
-```
+Open three terminals in your project folder.
 
-## Quick start
-
-After [installing Collab](#install), follow these steps. This example uses Codex as the reviewer
-and Claude Code as the implementer.
-
-1. **Open three terminals in the same project folder.** Use the project you want the agents to
-   work on, such as your app's repository.
-
-2. **Start the reviewer in terminal 1.** Launch Codex CLI, then send this message in its chat:
-
+1. **Reviewer** (terminal 1). Start Codex and send:
    ```text
    $collab review
    ```
+   It waits for a task to appear. Leave it running.
 
-   The reviewer will wait for the implementer to create a task. Leave it running.
-
-3. **Give the implementer a task in terminal 2.** Launch Claude Code, then send this message in
-   its chat, replacing the example task with your own:
-
+2. **Implementer** (terminal 2). Start Claude Code and send your task:
    ```text
    /collab implement Add input validation to the signup form, with tests.
    ```
+   Or send `/collab implement` on its own and describe the task when it asks. (With queued
+   tasks, it starts the first one instead.)
 
-   You don't have to include the task in the initial command. You can send `/collab implement`
-   on its own, wait for the agent to ask what to build, then describe your task in your next
-   message. (If you already have queued tasks, it starts the first one instead.)
-
-   The implementer writes a short brief and starts working. The two agents then take turns
-   implementing, reviewing, and fixing the changes automatically.
-
-4. **Watch progress in terminal 3.** Run this command at the shell prompt:
-
+3. **You** (terminal 3, optional):
    ```bash
-   collab watch
+   collab watch                          # live dashboard
+   collab note "keep the public API unchanged"   # steer at any time
    ```
 
-   Use ↑↓ to browse steps, ←→ for earlier tasks, and `q` to leave the dashboard. When the task
-   finishes or needs your input, Collab notifies you and the agents report back.
+That's it. The implementer writes a brief and starts; the two hand the work back and forth until
+the reviewer approves. You get a desktop notification when it's done or when they need you.
 
-You can swap the roles: use `/collab review` in Claude Code and `$collab implement` followed by
-your task in Codex.
-
-> 💡 Let the agents run without permission prompts (e.g. Claude Code's auto mode, or allow
+> [!TIP]
+> Let the agents run without permission prompts (Claude Code's auto mode, or allow
 > `Bash(collab:*)`), otherwise every handoff stops to ask you.
 
-Want the approach agreed first? Add `--plan` before your task in step 3, for example:
+Roles swap freely: `/collab review` in Claude Code and `$collab implement …` in Codex works just
+as well. Want the approach agreed before any code? Add `--plan`:
 `/collab implement --plan Add input validation to the signup form, with tests.`
 
-## Queue up a morning's work
+## What a run looks like
 
-```bash
-collab queue add --branch feat/validation --check "npm test" --commit "Add signup form validation"
-collab queue add --plan --focus security --scope "src/auth/**" --check "npm test" "Refactor the auth middleware"
-collab queue add --confirm "Run the DB migration for user roles"
+The timeline of a task in `collab watch` (illustrative: `human` is your note, `peer` a
+mid-turn note from the reviewer, which it *can* send but most tasks don't need):
+
+```text
+  #000  implementer  brief             Add input validation to the signup form…
+  #001  human        note-all          Use zod, it's already a dependency
+  #002  peer         note-implementer  Your diff touches src/api/users.ts, outside the form…
+  #003  implementer  ready             Added zod schema, 9 tests (Note #1 zod, Note #2 reverted)
+  #004  reviewer     changes           1. [blocking] email regex accepts "a@b" …
+  #005  implementer  ready             Fixed 1: switched to zod .email(), +2 tests
+  #006  reviewer     approve           Verdict: approved ✔
+
+  🔔 collab: DONE
 ```
 
-Then start the pair as usual, with `/collab implement` and no task. The implementer takes the first
-queued task. When it's done, it moves on to the next one, and the reviewer follows. If a task gets
-escalated, the queue pauses until you've had a look. You can add tasks any time, even while they
-work.
+Nobody copy-pasted anything. Every step, in full, stays browsable in the dashboard
+(↑↓ steps, ←→ earlier tasks) and in `collab log`. At the end of the run you get one report:
+what was delivered, what was verified, every decision taken and what to check by hand.
+
+## Why it works
+
+- **Reviews the real changes.** Diffs come from a git snapshot taken at the start of the task,
+  nested repos included. Files outside a task's `--scope` are flagged.
+- **Approval means what it says.** An approval covers the exact files the reviewer saw. If they
+  change afterwards, the approval is refused, and `collab verify` checks again before a commit.
+- **Honest handoffs.** Each handoff states what was verified, what was attempted, what was
+  deferred and what isn't claimed. The reviewer treats a false "verified" as a blocking issue.
+- **Notes can't get lost.** Every note must be acknowledged as `Note #N`, even if the agent
+  missed the output it arrived in. An agent's note is always labelled as the agent's, never as yours.
+- **Asks instead of guessing, and doesn't argue forever.** Choices that are yours come to you as
+  numbered options. After 4 review rounds (configurable) you pick: 2 more rounds, approve as it is, or stop.
+- **Learns your project.** Recurring findings become *project lessons*, put into every later brief.
+- **Never stuck silently.** Agents post progress. If one goes quiet, the other asks you whether
+  to keep waiting.
+- **Cheap and tiny.** Waiting is a blocking shell command, so it costs no tokens. One Node.js file,
+  no dependencies, macOS, Linux and Windows.
+
+## Everyday use
+
+### Task options
+
+Add these to `/collab implement …` or to `collab queue add`:
 
 | Option | What it does |
 |---|---|
 | `--plan` | The reviewer approves a plan before any code is written |
-| `--check "npm test"` | Must pass before every handoff. Collab runs it and refuses to hand off on failure |
+| `--check "npm test"` | Must pass before each implementation handoff (`ready`). Collab runs it and refuses that handoff on failure |
 | `--scope "src/auth/**"` | Files the task may change. `collab diff` flags anything outside, and the reviewer treats it as blocking |
 | `--focus "security"` | What the reviewer should look at hardest |
 | `--branch feat/x` | Work on this branch |
 | `--commit` | Commit the changes when the task is done (never pushes) |
-| `--confirm` | Ask you before this queued task starts |
+| `--confirm` | Queued tasks only: ask you before this one starts |
 | `--phone` | Push to your phone when you're needed (see [Phone notifications](#phone-notifications)); stays on for the rest of the run |
 | `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
-| `--first` | Put it at the front of the queue |
+| `--first` | Queued tasks only: put it at the front of the queue |
 
-The same options work for a single task: `/collab implement --check "npm test" fix the login redirect`.
-Manage the queue with `collab queue` (list), `collab queue rm 2`, `collab queue move 3 1` and
-`collab queue clear`.
+Example: `/collab implement --check "npm test" --scope "src/auth/**" fix the login redirect`.
 
-You don't have to split big jobs yourself. If a task is too big to review well in one go, the
-implementer can split it with `collab queue split`. The current task becomes part 1, and the other
-parts are queued right after it, with the same options. It tells you how it split the work, and
-you can still edit the queue.
-
-## While it runs
+### Queue up a morning's work
 
 ```bash
-collab watch                                  # interactive dashboard (↑↓ steps · ←→ tasks · space scroll · q quit)
+collab queue add --branch feat/validation --check "npm test" --commit "Add signup form validation"
+collab queue add --plan --focus security --scope "src/auth/**" "Refactor the auth middleware"
+collab queue add --confirm "Run the DB migration for user roles"
+```
+
+Then start the pair with `/collab implement` and no task. The implementer takes the first queued
+task, and when it's done moves on to the next one; the reviewer follows. An escalated task pauses
+the queue until you've had a look. Add tasks any time, even while they work. Manage it with
+`collab queue`, `queue rm 2`, `queue move 3 1` and `queue clear`.
+
+Big jobs split themselves: if a task is too big to review in one go, the implementer splits it
+with `collab queue split`, keeps part 1, queues the rest right after with the same options, and
+tells you how it split the work.
+
+### While it runs
+
+```bash
+collab watch                                  # dashboard (↑↓ steps · ←→ tasks · space scroll · q quit)
 collab note "keep the public API unchanged"   # tell both agents something new
 collab note -r "be strict on accessibility"   # just the reviewer (-i = just the implementer)
+collab answer 2                               # pick option 2 of a pending decision
 collab status                                 # one-line summary
-collab log                                    # the full conversation between the agents
 collab diff --stat                            # what actually changed in your code
+collab log                                    # the full conversation between the agents
 collab abort                                  # stop both agents
 ```
 
-When it's finished, both agents give you a short report. `collab clean` tidies up old tasks.
+Want the reviewer to look at the work in progress? While it waits for its turn, the reviewer is
+blocked in `collab wait` and only sees notes for it when its turn comes, so a `collab note -r`
+steers its *next* review, it doesn't wake it up. To get an early look, talk to the reviewer
+directly in its own terminal (interrupt it and ask it to check `collab diff` now). It can then
+send the implementer a note (`collab note --from reviewer`), which reaches the implementer at its
+next progress update and must be acknowledged before it hands off.
 
 ### Project lessons
 
-When a review turns up something a future task in the same project would get wrong too (a
-convention, a recurring mistake), the agents record it as a *lesson*. Every new brief for that
-project includes the lessons, and the reviewer checks the work against them. Your current
-instructions and the project's own rules (`CLAUDE.md`, `AGENTS.md`) always come first.
+When a review turns up something a future task in the same project would also get wrong (a
+convention, a recurring mistake), the agents record it as a *lesson*. Every new brief includes the
+project's lessons, and the reviewer checks the work against them. Your instructions and the
+project's own rules (`CLAUDE.md`, `AGENTS.md`) always come first.
 
 ```bash
 collab lessons                                # list this project's lessons
@@ -236,78 +251,33 @@ collab lessons add "Never edit generated files in src/gen/"
 collab lessons rm 4                           # drop one that's wrong or outdated
 ```
 
-Lessons live in `.collab/lessons.md` at the top of your repo (a module inside it shares the same
-file), a plain Markdown list you can read and edit. Commit it, and every teammate, machine and
-clone gets the same lessons. When editing by hand:
-
-- each top-level `- ` bullet is one lesson (indented lines continue it), at most 300 characters:
-  a longer one stays in the file but is left out of briefs until you shorten it;
-- headings, notes, code blocks and HTML comments are left alone, and bullets inside them are not
-  lessons, so you can keep examples there.
-
-Collab's writes to the file never count as part of the work under review, so they can't void an
-approval. That also means your own edits to it aren't reviewed: check it with `git diff` before
-committing. The final report lists the lessons recorded during the run, so you can prune them first.
+They live in `.collab/lessons.md` in your repo: commit it and every teammate gets them.
+File format and editing rules: [docs/reference.md](docs/reference.md#the-lessons-file).
 
 ### Phone notifications
 
-Off unless you ask: add `--phone` to a task (`/collab implement --phone …` or
-`collab queue add --phone …`). You then get a push when a decision is waiting for you, a task is
-escalated or stalls, an agent looks unresponsive, a confirm-first queued task needs your go-ahead,
-and when the whole run is done. Ordinary handoffs don't notify you. The rest of the run keeps
-`--phone`; a new request needs it again.
+Add `--phone` to a task and you get a push, through the free [ntfy](https://ntfy.sh) app (no
+account), when a decision is waiting, a task is escalated or stalls, an agent goes quiet, and
+when the run is done. Ordinary handoffs stay silent. The first time, the implementer gives you a
+private topic to subscribe to; `collab phone test` sends a test push.
 
-The first time, collab creates a private, random [ntfy](https://ntfy.sh) topic and the implementer
-tells you its name: install the ntfy app and subscribe to it. `collab phone` shows the topic,
-`collab phone test` sends a test push, and `collab phone set <topic | url>` switches to your own
-topic or a self-hosted server. ntfy.sh topics are public to anyone who knows the name, so keep it
-private. Pushes contain the task id and the decision question.
-
-Collab only sees what goes through it. An agent stuck on its own permission prompt ("Allow this
-command?") looks merely quiet until the 30-minute idle check. To hear about those right away,
-let the agent CLI call `collab phone send`. It pushes "Waiting for you: …" only when the project
-has a running `--phone` task, and does nothing otherwise:
-
-- **Claude Code** (`~/.claude/settings.json`): its questions (AskUserQuestion) fire no
-  notification, so they need a `PreToolUse` hook; permission prompts come through `Notification`:
-  ```json
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
-    ],
-    "Notification": [
-      { "matcher": "permission_prompt|elicitation_dialog",
-        "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
-    ]
-  }
-  ```
-  The hook prints nothing, so the question or prompt shows as usual. Don't add `idle_prompt`:
-  Claude Code ends its turn while it waits in the loop, so that one would fire all the time.
-- **Codex** (`~/.codex/hooks.json`; hooks are on by default, and Codex asks you once to trust a
-  new hook):
-  ```json
-  { "hooks": { "PermissionRequest": [
-      { "hooks": [{ "type": "command", "command": "collab phone send", "timeout": 10 }] }
-  ] } }
-  ```
-  The hook prints nothing on stdout and always exits 0, so Codex's normal approval prompt is
-  unchanged.
+To also hear about an agent stuck on its own permission prompt, add a small hook to Claude Code
+or Codex: see [docs/reference.md](docs/reference.md#hooks-for-agent-permission-prompts).
 
 ## Command reference
 
 The same list as `collab help`, grouped by what you'd use it for. 🤖 marks commands the agents
-also run themselves.
+also run themselves. Add `-t <task-id>` to any command to target a task other than the current one.
 
 **Watch and steer**
 
 | Command | What it does |
 |---|---|
 | `collab watch [--interval S]` | Interactive dashboard: steps (↑↓), tasks (←→), live progress |
-| `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer). Each must be acknowledged as `Note #N` in the agent's next handoff |
+| `collab note "text" [-i \| -r]` | Tell the agents something new (both by default; `-i` just the implementer, `-r` just the reviewer). Each must be acknowledged as `Note #N` in the agent's next handoff. 🤖 agents use `--from <role>` to reach the other agent |
+| `collab answer <N \| text>` | Answer a pending decision: option N, or your own words. 🤖 when you pick an option in Claude Code |
 | `collab snooze [MIN]` | Keep waiting on a slow agent: no idle prompt for MIN minutes (default 30). 🤖 when you answer *keep waiting* |
 | `collab abort` | Stop the current task; both agents exit their loop. 🤖 when you answer *stop* |
-| `collab answer <N \| text>` | Answer a pending decision: option N, or your own words. 🤖 when you pick an option in Claude Code |
 
 **Look at a task**
 
@@ -316,7 +286,7 @@ also run themselves.
 | `collab status` | One-shot summary of the current task. 🤖 after an unexpected exit code |
 | `collab log` | Full history: brief, summaries, reviews, notes |
 | `collab show [N]` | Print entry #N (default: the latest one) |
-| `collab diff [--stat]` | What changed in the project since the task started. 🤖 the reviewer, on every review |
+| `collab diff [--stat] [--all] [--since-review]` | What changed in the project since the task started. Lockfile patches are left out unless `--all`; `--since-review` shows only what changed since the last review. 🤖 the reviewer, on every review |
 | `collab list` | All tasks (`*` = current) with status and round |
 | `collab path` | Folder holding the current task's files |
 
@@ -325,17 +295,15 @@ also run themselves.
 | Command | What it does |
 |---|---|
 | `collab queue` | List queued tasks (`*` = this project) |
-| `collab queue add [options] "task"` | Queue a task; the implementer starts it after the current one (options [above](#queue-up-a-mornings-work)) |
+| `collab queue add [options] "task"` | Queue a task; the implementer starts it after the current one (see [Task options](#task-options)) |
 | `collab queue rm N` · `move N M` · `clear [--all]` | Edit the queue |
 | `collab lessons [add "text" \| rm N]` | List, add or remove this project's lessons (see [Project lessons](#project-lessons)) |
 | `collab phone [set <topic \| url> \| test \| send]` | Show, change or test where `--phone` tasks push to; `send` is for agent CLI hooks (see [Phone notifications](#phone-notifications)) |
 | `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks and drafts older than a day (asks first; `-n` dry run, `-y` no prompt) |
-| `collab help` | Print this list |
-
-Add `-t <task-id>` to any command to target a task other than the current one.
+| `collab help` | Print the command list |
 
 <details>
-<summary><b>Commands the agents run</b> (the skill handles these, you normally don't need them)</summary>
+<summary><b>Commands the agents run</b> (the skill handles these; you normally don't need them)</summary>
 
 | Command | What it does |
 |---|---|
@@ -343,17 +311,19 @@ Add `-t <task-id>` to any command to target a task other than the current one.
 | `collab queue next` · `queue skip` | Show / drop the next queued task for this project |
 | `collab queue split [--reason TEXT]` | Implementer: split the current task (parts on stdin, separated by `=== part ===` lines); part 1 stays, the rest queue next |
 | `collab check` | Run the task's `--check` command |
-| `collab verify` | Implementer: are the project files still the ones the reviewer approved? Exit 0 yes, 17 no. 🤖 before a `--commit` commit |
+| `collab verify` | Implementer: are the project files still the ones the reviewer approved? Exit 0 yes, 17 no. Run before a `--commit` commit |
 | `collab scratch` | Folder for message drafts, notes and logs: the task's own, or a shared drafts folder before `init`. Keeps them out of your project |
-| `collab join [--after ID]` | Reviewer: wait until a task exists, print its brief. With `--after` (the task it just finished), it also stops when the run ends |
+| `collab join [--after ID] [--force]` | Reviewer: wait until a task exists, print its brief. Refused when the task already has a live reviewer (`--force` takes over from a dead one). With `--after` (the task it just finished), it also stops when the run ends |
 | `collab end` | Implementer: the whole request is done. Ends the run for both agents (final report on stdin or `--file`) |
 | `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |
-| `collab progress "text"` | Post what you're doing now (shown to the other side) |
+| `collab progress "text"` | Post what it's doing now (shown to the other side and in `watch`) |
+| `collab note --from <role> "text"` | Send a note to the other agent mid-turn (labelled as the agent's, never as yours) |
 | `collab submit implementer <plan\|ready\|decide\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
 | `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself). `approve` is refused (exit 17) if the files changed since the implementer's handoff; `approve --rereviewed` after checking them |
 
-Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` new note · `13` other agent idle ·
-`14` check failed · `15` queue empty · `16` decision for you · `17` files changed since review/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md).
+Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` note not acknowledged · `13` other
+agent idle · `14` check failed · `15` queue empty · `16` decision for the user · `17` files changed
+since review/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md#exit-codes).
 
 </details>
 
@@ -368,11 +338,9 @@ Not for the coordination. Waiting is a plain shell command, so an agent spends n
 other works. You pay for the actual implementing and reviewing, as you would by hand.
 
 **What if they disagree forever?**
-They can't. After a round limit (default 4, `--max-rounds N`) you pick: 2 more rounds, approve
-as it is, or stop the task. Before that, they settle technical calls themselves (the safest
-option, noted in the final report). When a choice is really yours, such as product behaviour or
-an ambiguous requirement, they ask you right away with a short list of options and carry on once
-you pick one.
+They can't. After the round limit (default 4, `--max-rounds N`) you pick: 2 more rounds, approve
+as it is, or stop. Before that, they settle technical calls themselves (the safest option, noted
+in the final report) and ask you right away about choices that are really yours.
 
 **What if an agent crashes or hangs?**
 If the working agent goes quiet (no handoff, no progress update, no file changes for a while), the
@@ -381,36 +349,27 @@ waiting agent asks you whether to stop or keep waiting. `collab abort` always st
 **Can I still talk to the agents directly?**
 Yes. Typing into either CLI works for quick, agent-specific tweaks. Use `collab note` for anything
 both agents need to know, such as new requirements or scope changes, so the reviewer doesn't flag
-your instructions as scope creep.
+your instructions as scope creep. (Running `collab note` from inside an agent's own shell needs
+`--as-user`, so an agent can never post as you.)
 
 **Does it commit or push for me?**
-Only if you ask: with `--commit`, the implementer commits a task's changes once it's approved. Collab
-never pushes. Otherwise the agents follow your usual rules (`CLAUDE.md`, `AGENTS.md`).
+Only if you ask: with `--commit`, the implementer commits a task's changes once it's approved and
+verified. Collab never pushes. Otherwise the agents follow your usual rules (`CLAUDE.md`, `AGENTS.md`).
 
 **Can I run two pairs at once?**
 Yes. Each agent pins its own task id, so pairs in different projects don't interfere.
 
-## Configuration
-
-All optional, via environment variables:
-
-| Variable | Default | What it does |
-|---|---|---|
-| `COLLAB_MAX_ROUNDS` | `4` | Review rounds before you are asked how to go on |
-| `COLLAB_IDLE_SECS` | `1800` | Quiet time before "stop or keep waiting?" |
-| `COLLAB_QUIET_MINS` | `10` | …and no file changes for this long (implementer's turn) |
-| `COLLAB_STALL_SECS` | `7200` | Hard stop when nobody answers |
-| `COLLAB_POLL_SECS` | `5` | How often a waiting agent checks for its turn |
-| `COLLAB_CHECK_TIMEOUT` | `1800` | Seconds before a `--check` command is stopped |
-| `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications (phone pushes only depend on `--phone`) |
-| `COLLAB_PHONE_URL` | | Where `--phone` pushes go, overriding `collab phone set` |
-| `COLLAB_HOME` | `~/.collab` | Where task state, the queue and settings are kept (lessons live in the repo) |
+**Can I change the timeouts and limits?**
+Yes, with environment variables (`COLLAB_MAX_ROUNDS`, `COLLAB_IDLE_SECS`, `COLLAB_NOTIFY=0`, …).
+The full list is in [docs/reference.md](docs/reference.md#configuration).
 
 ## How it works
 
 Each agent runs the same skill ([`SKILL.md`](SKILL.md)), and the two coordinate through a small
-state folder that the `collab` CLI manages. When it's not their turn, they block on
-`collab wait`. When it is, they work, post progress, and hand off with `collab submit`.
+state folder (`~/.collab`) that the `collab` CLI manages. When it's not their turn, they block on
+`collab wait`. When it is, they work, post progress, and hand off with `collab submit`. The CLI
+enforces the protocol: whose turn it is, notes acknowledged, checks passed, approvals matching
+the files.
 
 Want the details, or to adapt it to other agents? See [docs/how-it-works.md](docs/how-it-works.md).
 
