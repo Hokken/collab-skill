@@ -131,7 +131,9 @@ Open three terminals in your project folder.
    ```
 
 That's it. The implementer writes a brief and starts; the two hand the work back and forth until
-the reviewer approves. You get a desktop notification when it's done or when they need you.
+the reviewer approves. When a task finishes or the pair needs you, `collab watch` shows it, the
+agents tell you in their terminals, and your desktop gets a best-effort notification. Away from
+your desk? Add `--phone` to get a push on your phone ([how](#phone-notifications)).
 
 > [!TIP]
 > Let the agents run without permission prompts (Claude Code's auto mode, or allow
@@ -263,6 +265,12 @@ private topic to subscribe to; `collab phone test` sends a test push.
 
 To also hear about an agent stuck on its own permission prompt, add a small hook to Claude Code
 or Codex: see [docs/reference.md](docs/reference.md#hooks-for-agent-permission-prompts).
+
+A push tells you something is waiting. To *answer* from your phone too, run the agent that
+presents decisions (usually the implementer) in Claude Code with
+[Remote Control](https://code.claude.com/docs/en/remote-control) on. You can then pick an option,
+or say *keep waiting* or *stop*, from the Claude app, and the pair carries on. From any terminal,
+`collab answer <N>` works too.
 
 ## Command reference
 
