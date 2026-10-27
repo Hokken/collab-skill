@@ -142,8 +142,9 @@ Roles swap freely: `/collab review` in Claude Code and `$collab implement …` i
 as well. In OpenCode, ask in words: *use the collab skill to implement …* or *use the collab skill
 to review task <task-id>*. OpenCode waits by re-running `collab wait` with a rising `--attempt`
 number, so its repeated-call guard (`doom_loop`) doesn't stop to ask you; if it still does, set
-`"permission": { "doom_loop": "allow" }` in `opencode.json`. A paired run with OpenCode hasn't been
-tested end to end yet; see [docs/other-agents.md](docs/other-agents.md). Want the approach agreed before any code? Add `--plan`:
+`"permission": { "doom_loop": "allow" }` in `opencode.json`.
+
+Want the approach agreed before any code? Add `--plan`:
 `/collab implement --plan Add input validation to the signup form, with tests.`
 
 ## What a run looks like
