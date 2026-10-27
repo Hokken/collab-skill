@@ -236,7 +236,7 @@ Agents branch on these, so they are part of the protocol:
 | `0` | OK / it's your turn |
 | `1` | error (message on stderr) |
 | `10` | the task is finished; stop looping (`join --after`: the run ended, or a task ended without approval) |
-| `11` | `wait` timed out and it's still not your turn; run it again |
+| `11` | `wait` timed out and it's still not your turn; run it again (with `--attempt N`, the message names `--attempt N+1`: the option has no other effect, it only keeps agent loop guards such as OpenCode's `doom_loop` from seeing identical calls) |
 | `12` | submit refused: a note for you is not acknowledged (`Note #N`) in your message |
 | `13` | the other agent looks unresponsive; ask the user whether to stop or keep waiting |
 | `14` | submit refused: the task's `--check` command failed |
@@ -249,7 +249,7 @@ Agents branch on these, so they are part of the protocol:
 `collab note` adds an entry for `all`, `implementer` or `reviewer`: from the user by default
 (`NNN-human-note-<to>.md`, shown as `!!! HUMAN NOTE`), or from an agent with `--from <role>`
 (`NNN-peer-note-<to>.md`, shown as `>>> NOTE FROM THE OTHER AGENT`, always addressed to the other
-agent). A plain `collab note` from an agent's shell (`CLAUDECODE=1`, `COLLAB_AGENT`, or Codex's
+agent). A plain `collab note` from an agent's shell (`CLAUDECODE=1`, OpenCode's `OPENCODE=1`, `COLLAB_AGENT`, or Codex's
 `CODEX_THREAD_ID` / `CODEX_SESSION_ID` / sandbox variables) is refused, so an agent can't post as the user; a user typing inside an agent
 session adds `--as-user`.
 

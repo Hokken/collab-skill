@@ -1134,7 +1134,11 @@ function takeOpts(args, { values = {}, flags = {} } = {}, { strict = false } = {
   return { opts, rest };
 }
 
-const timeoutOpt = { values: { '--timeout': 'timeout' } };
+// --attempt N does nothing but make each retry a different command, so an agent CLI's guard
+// against repeated identical tool calls (OpenCode's doom_loop) doesn't fire while waiting.
+const waitOpts = { values: { '--timeout': 'timeout', '--attempt': 'attempt' } };
+// The command to run again after exit 11, naming the next attempt when this one had --attempt.
+const again = (cmd, opts) => (opts.attempt === undefined ? cmd : `${cmd} --attempt ${toSecs(opts.attempt) + 1}`);
 const toSecs = (v, def) => {
   if (v === undefined) return def;
   if (!/^\d+$/.test(v)) die(`invalid number: ${v}`);
@@ -1263,7 +1267,7 @@ function cmdInit(args) {
   if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   out(`scratch: ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
-  out(`reviewer: /collab review ${id}  (Codex: $collab review ${id}): tell the user, so the reviewer joins this task`);
+  out(`reviewer: /collab review ${id}  (Codex: $collab review ${id}; OpenCode: "use the collab skill to review task ${id}"): tell the user, so the reviewer joins this task`);
   if (plan) out("Next: write a plan (no code yet), then 'collab submit implementer plan' with it on stdin.");
   else out("Next: implement, then 'collab submit implementer ready' with your summary on stdin.");
 }
@@ -1284,8 +1288,9 @@ function joinableTask(dir) {
 // one. Then the newest task of that project decides: a new active task is joined, `collab end`
 // on it stops the reviewer too (exit 10), and a long silence after DONE asks the user (exit 13).
 async function cmdJoin(args) {
-  const { opts } = takeOpts(args, { values: { ...timeoutOpt.values, '--after': 'after' }, flags: { '--force': { force: true } } });
+  const { opts } = takeOpts(args, { values: { ...waitOpts.values, '--after': 'after' }, flags: { '--force': { force: true } } });
   const timeout = toSecs(opts.timeout, 540);
+  toSecs(opts.attempt);
   const start = epoch();
   let projectDir = '';
   if (opts.after) {
@@ -1340,7 +1345,7 @@ async function cmdJoin(args) {
     }
     if (epoch() - start >= timeout) {
       out(`no active task yet (waited ${fmtDur(epoch() - start)}). This is normal: the implementer may still be writing the brief.`);
-      out(`Run 'collab join${opts.after ? ` --after ${opts.after}` : ''}' again right away. Keep waiting; don't end your turn.`);
+      out(`Run '${again(`collab join${opts.after ? ` --after ${opts.after}` : ''}`, opts)}' again right away. Keep waiting; don't end your turn.`);
       exit(EXIT_TIMEOUT);
     }
     await sleep(POLL * 1000);
@@ -1477,11 +1482,12 @@ function printPlanDelta(d, st, f) {
 }
 
 async function cmdWait(args) {
-  const { opts, rest } = takeOpts(args, timeoutOpt);
+  const { opts, rest } = takeOpts(args, waitOpts);
   const role = rest[0];
-  if (!ROLES.includes(role)) die('usage: collab wait <implementer|reviewer> [--timeout SECS]');
+  if (!ROLES.includes(role)) die('usage: collab wait <implementer|reviewer> [--timeout SECS] [--attempt N]');
   const other = role === 'implementer' ? 'reviewer' : 'implementer';
   const timeout = toSecs(opts.timeout, 540);
+  toSecs(opts.attempt);
   const start = epoch();
   const d = taskDir();
   for (;;) {
@@ -1520,8 +1526,8 @@ async function cmdWait(args) {
         exit(EXIT_DECISION);
       }
       if (epoch() - start >= timeout) {
-        if (presenter === role) out(`still waiting — the user has not answered the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question yet ('collab answer <N | text>'). Run 'collab wait ${role}' again.`);
-        else out(`still waiting — the ${presenter} presents the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question to the user; don't ask the user about it yourself. Run 'collab wait ${role}' again.`);
+        if (presenter === role) out(`still waiting — the user has not answered the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question yet ('collab answer <N | text>'). Run '${again(`collab wait ${role}`, opts)}' again.`);
+        else out(`still waiting — the ${presenter} presents the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question to the user; don't ask the user about it yourself. Run '${again(`collab wait ${role}`, opts)}' again.`);
         exit(EXIT_TIMEOUT);
       }
       await sleep(POLL * 1000);
@@ -1547,7 +1553,7 @@ async function cmdWait(args) {
       const info = p
         ? `latest ${st.turn} progress: "${p.text}" (${fmtDur(epoch() - p.epoch)} ago)`
         : `no progress update from the ${st.turn} yet (turn started ${fmtDur(epoch() - turnStart(st))} ago)`;
-      out(`still waiting — status: ${st.status}, turn: ${st.turn}; ${info}. Run 'collab wait ${role}' again.`);
+      out(`still waiting — status: ${st.status}, turn: ${st.turn}; ${info}. Run '${again(`collab wait ${role}`, opts)}' again.`);
       exit(EXIT_TIMEOUT);
     }
     await sleep(POLL * 1000);
@@ -1788,8 +1794,9 @@ async function cmdSubmit(args) {
 function agentShell() {
   const e = process.env;
   // Claude Code sets CLAUDECODE=1 in its shells; Codex sets CODEX_THREAD_ID / CODEX_SESSION_ID in
-  // every session (its sandbox variables only when sandboxed). COLLAB_AGENT=1 marks any other agent.
-  return e.CLAUDECODE === '1' || !!e.COLLAB_AGENT || !!e.CODEX_THREAD_ID || !!e.CODEX_SESSION_ID
+  // every session (its sandbox variables only when sandboxed); OpenCode sets OPENCODE=1 in its own
+  // process, which its shells inherit. COLLAB_AGENT=1 marks any other agent.
+  return e.CLAUDECODE === '1' || e.OPENCODE === '1' || !!e.COLLAB_AGENT || !!e.CODEX_THREAD_ID || !!e.CODEX_SESSION_ID
     || !!e.CODEX_SANDBOX || !!e.CODEX_SANDBOX_NETWORK_DISABLED;
 }
 
@@ -2754,10 +2761,25 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   lines.push(`${roleColor(it.role)}${B}${title}${R}${D}${range}${R}`);
   for (const l of body.slice(view.scroll, view.scroll + bodyH)) lines.push([...l].slice(0, cols).join(''));
   while (pad && lines.length < rows - footerRows) lines.push('');
+  const flash = view.flash && view.flash.until > Date.now() ? `${G}${view.flash.text}${R}  ` : '';
   lines.push(keys
-    ? `${D}↑↓ step · ←→ task · space/b scroll · g/G first/latest · f follow: ${view.follow ? 'on' : 'off'} · q quit${R}`
+    ? `${flash}${D}↑↓ step · ←→ task · space/b scroll · g/G first/latest · f follow: ${view.follow ? 'on' : 'off'} · c copy id · q quit${R}`
     : `${D}steer: collab note "…"  ·  stop: collab abort${R}`);
   return lines.slice(0, rows).map((l) => clipAnsi(l, cols));
+}
+
+// Puts text on the system clipboard; falls back to OSC 52 (the terminal's clipboard, also over ssh).
+function copyText(text) {
+  const tools = process.platform === 'darwin' ? [['pbcopy']]
+    : process.platform === 'win32' ? [['clip']]
+      : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']];
+  for (const [cmd, ...args] of tools) {
+    const r = spawnSync(cmd, args, { input: text, stdio: ['pipe', 'ignore', 'ignore'], timeout: 2000, windowsHide: true });
+    if (!r.error && r.status === 0) return true;
+  }
+  if (!process.stdout.isTTY) return false;
+  process.stdout.write(`\x1b]52;c;${Buffer.from(text).toString('base64')}\x07`);
+  return true;
 }
 
 async function cmdWatch(args) {
@@ -2823,6 +2845,7 @@ async function cmdWatch(args) {
           break;
         }
         case 'f': view.follow = !view.follow; view.scroll = 0; break;
+        case 'c': if (view.task) view.flash = { text: `${copyText(view.task) ? 'copied' : 'could not copy'} ${view.task}`, until: Date.now() + 2500 }; break;
         case 'space': case 'pagedown': view.scroll += page; break;
         case 'b': case 'pageup': view.scroll -= page; break;
         default: return undefined;
@@ -2901,6 +2924,8 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
   ${C}end${R}                         Implementer: the whole request is done; ends the run for both
                               (final report on stdin or --file)
   ${C}wait${R} <implementer|reviewer> Block until it's that agent's turn (or the task ends)
+                              join and wait take --timeout SECS (default 540) and --attempt N
+                              (no effect; agents raise it on each retry so loop guards don't fire)
   ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
   ${C}submit${R} implementer <plan|ready|decide|escalate>
   ${C}submit${R} reviewer <changes|approve [--rereviewed]|decide|escalate>
@@ -2910,6 +2935,7 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
 ${B}START A SESSION${R}
   Claude Code:  /collab implement   ·  /collab review     ${D}(add --plan to plan first)${R}
   Codex:        $collab implement   ·  $collab review
+  OpenCode:     "use the collab skill to implement …"  ·  "… to review task <id>"
 
 ${D}Options: -t <task-id> targets another task · state lives in ~/.collab/tasks/
 Exit codes: 0 ok · 10 finished · 11 wait timed out · 12 note not acknowledged · 13 other agent idle · 14 check failed · 15 queue empty · 16 decision for the user · 17 tree changed since review/approval · 1 error${R}`);

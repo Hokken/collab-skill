@@ -68,7 +68,7 @@ It's more than taking turns:
 
 **You need:** Node.js 18+, git, and two agent CLIs that load
 [agent skills](https://docs.claude.com/en/docs/claude-code/skills), e.g. **Claude Code** and
-**Codex CLI** (either can take either role).
+**Codex CLI**, or **OpenCode** (any of them can take either role).
 
 ### Install
 
@@ -84,7 +84,7 @@ git clone https://github.com/Hokken/collab-skill.git
 cd collab-skill; powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer links the skill into Claude Code and Codex and puts a `collab` command in
+The installer links the skill into Claude Code and Codex (OpenCode reads the same folders) and puts a `collab` command in
 `~/.local/bin`. If that folder isn't on your PATH, it tells you what to add (on Windows it offers
 to add it). Then **open a new terminal** (on Windows, restart VS Code too) and restart your agent
 sessions so they load the skill. Check it with:
@@ -139,7 +139,11 @@ your desk? Add `--phone` to get a push on your phone ([how](#phone-notifications
 > `Bash(collab:*)`), otherwise every handoff stops to ask you.
 
 Roles swap freely: `/collab review` in Claude Code and `$collab implement …` in Codex works just
-as well. Want the approach agreed before any code? Add `--plan`:
+as well. In OpenCode, ask in words: *use the collab skill to implement …* or *use the collab skill
+to review task <task-id>*. OpenCode waits by re-running `collab wait` with a rising `--attempt`
+number, so its repeated-call guard (`doom_loop`) doesn't stop to ask you; if it still does, set
+`"permission": { "doom_loop": "allow" }` in `opencode.json`. A paired run with OpenCode hasn't been
+tested end to end yet; see [docs/other-agents.md](docs/other-agents.md). Want the approach agreed before any code? Add `--plan`:
 `/collab implement --plan Add input validation to the signup form, with tests.`
 
 ## What a run looks like
@@ -222,7 +226,7 @@ tells you how it split the work.
 ### While it runs
 
 ```bash
-collab watch                                  # dashboard (↑↓ steps · ←→ tasks · space scroll · q quit)
+collab watch                                  # dashboard (↑↓ steps · ←→ tasks · space scroll · c copy task id · q quit)
 collab note "keep the public API unchanged"   # tell both agents something new
 collab note -r "be strict on accessibility"   # just the reviewer (-i = just the implementer)
 collab answer 2                               # pick option 2 of a pending decision
@@ -321,7 +325,7 @@ also run themselves. Add `-t <task-id>` to any command to target a task other th
 | `collab scratch` | Folder for message drafts, notes and logs: the task's own, or a shared drafts folder before `init`. Keeps them out of your project |
 | `collab join [--after ID] [--force]` | Reviewer: wait until a task exists, print its brief. Refused when the task already has a live reviewer (`--force` takes over from a dead one). With `--after` (the task it just finished), it also stops when the run ends |
 | `collab end` | Implementer: the whole request is done. Ends the run for both agents (final report on stdin or `--file`) |
-| `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends) |
+| `collab wait <implementer\|reviewer>` | Block until it's that agent's turn (or the task ends). `wait` and `join` take `--timeout SECS` and `--attempt N` (no effect; OpenCode raises it on each retry) |
 | `collab progress "text"` | Post what it's doing now (shown to the other side and in `watch`) |
 | `collab note --from <role> "text"` | Send a note to the other agent mid-turn (labelled as the agent's, never as yours) |
 | `collab submit implementer <plan\|ready\|decide\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |

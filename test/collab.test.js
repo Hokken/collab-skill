@@ -10,7 +10,7 @@ const { spawnSync } = require('child_process');
 const CLI = path.join(__dirname, '..', 'bin', 'collab.js');
 
 // The tests act as the user unless a test sets an agent marker itself.
-const NO_AGENT = { CLAUDECODE: '', COLLAB_AGENT: '', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '', CODEX_SANDBOX: '', CODEX_SANDBOX_NETWORK_DISABLED: '' };
+const NO_AGENT = { CLAUDECODE: '', COLLAB_AGENT: '', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '', CODEX_SANDBOX: '', CODEX_SANDBOX_NETWORK_DISABLED: '', OPENCODE: '' };
 
 const CLOSEOUT = '## Closeout\nVerified: none\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n';
 
@@ -583,10 +583,10 @@ test('a task from before acknowledgements: notes already shown stay handled, eve
   assert.equal(t.run(['submit', 'reviewer', 'approve'], { input: `ok (Note #${newR} considered)` }).code, 10);
 });
 
-test('agent shells are recognised (Claude Code, Codex sessions sandboxed or not, COLLAB_AGENT); the user override stays', () => {
+test('agent shells are recognised (Claude Code, Codex sessions sandboxed or not, OpenCode, COLLAB_AGENT); the user override stays', () => {
   const s = sandbox();
   s.run(['init', 'shells'], { input: 'brief' });
-  for (const env of [{ CLAUDECODE: '1' }, { CODEX_THREAD_ID: 't-1' }, { CODEX_SESSION_ID: 's-1' }, { CODEX_SANDBOX: 'seatbelt' }, { COLLAB_AGENT: '1' }]) {
+  for (const env of [{ CLAUDECODE: '1' }, { CODEX_THREAD_ID: 't-1' }, { CODEX_SESSION_ID: 's-1' }, { CODEX_SANDBOX: 'seatbelt' }, { OPENCODE: '1' }, { COLLAB_AGENT: '1' }]) {
     const r = s.run(['note', 'as the user?'], { env });
     assert.equal(r.code, 1, JSON.stringify(env));
     assert.match(r.err, /--from/);
@@ -594,6 +594,41 @@ test('agent shells are recognised (Claude Code, Codex sessions sandboxed or not,
   assert.equal(s.run(['note', 'typed by the user', '--as-user'], { env: { CODEX_THREAD_ID: 't-1' } }).code, 0);
   assert.equal(s.run(['note', '--from', 'reviewer', 'a finding'], { env: { CODEX_THREAD_ID: 't-1' } }).code, 0);
   assert.equal(s.run(['note', 'plain user shell']).code, 0);
+});
+
+test('--attempt changes nothing but the retry hint, in every wait and join timeout', () => {
+  const s = sandbox();
+  let r = s.run(['join', '--timeout', '1', '--attempt', '1']);
+  assert.equal(r.code, 11);
+  assert.ok(r.out.includes("Run 'collab join --attempt 2' again"), r.out);
+  assert.ok(s.run(['join', '--timeout', '1']).out.includes("Run 'collab join' again"), 'no --attempt: hint unchanged');
+  assert.match(s.run(['join', '--timeout', '1', '--attempt', 'x']).err, /invalid number: x/);
+
+  s.run(['init', 'tries'], { input: 'brief' });
+  r = s.run(['wait', 'reviewer', '--timeout', '1', '--attempt', '7']);
+  assert.equal(r.code, 11);
+  assert.ok(r.out.includes("Run 'collab wait reviewer --attempt 8' again"), r.out);
+  r = s.run(['wait', 'reviewer', '--timeout', '1']);
+  assert.ok(r.out.includes("Run 'collab wait reviewer' again") && !r.out.includes('--attempt'), r.out);
+  r = s.run(['wait', 'reviewer', '--attempt', '-1']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /invalid number: -1/);
+
+  // A pending decision: both the presenter's and the other agent's timeout name the next attempt.
+  assert.equal(s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' }).code, 0);
+  r = s.run(['wait', 'implementer', '--timeout', '1', '--attempt', '2']);
+  assert.equal(r.code, 11);
+  assert.ok(r.out.includes("Run 'collab wait implementer --attempt 3' again"), r.out);
+  r = s.run(['wait', 'reviewer', '--timeout', '1', '--attempt', '4']);
+  assert.equal(r.code, 11);
+  assert.ok(r.out.includes("Run 'collab wait reviewer --attempt 5' again"), r.out);
+  s.run(['answer', '1']);
+
+  const id = s.state().id;
+  assert.equal(approveCurrent(s, '## Verdict: approved\n').code, 10);
+  r = s.run(['join', '--after', id, '--timeout', '1', '--attempt', '9']);
+  assert.equal(r.code, 11);
+  assert.ok(r.out.includes(`Run 'collab join --after ${id} --attempt 10' again`), r.out);
 });
 
 test('a failed check keeps its whole output in the scratch folder (a path with spaces too)', () => {

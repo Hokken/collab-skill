@@ -53,4 +53,4 @@ esac
 
 echo
 echo "Done. Check with: collab help"
-echo "Restart Claude Code / Codex sessions so they load the skill."
+echo "Restart Claude Code / Codex / OpenCode sessions so they load the skill."

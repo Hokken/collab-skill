@@ -1,6 +1,6 @@
 ---
 name: collab
-description: Autonomous implementer/reviewer loop between two coding agents (e.g. Claude Code and Codex CLI) coordinated through the shared `collab` CLI in ~/.collab. Use when the user says "collab implement", "collab review", "collab 1" (implementer) or "collab 0" (reviewer).
+description: Autonomous implementer/reviewer loop between two coding agents (e.g. Claude Code, Codex CLI or OpenCode) coordinated through the shared `collab` CLI in ~/.collab. Use when the user says "collab implement", "collab review", "collab 1" (implementer) or "collab 0" (reviewer).
 ---
 
 # collab — autonomous implementer ⇄ reviewer loop
@@ -29,7 +29,9 @@ Read the argument from the user's message:
 | `review`, `0`          | **reviewer**    |
 
 Anything after the role (e.g. `collab implement add dark mode to the tarot app`) is the
-task for the implementer. For the reviewer, a task id after the role (e.g.
+task for the implementer. In OpenCode the user usually asks in words instead ("use the collab
+skill to implement …", "use the collab skill to review task <task-id>"): read the role and task
+from that. For the reviewer, a task id after the role (e.g.
 `collab review dark-mode-20260926-120000`, as `init` prints it) pairs you with that task: join it
 with `collab -t <task-id> join`. If the role is missing, ask the user once, then continue on your own.
 
@@ -75,7 +77,8 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   - `init` and `note` accept `--file` too.
 - In PowerShell, read a command's exit code from `$LASTEXITCODE`.
 - Exit codes: `0` = OK / your turn, `10` = task finished (DONE, ESCALATED, ABORTED, STALLED),
-  `11` = wait timed out and it's still not your turn (just run the same command again),
+  `11` = wait timed out and it's still not your turn (just run the same command again;
+  OpenCode: with the next `--attempt`, see *How to wait*),
   `12` = submit refused because a note for you (from the user, or from the other agent) is not
   acknowledged as `Note #N` in your message (see *Notes*),
   `13` = the other agent looks unresponsive (see below),
@@ -122,7 +125,7 @@ the task's changes when you commit, but never edit it to record a lesson.
 working, it also needs no project file to have changed for 10 min. `join --after` returns 13 when
 the implementer has neither started a new task nor ended the run for 30 min. The user already
 got a desktop notification.
-- **Claude Code:** use the AskUserQuestion tool: "The <other role> has not handed off for
+- **Claude Code / OpenCode:** use the AskUserQuestion tool (OpenCode: the `question` tool): "The <other role> has not handed off for
   N min. Stop the task?", with the options **Keep waiting (30 min)** and **Stop the task**.
   On *keep waiting*, run `collab -t <id> snooze 30` (or the minutes the user gives), then go back
   to waiting. On *stop*, run `collab -t <id> abort` (skip this after `join --after`: that task
@@ -191,6 +194,14 @@ you to stop, they will interrupt you.
 - **Codex CLI:** run `collab wait <role> --timeout 540` (or `collab join --timeout 540`) in the
   foreground with a shell timeout of at least 600000 ms. On exit 11, run it again immediately.
   Don't stop to ask the user and don't end your turn.
+- **OpenCode:** wait like Codex, in the foreground, passing the shell tool a `timeout` of at least
+  600000 (ms), and add `--attempt N`: `collab -t <id> wait <role> --timeout 540 --attempt 1`,
+  then `--attempt 2`, `3`… on each retry (the exit-11 output names the next one). The same goes
+  for `join` and `join --after`, and for re-running after the shell tool stopped a command (next
+  bullet). `--attempt` changes nothing in collab; it only keeps OpenCode's guard against repeated
+  identical tool calls (`doom_loop`) from asking the user. Start again at 1 for each new command
+  (another task, `join` after `wait`). If OpenCode still asks about a repeated call, tell the
+  user they can set `"permission": { "doom_loop": "allow" }` in `opencode.json`.
 - **If the shell tool stops the command before it exits** (a tool timeout, "command timed out",
   an interrupted or killed process, no exit code), that is not an error in the task. Run the same
   command again, with a `--timeout` below the shell tool's limit (e.g. `--timeout 240` for a
@@ -219,7 +230,8 @@ you to stop, they will interrupt you.
    ```
    The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
    shows only what changed during this task. Tell the user the task id and the `reviewer:` command
-   `init` printed (e.g. `/collab review <task-id>`, Codex: `$collab review <task-id>`), which pairs
+   `init` printed (e.g. `/collab review <task-id>`, Codex: `$collab review <task-id>`, OpenCode:
+   "use the collab skill to review task <task-id>"), which pairs
    the reviewer with this task even if another pair is running, and that they can watch live with
    `collab watch` and steer with `collab note "…"`.
    If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
@@ -288,7 +300,7 @@ folder, with its options.
 1. If the output says **CONFIRM FIRST**, ask the user before starting: start, skip, or stop.
    If it also says **HELD**, an earlier part of the same split task didn't get approved. Say so
    in your question.
-   (Claude Code: AskUserQuestion; Codex: plain text, then end your turn.) *Skip* runs
+   (Claude Code: AskUserQuestion; OpenCode: the `question` tool; Codex: plain text, then end your turn.) *Skip* runs
    `collab queue skip` and moves on to the next one. *Stop* leaves it queued for later: if the
    last task was approved, run `collab end` as in step 5 of the implementer loop (it lists the
    task under *Left in the queue*), then stop.
@@ -453,7 +465,8 @@ task pauses (`DECISION`) and continues as soon as the user picks an option.
    3. Keep it, check only match/audience/age — rare stale mentions
    ```
 2. Submit it with `collab -t <id> submit <role> decide`:
-   - **Claude Code:** add `--self`, then ask the user yourself with AskUserQuestion (the options
+   - **Claude Code / OpenCode:** add `--self`, then ask the user yourself with AskUserQuestion
+     (OpenCode: the `question` tool) (the options
      from your message; the context goes in the question). Record the answer with
      `collab -t <id> answer <N>` (or `answer "<their own words>"`). The turn is yours again:
      carry on.
@@ -461,7 +474,7 @@ task pauses (`DECISION`) and continues as soon as the user picks an option.
      (exit 0) with the user's answer once they have chosen.
 3. **Exit 16 from `wait`** means the user has to choose and **you** present it: the other agent
    asked (without `--self`), or you are the implementer and the round limit was reached (see
-   *Escalation*). Claude Code: ask the user with AskUserQuestion as in
+   *Escalation*). Claude Code / OpenCode: ask the user with AskUserQuestion or `question` as in
    step 2, run `collab -t <id> answer …`, then go back to waiting. Codex: post the question and
    options as plain text, tell the user to answer with `collab answer <N>` in any terminal, and
    go back to waiting (**don't end your turn**). If `answer` says no decision is pending, the

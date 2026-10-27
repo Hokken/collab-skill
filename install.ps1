@@ -85,5 +85,5 @@ if (-not (($userPath -split ';') -contains $Bin)) {
 
 Write-Host ""
 Write-Host "Done. In a NEW terminal check with: collab help"
-Write-Host "Restart Claude Code / Codex sessions so they load the skill."
+Write-Host "Restart Claude Code / Codex / OpenCode sessions so they load the skill."
 Write-Host "If Codex's /skills does not list Collab, re-run with -LinkCodexSkills."
