@@ -1,0 +1,19 @@
+{
+  "name": "collab-terminals",
+  "displayName": "Collab Terminals",
+  "description": "Opens the Claude code, Codex, collab watch and collab note terminals for the collab-up command.",
+  "publisher": "hokken",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hokken/collab-skill.git"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onUri"
+  ]
+}

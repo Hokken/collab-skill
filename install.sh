@@ -2,6 +2,16 @@
 # Install the Collab skill from this repo (macOS / Linux).
 # Safe to re-run. Everything is a symlink to this repo, so `git pull` updates it in place.
 set -euo pipefail
+#   ./install.sh               # skill, `collab`, `collab-up` and (if `code` is found) the VS Code extension
+#   ./install.sh --skip-vscode # everything but the VS Code extension
+
+SKIP_VSCODE=0
+for arg in "$@"; do
+  case "$arg" in
+    --skip-vscode) SKIP_VSCODE=1 ;;
+    *) echo "usage: ./install.sh [--skip-vscode]"; exit 2 ;;
+  esac
+done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_LINK="$HOME/.agents/skills/collab"        # Codex reads ~/.agents/skills
@@ -14,7 +24,7 @@ node -e 'process.exit(parseInt(process.versions.node, 10) >= 18 ? 0 : 1)' \
   || { echo "error: Node.js >= 18 is required (found $(node --version))"; exit 1; }
 command -v git >/dev/null 2>&1 || echo "warning: git not found — 'collab diff' will not work"
 
-chmod +x "$REPO/bin/collab.js"
+chmod +x "$REPO/bin/collab.js" "$REPO/bin/collab-up.js"
 mkdir -p "$(dirname "$SKILL_LINK")" "$(dirname "$CLAUDE_LINK")" "$BIN"
 
 # link <target> <path>: make <path> a symlink to <target>; a real folder/file is backed up first
@@ -44,6 +54,17 @@ case "$(cd "$REPO/.." && pwd -P)" in
 esac
 link "$REPO" "$CLAUDE_LINK"
 link "$REPO/bin/collab.js" "$BIN/collab"
+link "$REPO/bin/collab-up.js" "$BIN/collab-up"
+
+# The VS Code extension behind `collab-up` (only when VS Code's `code` command is available).
+if [ "$SKIP_VSCODE" = 1 ]; then
+  echo "skipped VS Code extension (--skip-vscode)"
+elif command -v code >/dev/null 2>&1; then
+  node "$REPO/bin/collab-up.js" --install \
+    || echo "warning: VS Code extension not installed — collab-up won't work until 'collab-up --install' succeeds"
+else
+  echo "skipped VS Code extension (no 'code' command) — run 'collab-up --install' later to use collab-up"
+fi
 
 case ":$PATH:" in
   *":$BIN:"*) ;;

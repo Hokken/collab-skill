@@ -16,8 +16,10 @@ The installer:
 - links the skill with **directory junctions** (no admin rights or Developer Mode needed):
   - `%USERPROFILE%\.agents\skills\collab` → the repo (Codex reads this folder)
   - `%USERPROFILE%\.claude\skills\collab` → the repo (Claude Code)
-- adds two small shims in `%USERPROFILE%\.local\bin`: `collab.cmd` for PowerShell and cmd, and
-  `collab` for Git Bash;
+- adds small shims in `%USERPROFILE%\.local\bin`: `collab.cmd` / `collab-up.cmd` for PowerShell
+  and cmd, and `collab` / `collab-up` for Git Bash;
+- installs the Collab Terminals VS Code extension for `collab-up` when the `code` command is
+  found (skip it with `-SkipVSCode`; see [vscode.md](vscode.md));
 - asks before adding `%USERPROFILE%\.local\bin` to your user PATH.
 
 After a PATH change, **restart VS Code** (or open new terminals). Updating later is just `git pull`.

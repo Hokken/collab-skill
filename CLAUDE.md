@@ -10,6 +10,10 @@ autonomous implementer ⇄ reviewer loop. The whole product is two files:
 - `bin/collab.js`: the `collab` CLI (~1400 lines, single file). It owns the shared state and enforces the protocol.
 - `SKILL.md`: the prose instructions every agent follows, for both roles. Agents only talk to each other through the CLI.
 
+Outside the protocol, `bin/collab-up.js` (`collab-up`) opens the Claude code / Codex / collab watch /
+collab note terminals in VS Code through the tiny extension in `vscode/`; `collab-up --install` packs
+that folder into a .vsix itself (stored zip, no deps) and runs `code --install-extension`. See `docs/vscode.md`.
+
 `docs/how-it-works.md` is the protocol reference (loop, states, exit codes, notes, queue, on-disk layout). Read it before changing behaviour.
 
 ## Commands

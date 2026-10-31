@@ -3,8 +3,10 @@
 #
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -LinkCodexSkills   # also link into ~\.codex\skills
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipVSCode        # no VS Code extension for collab-up
 param(
   [switch]$LinkCodexSkills,   # only needed if Codex does not list Collab from ~\.agents\skills
+  [switch]$SkipVSCode,        # don't install the Collab Terminals extension even if `code` is found
   [switch]$Yes                # add ~\.local\bin to the user PATH without asking
 )
 $ErrorActionPreference = 'Stop'
@@ -18,6 +20,7 @@ $Bin        = Join-Path $UserHome '.local\bin'
 $CollabHome = if ($env:COLLAB_HOME) { $env:COLLAB_HOME } else { Join-Path $UserHome '.collab' }
 $Backups    = Join-Path $CollabHome 'backups'   # outside any skills folder, so no duplicate skill
 $Js         = Join-Path $Repo 'bin\collab.js'
+$UpJs       = Join-Path $Repo 'bin\collab-up.js'
 
 function Fail($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 
@@ -59,14 +62,28 @@ Set-Junction $Repo $SkillLink
 Set-Junction $Repo $ClaudeLink
 if ($LinkCodexSkills) { Set-Junction $Repo $CodexLink }
 
-# `collab` on PATH: a .cmd shim for PowerShell/cmd and an extensionless sh shim for Git Bash.
+# `collab` and `collab-up` on PATH: a .cmd shim for PowerShell/cmd and an extensionless sh shim
+# for Git Bash. The sh shim names the script as C:/... (not $HOME/...): node needs a Windows path,
+# and Git Bash only converts /c/... paths when MSYS path conversion is on (MSYS_NO_PATHCONV=1 turns it off).
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
-[IO.File]::WriteAllText((Join-Path $Bin 'collab.cmd'), "@node `"$Js`" %*`r`n")
-# The sh shim names the script as C:/... (not $HOME/...): node needs a Windows path, and Git Bash
-# only converts /c/... paths when MSYS path conversion is on (MSYS_NO_PATHCONV=1 turns it off).
-$JsFwd = $Js -replace '\\', '/'
-[IO.File]::WriteAllText((Join-Path $Bin 'collab'), '#!/bin/sh' + "`n" + 'exec node "' + $JsFwd + '" "$@"' + "`n")
-Write-Host "shims   $Bin\collab.cmd, $Bin\collab"
+function Set-Shims([string]$Name, [string]$Script) {
+  [IO.File]::WriteAllText((Join-Path $Bin "$Name.cmd"), "@node `"$Script`" %*`r`n")
+  $fwd = $Script -replace '\\', '/'
+  [IO.File]::WriteAllText((Join-Path $Bin $Name), '#!/bin/sh' + "`n" + 'exec node "' + $fwd + '" "$@"' + "`n")
+  Write-Host "shims   $Bin\$Name.cmd, $Bin\$Name"
+}
+Set-Shims 'collab' $Js
+Set-Shims 'collab-up' $UpJs
+
+# The VS Code extension behind `collab-up` (only when VS Code's `code` command is available).
+if ($SkipVSCode) {
+  Write-Host "skipped VS Code extension (-SkipVSCode)"
+} elseif (Get-Command code -ErrorAction SilentlyContinue) {
+  node $UpJs --install
+  if ($LASTEXITCODE -ne 0) { Write-Host "warning: VS Code extension not installed - collab-up won't work until 'collab-up --install' succeeds" -ForegroundColor Yellow }
+} else {
+  Write-Host "skipped VS Code extension (no 'code' command) - run 'collab-up --install' later to use collab-up"
+}
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (-not $userPath) { $userPath = '' }

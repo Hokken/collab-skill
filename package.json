@@ -9,10 +9,12 @@
     "url": "git+https://github.com/Hokken/collab-skill.git"
   },
   "bin": {
-    "collab": "bin/collab.js"
+    "collab": "bin/collab.js",
+    "collab-up": "bin/collab-up.js"
   },
   "files": [
     "bin/",
+    "vscode/",
     "SKILL.md",
     "install.sh",
     "install.ps1",

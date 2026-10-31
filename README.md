@@ -237,6 +237,12 @@ collab log                                    # the full conversation between th
 collab abort                                  # stop both agents
 ```
 
+**In VS Code?** Run `collab-up` in an integrated terminal to open four named terminals in the
+current folder: *Claude code* (`claude`), *Codex* (`codex`), *collab watch* (`collab watch`) and
+an empty *collab note*. `collab-up --update` runs `claude update` and `codex update` first.
+The installer sets it up when VS Code's `code` command is available; details in
+[docs/vscode.md](docs/vscode.md).
+
 Want the reviewer to look at the work in progress? While it waits for its turn, the reviewer is
 blocked in `collab wait` and only sees notes for it when its turn comes, so a `collab note -r`
 steers its *next* review, it doesn't wake it up. To get an early look, talk to the reviewer
