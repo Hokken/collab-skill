@@ -33,11 +33,14 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   address. This applies in both phases.
 - **Closeout:** a build-phase `submit implementer ready` is refused (exit 1, nothing written)
   without a `## Closeout` section that has the labels `Verified:`, `Attempted, blocked:`,
-  `Deferred:` and `Not claimed:` (content may be `none`; list markers and bold are fine).
+  `Deferred:` and `Not claimed:` (content may be `none`; list markers and bold are fine). Each
+  label must be followed directly by its colon; when a Closeout line starts with a missing label's
+  words but has text before the colon (`Verified (logs):`), the refusal quotes that line.
 - **Review recap:** when it's the reviewer's turn, `wait` also prints the `[blocking]` items
   (with their continuation lines) of the earlier `changes` entries of the current phase, by round,
   and in a `--plan` task's build phase, which entry is the approved plan. Both come from `entries/`:
-  the plan approval is the only reviewer `approve` of an unfinished task, so it separates the phases.
+  the entry that approved the plan (`plan_approved_seq`: the reviewer's `approve`, or the user's
+  answer at the round limit; for older tasks, the first reviewer `approve`) separates the phases.
   It also lists the reviewer's own notes (`--from reviewer`) since its last review, one line each,
   with the implementer's latest `Note #N` line about each, so the reviewer verifies the fixes.
 - **Revised plans:** from the second `plan` on, the reviewer's `wait` prints a line diff against
@@ -51,6 +54,11 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
   for the user, presented by the implementer (its `wait` returns 16; the reviewer keeps waiting):
   `1` gives 2 more rounds and passes the review on, `2` approves (`DONE`), `3` stops
   (`ESCALATED`). An answer in the user's own words counts as `1`, and the implementer gets the words.
+  The plan phase counts its own rounds (`plan_round`) against `max_rounds`, or `plan_max_rounds`
+  once the user gave it more: there, `1` adds plan rounds only, and `2` approves the plan and starts
+  the build (round 1), like a reviewer's plan approval. Either approval stores its entry's number
+  as `plan_approved_seq`, the boundary between the phases for the review recap. Round displays
+  show `plan round N/M` during the plan phase.
 - **Decisions:** the agent holding the turn can `submit <role> decide` a question with numbered
   options. The task goes to `DECISION` (turn: `human`) until someone runs `collab answer <N | text>`.
   Then it returns to the status and turn it came from, and the asker gets the answer. The other
@@ -87,7 +95,9 @@ previous `end` in that project.
   module inside it). Tasks, the queue, `join` and the one-active-task-per-project rule all use
   this, so agents started from different levels of the same tree still find each other. Unrelated
   folders, siblings included, stay separate. When several tasks match, the newest active one is
-  the default.
+  the default. So when the code lives elsewhere (another worktree), a bare `join` started there
+  doesn't find the task, and `collab watch` shows that folder's own newest (active) task (or, if
+  it has none, the last task started anywhere); `-t <task-id>` reaches it from any folder.
 - **Pairs stay apart:** `init` prints `reviewer: /collab review <task-id>`, and a reviewer started
   with a task id joins with `collab -t <task-id> join`. A bare `join` only looks at the folder's
   project (no fallback to `$COLLAB_HOME/current`, the last task started anywhere), and refuses
@@ -110,7 +120,8 @@ previous `end` in that project.
   `HELD:` and `CONFIRM FIRST`, and they need the user's go-ahead.
 - Options are stored in `state.json` and summarised in a *Task options* section of the brief:
   - `--check` is enforced: `submit implementer ready` runs it in the project folder and refuses with
-    exit 14 on failure. On success, a `check passed` line is appended to the summary.
+    exit 14 on failure. On success, a `check passed` line is appended to the summary
+    (kept in the entry, but never read as part of its last section, e.g. `## Lessons`).
   - `--scope` is flagged: `collab diff` lists changed files outside the globs.
   - `--focus`, `--branch` and `--commit` are instructions the agents follow (and the reviewer checks).
     Before a `--commit` commit, the implementer runs `collab verify` and commits only on exit 0.
@@ -253,7 +264,8 @@ agent). A plain `collab note` from an agent's shell (`CLAUDECODE=1`, OpenCode's 
 `CODEX_THREAD_ID` / `CODEX_SESSION_ID` / sandbox variables) is refused, so an agent can't post as the user; a user typing inside an agent
 session adds `--as-user`.
 
-A note is **shown** to its target at its next `wait` or `progress`, and it must be **acknowledged**:
+A note is **shown** to its target at its next `wait` or `progress` (`wait` also shows a note that
+arrived before the target's own last entry, e.g. a `split` or `decide`, if it wasn't shown yet), and it must be **acknowledged**:
 the target's next `submit` is refused (exit 12) until its message names every note addressed to it
 since its previous handoff (`Note #N`). Being shown is not enough, because an agent may discard that
 output. This is checked before the task's `--check` runs, so a refused handoff costs no check run,
@@ -271,7 +283,9 @@ While it holds the turn, an agent posts `collab progress "…"` at each real ste
 handoff: it adds no timeline entry, but it counts as a sign of life. The waiting side reports
 "unresponsive" (exit 13) only when there has been no handoff, no progress and (on the
 implementer's turn) no project file change for a while. After a longer limit with nobody
-answering, the task becomes `STALLED`.
+answering, the task becomes `STALLED`. Both limits count from the start of the turn (`turn_since`)
+or the turn holder's latest progress: notes and other state writes are no sign of life, so a note
+to an unresponsive agent doesn't postpone either.
 
 ## Reviewing real changes
 

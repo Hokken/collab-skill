@@ -332,7 +332,7 @@ function addEntry(d, st, role, kind, body) {
   const name = `${pad3(st.seq)}-${role}-${kind}.md`;
   fs.writeFileSync(path.join(entriesDir(d), name), body);
   fs.appendFileSync(path.join(d, 'log.md'),
-    `\n---\n## #${pad3(st.seq)} · ${role} · ${kind} · round ${st.round} · ${nowIso()}\n\n${body}\n`);
+    `\n---\n## #${pad3(st.seq)} · ${role} · ${kind} · ${isPlan(st) ? 'plan round' : 'round'} ${phaseRound(st)} · ${nowIso()}\n\n${body}\n`);
 }
 
 // Notes: `NNN-human-note-<to>.md` (the user) or `NNN-peer-note-<to>.md` (the other agent, with
@@ -405,7 +405,11 @@ function readBody(file) {
 // First meaningful line of a message, without markdown heading marks.
 // A handoff's own text, for comparing two of them: without the check line collab appends, or
 // trailing whitespace.
-const handoffText = (t) => t.replace(/\n*> collab: check passed: .*\n*$/, '').split('\n').map((l) => l.trimEnd()).join('\n').trim();
+// The line cmdSubmit appends to a message after the task's --check passed. It stays in the entry
+// (the audit trail), but never counts as part of the message's text or of its last section.
+const CHECK_LINE = /\n*> collab: check passed: .*\n*$/;
+const stripCheckLine = (t) => t.replace(CHECK_LINE, '');
+const handoffText = (t) => stripCheckLine(t).split('\n').map((l) => l.trimEnd()).join('\n').trim();
 const headline = (t) => (t.split('\n').find((l) => /\w/.test(l)) || '').replace(/^[#>*\s-]+/, '').trim();
 
 // Numbered options ("1. …" or "2) …") of a decision, in order.
@@ -413,8 +417,10 @@ const decisionOptions = (body) => body.split('\n').map((l) => l.match(/^\s*(\d+)
 
 // --- git snapshot helpers -----------------------------------------------------
 
+// core.quotePath=false: human-readable output (diff, --stat) shows non-ASCII names as they are.
+// Listings collab parses use -z instead, which quotes nothing.
 function git(cwd, args, env = {}) {
-  const r = spawnSync('git', args, {
+  const r = spawnSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_PAGER: 'cat', ...env },
   });
   return { ok: r.status === 0, out: r.stdout || '' };
@@ -440,11 +446,38 @@ function findRepos(root) {
 }
 
 const untrackedFiles = (repo) =>
-  git(repo, ['ls-files', '--others', '--exclude-standard']).out.split('\n').filter(Boolean);
+  zList(git(repo, ['ls-files', '-z', '--others', '--exclude-standard']).out);
 // Markdown files git ignores (e.g. in a gitignored plans folder): documents an agent writes there
 // would otherwise never show up in collab diff.
 const ignoredDocs = (repo) =>
-  git(repo, ['ls-files', '--others', '--ignored', '--exclude-standard', '--', '*.md']).out.split('\n').filter(Boolean);
+  zList(git(repo, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '*.md']).out);
+
+// The file lists init snapshots (untracked/<n>.txt, <n>-ignored-md.txt) are NUL-delimited with a
+// trailing NUL. Older versions wrote one name per line, as git printed it: C-quoted ("...") when
+// it had special or non-ASCII characters. readNameList returns null when there is no snapshot.
+const writeNameList = (file, list) => fs.writeFileSync(file, list.map((f) => `${f}\0`).join(''));
+function readNameList(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  if (raw.includes('\0')) return zList(raw);
+  return raw.split('\n').map((l) => l.replace(/\r$/, '')).filter(Boolean).map(unquoteGitPath);
+}
+
+// A name as git prints it with core.quotePath: "..." with backslash escapes and octal UTF-8 bytes.
+function unquoteGitPath(name) {
+  if (name.length < 2 || name[0] !== '"' || name[name.length - 1] !== '"') return name;
+  const esc = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  const bytes = [];
+  // Whole code points: with core.quotePath=false a quoted name can hold raw non-BMP characters.
+  const body = [...name.slice(1, -1)];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c !== '\\') { bytes.push(...Buffer.from(c, 'utf8')); continue; }
+    const oct = body.slice(i + 1, i + 4).join('');
+    if (/^[0-3][0-7]{2}$/.test(oct)) { bytes.push(parseInt(oct, 8)); i += 3; } else if (esc[body[i + 1]] !== undefined) { bytes.push(esc[body[i + 1]]); i += 1; } else bytes.push(92);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
 
 // Lockfile patches are long and not reviewed line by line: 'collab diff' lists them but leaves
 // their patch out unless --all is given.
@@ -478,7 +511,7 @@ function snapshotTree(d, r, i, extra = []) {
   const g = (args, input) => digestGit(r.path, [...cfg, ...args], env, input);
   let env;
   try {
-    if (fs.existsSync(index)) fs.copyFileSync(index, copy);
+    if (fs.existsSync(index)) copyIndex(index, copy);
     env = { ...snapshotEnv(d, idx, r.path), GIT_INDEX_FILE: copy };
     if (fs.existsSync(copy)) {
       g(['update-index', '--no-split-index']);
@@ -537,6 +570,16 @@ function fileSig(abs, covered) {
   return noDigest(`unsupported file type: ${abs}`);
 }
 
+// A private copy of a repo's index for git to read and refresh. It keeps the original's timestamps:
+// git treats an entry stat'ed in the same second as the index was written as "racily clean" and
+// compares its content, which only works if the copy is as old as the index it copies. With a
+// fresh mtime, a same-size edit made in that second would look unchanged.
+function copyIndex(index, copy) {
+  fs.copyFileSync(index, copy);
+  const t = fs.statSync(index);
+  fs.utimesSync(copy, t.atime, t.mtime);
+}
+
 function treeMap(st, d) {
   const covered = new Set(st.repos.map((r) => realDir(r.path)));
   const repos = st.repos.map((r, i) => {
@@ -547,7 +590,7 @@ function treeMap(st, d) {
     const copy = path.join(d, 'digests', `index-${process.pid}-${idx}.tmp`);
     let changed;
     try {
-      if (fs.existsSync(index)) fs.copyFileSync(index, copy);
+      if (fs.existsSync(index)) copyIndex(index, copy);
       changed = digestGit(r.path, ['diff', '--name-only', '-z', '--no-renames', '--ignore-submodules=none', r.base], { GIT_INDEX_FILE: copy });
     } catch (e) {
       if (e instanceof CollabError) throw e;
@@ -558,7 +601,8 @@ function treeMap(st, d) {
     const paths = new Set(zList(changed));
     for (const f of zList(digestGit(r.path, ['ls-files', '-z', '--others', '--exclude-standard']))) paths.add(f.replace(/\/$/, ''));
     let had = null;
-    try { had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean)); } catch { /* no snapshot */ }
+    const snap = readNameList(path.join(d, 'untracked', `${idx}-ignored-md.txt`));
+    if (snap) had = new Set(snap);
     if (had) {
       for (const f of zList(digestGit(r.path, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '*.md']))) {
         if (!had.has(f)) paths.add(f);
@@ -640,8 +684,10 @@ function liveProgress(st) {
   return p && p.role === st.turn && p.epoch >= turnStart(st) ? p : null;
 }
 
-// Last sign of life from the agent whose turn it is: a handoff/update or a progress post.
-const lastActivity = (st) => Math.max(st.updated_epoch, (liveProgress(st) || {}).epoch || 0);
+// Last sign of life from the agent whose turn it is: the handoff (or answer) that gave it the turn,
+// or its progress posts since. Not updated_epoch: notes and the other agent's reads write the
+// state too, and must not make an unresponsive agent look alive.
+const lastActivity = (st) => Math.max(turnStart(st), (liveProgress(st) || {}).epoch || 0);
 
 // Why the agent whose turn it is looks unresponsive, or ''.
 function idleReason(st) {
@@ -650,7 +696,7 @@ function idleReason(st) {
   const since = now - lastActivity(st);
   if (since < IDLE || now < (st.snooze_until || 0)) return '';
   if (st.turn === 'implementer' && recentChanges(st.project_dir)) return '';
-  let why = `the ${st.turn} has not handed off for ${Math.floor((now - st.updated_epoch) / 60)} min`;
+  let why = `the ${st.turn} has not handed off for ${Math.floor((now - turnStart(st)) / 60)} min`;
   if (liveProgress(st)) why += `, its last progress update was ${Math.floor(since / 60)} min ago`;
   if (st.turn === 'implementer') why += ` and no project file changed in the last ${QUIET_MINS} min`;
   return why;
@@ -916,10 +962,13 @@ function lessonBullets(text) {
   const body = section(text, 'Lessons');
   if (!body) return [];
   const items = [];
+  // Lines right under a bullet continue it (wrapped, indented or not); a blank line, a heading or
+  // a quote ends it, so later text never joins the lesson.
+  let open = false;
   for (const line of body.split('\n')) {
     const m = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*)$/);
-    if (m) items.push(m[1]);
-    else if (line.trim() && items.length) items[items.length - 1] += ` ${line.trim()}`;
+    if (m) { items.push(m[1]); open = true; } else if (!line.trim() || /^\s*[#>]/.test(line)) open = false;
+    else if (open) items[items.length - 1] += ` ${line.trim()}`;
   }
   return items.map(normLesson).filter((t) => t && !/^(none|n\/a|-)\.?$/i.test(t));
 }
@@ -1223,9 +1272,9 @@ function cmdInit(args) {
     const base = git(r, ['stash', 'create']).out.trim() || git(r, ['rev-parse', 'HEAD']).out.trim();
     if (!base) continue;
     const list = untrackedFiles(r).sort();
-    fs.writeFileSync(path.join(d, 'untracked', `${repos.length}.txt`), list.length ? `${list.join('\n')}\n` : '');
+    writeNameList(path.join(d, 'untracked', `${repos.length}.txt`), list);
     const docs = ignoredDocs(r).sort();
-    fs.writeFileSync(path.join(d, 'untracked', `${repos.length}-ignored-md.txt`), docs.length ? `${docs.join('\n')}\n` : '');
+    writeNameList(path.join(d, 'untracked', `${repos.length}-ignored-md.txt`), docs);
     repos.push({ index: repos.length, path: r, base });
   }
 
@@ -1319,7 +1368,7 @@ async function cmdJoin(args) {
         });
         out(`joined task: ${id}`);
         out(`project:     ${st.project_dir}`);
-        out(`status:      ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+        out(`status:      ${st.status} (turn: ${st.turn}, ${roundLabel(st)})`);
         out(`scratch:     ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
         printEntry(d, listEntries(d)[0]);
         return;
@@ -1375,7 +1424,8 @@ const oneLine = (t, n) => { const s = t.replace(/\s+/g, ' ').trim(); return [...
 // notes in full already: one line each.
 function noteReplies(d, files) {
   const last = files.filter((f) => roleOf(f) === 'reviewer' && ['changes', 'approve'].includes(kindOf(f))).pop();
-  const handoffs = files.filter((f) => roleOf(f) === 'implementer').reverse();
+  // Only handoffs acknowledge notes; a decide, escalate or split that mentions one is no reply.
+  const handoffs = files.filter((f) => roleOf(f) === 'implementer' && ['plan', 'ready'].includes(kindOf(f))).reverse();
   return files.filter((f) => f.includes('-peer-note-implementer') && (!last || seqOf(f) > seqOf(last))).map((f) => {
     const seq = seqOf(f);
     const text = fs.readFileSync(path.join(entriesDir(d), f), 'utf8').replace(/^From: .*\n/, '');
@@ -1390,13 +1440,17 @@ function noteReplies(d, files) {
 }
 
 // What the reviewer gets besides the latest messages: the blocking items of the current phase's
-// earlier reviews, and (in a --plan task's build phase) which entry is the approved plan. The plan
-// approval is the only reviewer approve of an unfinished task, so it splits the phases.
+// earlier reviews, and (in a --plan task's build phase) which entry is the approved plan. The
+// entry that approved the plan (plan_approved_seq: the reviewer's approve, or the user's answer at
+// the round limit; for older tasks, the first reviewer approve) splits the phases.
 function reviewRecap(d, st) {
   const files = listEntries(d);
-  const approve = files.find((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'approve');
-  const build = (st.phase || 'build') === 'build';
-  const inPhase = files.filter((f) => !approve || (build ? seqOf(f) > seqOf(approve) : seqOf(f) < seqOf(approve)));
+  // The entry that approved the plan (the reviewer's approve, or the user's answer at the round
+  // limit) separates the phases; tasks from before plan_approved_seq only had the reviewer's.
+  const approve = Number.isInteger(st.plan_approved_seq) ? st.plan_approved_seq
+    : (files.filter((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'approve').map(seqOf)[0] ?? null);
+  const build = !isPlan(st);
+  const inPhase = files.filter((f) => approve === null || (build ? seqOf(f) > approve : seqOf(f) < approve));
   const lines = [];
   const rounds = inPhase.filter((f) => roleOf(f) === 'reviewer' && kindOf(f) === 'changes');
   const found = rounds.map((f, i) => ({ f, i, items: blockingItems(fs.readFileSync(path.join(entriesDir(d), f), 'utf8')) }))
@@ -1415,8 +1469,8 @@ function reviewRecap(d, st) {
   if (build && (st.review_trees || []).length >= 2) {
     lines.push(`changes since your last review: 'collab -t ${st.id} diff --since-review' (the whole task: 'collab -t ${st.id} diff')`);
   }
-  if (build && approve) {
-    const plan = files.filter((f) => roleOf(f) === 'implementer' && kindOf(f) === 'plan' && seqOf(f) < seqOf(approve)).pop();
+  if (build && approve !== null) {
+    const plan = files.filter((f) => roleOf(f) === 'implementer' && kindOf(f) === 'plan' && seqOf(f) < approve).pop();
     if (plan) lines.push(`approved plan: #${pad3(seqOf(plan))} (read it with 'collab -t ${st.id} show ${seqOf(plan)}'). Review the build against it too.`);
   }
   return lines;
@@ -1494,19 +1548,29 @@ async function cmdWait(args) {
     if (role === 'reviewer') touchReviewer(d);
     const st = readState(d);
     if (isTerminal(st.status)) {
-      out(`TASK FINISHED: ${st.status} (round ${st.round})`);
+      out(`TASK FINISHED: ${st.status} (${isPlan(st) ? 'plan round' : 'round'} ${phaseRound(st)})`);
       printEntry(d, latestEntry(d));
       if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
       exit(EXIT_TERMINAL);
     }
     if (st.turn === role) {
-      // Everything since my last own entry: the other agent's message plus any human notes.
-      // Mark it seen before printing, so a reader that closes the pipe early can't lose that.
-      const mine = listEntries(d).filter((f) => roleOf(f) === role).slice(-1)[0];
-      let fresh = entriesAfter(d, mine ? seqOf(mine) : -1).filter((f) => !noteTarget(f) || isNoteFor(f, role));
-      if (!fresh.length) fresh = [latestEntry(d)];
-      withLock(d, () => update(d, (s) => markSeen(s, role)));
-      out(`YOUR TURN (${role}) — status: ${st.status}, round ${st.round}/${st.max_rounds}`);
+      // Everything since my last own entry (the other agent's message plus notes for me), and
+      // notes for me I haven't been shown yet even if they came before that entry (e.g. before
+      // a split or a decide). Never a note for the other role. Picked and marked seen under one
+      // lock, before printing, so neither a note arriving meanwhile nor a reader that closes the
+      // pipe early can lose one.
+      const visible = (f) => !noteTarget(f) || isNoteFor(f, role);
+      let fresh;
+      withLock(d, () => update(d, (s) => {
+        const all = listEntries(d);
+        const mine = all.filter((f) => roleOf(f) === role).slice(-1)[0];
+        const since = entriesAfter(d, mine ? seqOf(mine) : -1).filter(visible);
+        const pending = s.seen && Number.isInteger(s.seen[role]) ? pendingNotes(d, s, role) : [];
+        fresh = [...new Set([...pending, ...since])].sort((a, b) => seqOf(a) - seqOf(b));
+        if (!fresh.length) fresh = all.filter(visible).slice(-1);
+        markSeen(s, role);
+      }));
+      out(`YOUR TURN (${role}) — status: ${st.status}, ${roundLabel(st)}`);
       out(`project: ${st.project_dir}`);
       for (const f of fresh) if (!(role === 'reviewer' && printPlanDelta(d, st, f))) printEntry(d, f);
       if (role === 'reviewer') for (const l of reviewRecap(d, st)) out(l);
@@ -1574,24 +1638,37 @@ function decisionPresenter(dec) {
   return dec.role === 'implementer' ? 'reviewer' : 'implementer';
 }
 
-const LIMIT_OPTIONS = [
+// The round counter and limit of the task's current phase: the plan phase counts its own rounds
+// (plan_round) against its own limit (plan_max_rounds, which only the round-limit answer sets).
+const isPlan = (st) => (st.phase || 'build') === 'plan';
+const phaseRound = (st) => (isPlan(st) ? st.plan_round || 1 : st.round);
+const phaseMax = (st) => (isPlan(st) ? st.plan_max_rounds || st.max_rounds : st.max_rounds);
+const roundLabel = (st) => `${isPlan(st) ? 'plan round' : 'round'} ${phaseRound(st)}/${phaseMax(st)}`;
+
+const limitOptions = (plan) => [
   'Give them 2 more rounds: the implementer gets this review (Recommended)',
-  'Approve the task as it is',
+  plan ? 'Approve the plan as it is (start the build)' : 'Approve the task as it is',
   'Stop the task (escalate; queued tasks wait for you)',
 ];
 
+// The plan is approved (by the reviewer, or by the user at the round limit): the build starts.
+// plan_approved_seq is the entry that approved it, the boundary between the two phases.
+function approvePlan(s) {
+  s.phase = 'build'; s.status = 'IMPLEMENTING'; s.turn = 'implementer'; s.round = 1; s.plan_approved_seq = s.seq;
+}
+
 function transition(st, role, kind) {
   const phase = st.phase || 'build';
-  const max = st.max_rounds;
+  const max = phaseMax(st);
   const bad = `invalid: '${role} ${kind}' in ${phase} phase`;
   const escalate = () => ({ apply: (s) => { s.status = 'ESCALATED'; s.turn = 'none'; } });
-  // Out of rounds: the user decides (LIMIT_OPTIONS) instead of the task just stopping.
+  // Out of rounds: the user decides (limitOptions) instead of the task just stopping.
   const limit = (what) => ({ apply: (s) => { s.decision = { role, status: s.status, turn: s.turn, kind: 'limit' }; s.status = 'DECISION'; s.turn = 'human'; }, limit: what });
   switch (`${phase}:${role}:${kind}`) {
     case 'plan:implementer:plan':
       return { apply: (s) => { s.status = 'PLAN_REVIEW'; s.turn = 'reviewer'; } };
     case 'plan:reviewer:approve':
-      return { apply: (s) => { s.phase = 'build'; s.status = 'IMPLEMENTING'; s.turn = 'implementer'; s.round = 1; } };
+      return { apply: approvePlan };
     case 'plan:reviewer:changes':
       if ((st.plan_round || 1) + 1 > max) return limit(`${max} plan rounds`);
       return { apply: requestChanges };
@@ -1662,7 +1739,11 @@ async function cmdSubmit(args) {
   // A build handoff says what was verified and what wasn't (see SKILL.md), before the check runs.
   if (role === 'implementer' && kind === 'ready' && (pre.phase || 'build') === 'build') {
     const missing = closeoutMissing(body);
-    if (missing.length) die(`a ready needs a '## Closeout' section with the labels ${missing.map((l) => `'${l}:'`).join(', ')} (write 'none' where nothing applies)`);
+    if (missing.length) {
+      const near = closeoutNearMisses(body, missing);
+      const hint = near.length ? `; found ${near.join(', ')}: each label must be followed directly by its colon, e.g. 'Verified: (logs in x) …'` : '';
+      die(`a ready needs a '## Closeout' section with the labels ${missing.map((l) => `'${l}:'`).join(', ')} (write 'none' where nothing applies)${hint}`);
+    }
   }
 
   // The task's --check must pass before the implementer hands off its work.
@@ -1726,7 +1807,8 @@ async function cmdSubmit(args) {
     if (tree && kind === 'ready') saveMap(d, 'review', tree);
     if (binding) saveMap(d, 'approved', tree);
     const question = t.limit ? `Round limit reached (${t.limit}) and the reviewer still requests changes. What now?` : headline(body);
-    if (t.limit) body += `\n\n## ${question}\n${LIMIT_OPTIONS.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n`;
+    const limitOpts = t.limit && limitOptions(isPlan(st));
+    if (t.limit) body += `\n\n## ${question}\n${limitOpts.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n`;
     addEntry(d, st, role, kind, body);
     return {
       st: update(d, (s) => {
@@ -1735,7 +1817,7 @@ async function cmdSubmit(args) {
         if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap.repos }].slice(-2);
         if (binding) s.approved_digest = tree.id;
         if (s.decision && s.decision.seq === undefined) {
-          Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? LIMIT_OPTIONS : options, self: !!opts.self && !t.limit, shown: {} });
+          Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? limitOpts : options, self: !!opts.self && !t.limit, shown: {} });
         }
         freezeAcked(s);
         if (acks) s.acked = { ...s.acked, [role]: s.seq };
@@ -1754,7 +1836,7 @@ async function cmdSubmit(args) {
     exit(EXIT_TREE);
   }
   const st = result.st;
-  out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, round ${st.round}/${st.max_rounds})`);
+  out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, ${roundLabel(st)})`);
   // The handoff is done: a lessons problem is reported, never turned into a failed submit.
   const bullets = kind === 'decide' ? [] : lessonBullets(body);
   let res = null;
@@ -2244,10 +2326,10 @@ function cmdScratch() {
 function newIgnoredDocs(d, r, i) {
   const idx = Number.isInteger(r.index) ? r.index : i;
   const icase = repoIgnoresCase(r.path);
-  try {
-    const had = new Set(fs.readFileSync(path.join(d, 'untracked', `${idx}-ignored-md.txt`), 'utf8').split('\n').filter(Boolean));
-    return ignoredDocs(r.path).filter((f) => !had.has(f) && !isLessonsPath(f, icase)).sort();
-  } catch { return []; }
+  const snap = readNameList(path.join(d, 'untracked', `${idx}-ignored-md.txt`));
+  if (!snap) return [];
+  const had = new Set(snap);
+  return ignoredDocs(r.path).filter((f) => !had.has(f) && !isLessonsPath(f, icase)).sort();
 }
 
 // The first 400 lines of a new file, or a one-line note for a binary one.
@@ -2286,15 +2368,14 @@ function cmdDiff(args) {
     const idx = Number.isInteger(r.index) ? r.index : i;
     const icase = repoIgnoresCase(r.path);
     const skipLocks = all ? [] : notLockfiles();
-    let before = [];
-    try { before = fs.readFileSync(path.join(d, 'untracked', `${idx}.txt`), 'utf8').split('\n').filter(Boolean); } catch { /* none */ }
+    const before = readNameList(path.join(d, 'untracked', `${idx}.txt`)) || [];
     const known = new Set(before);
     const fresh = untrackedFiles(r.path).filter((f) => !known.has(f) && !isLessonsPath(f, icase)).sort();
     const docs = newIgnoredDocs(d, r, i);
     // Compare canonical paths: on Windows git and Node can spell the same folder differently
     // (8.3 short names like RUNNER~1, or different letter case).
     const rel = (f) => path.relative(realDir(st.project_dir), path.join(realDir(r.path), f)).split(path.sep).join('/');
-    const names = git(r.path, ['diff', '--name-only', r.base, ...notLessons(icase)]).out.split('\n').filter(Boolean);
+    const names = zList(git(r.path, ['diff', '--name-only', '-z', r.base, ...notLessons(icase)]).out);
     for (const f of [...names, ...fresh, ...docs]) touched.push(rel(f));
 
     const old = prev && (prev.repos.find((p) => p.path === r.path) || {}).tree;
@@ -2316,7 +2397,7 @@ function cmdDiff(args) {
       out(`=== ${r.path} (since review handoff #${pad3(prev.seq)})`);
       out(changed);
       if (!stat) {
-        const files = git(r.path, ['diff', '--name-only', old, now, ...notLessons(icase)], env).out.split('\n').filter(Boolean);
+        const files = zList(git(r.path, ['diff', '--name-only', '-z', old, now, ...notLessons(icase)], env).out);
         if (!all) omitted.push(...files.filter(isLockfile));
         process.stdout.write(git(r.path, ['--no-pager', 'diff', old, now, ...notLessons(icase), ...skipLocks], env).out);
       }
@@ -2389,7 +2470,7 @@ function cmdStatus() {
   out(`project: ${st.project_dir}`);
   out(`status:  ${st.status}`);
   out(`turn:    ${st.turn}`);
-  out(`round:   ${st.round}/${st.max_rounds}`);
+  out(`round:   ${isPlan(st) ? 'plan ' : ''}${phaseRound(st)}/${phaseMax(st)}`);
   out(`updated: ${st.updated_at} by ${st.updated_by}`);
   out(`latest:  ${latestEntry(d)}`);
   if (describeOpts(st.options).length) out(`options: ${describeOpts(st.options).join(' · ')}`);
@@ -2415,7 +2496,7 @@ function cmdList() {
   const cur = currentId();
   for (const id of ids) {
     const st = readState(path.join(TASKS, id));
-    out(`${id === cur ? '*' : ' '} ${st.id}  ${st.status}  round ${st.round}/${st.max_rounds}  ${st.project_dir}`);
+    out(`${id === cur ? '*' : ' '} ${st.id}  ${st.status}  ${roundLabel(st)}  ${st.project_dir}`);
   }
 }
 
@@ -2433,6 +2514,7 @@ function cmdAnswer(args) {
   const d = taskDir();
   const text = rest.join(' ').trim();
   const raw = (text && !opts.file ? text : readBody(opts.file)).trim();
+  let treeErr = null;
   const st = withLock(d, () => {
     const s0 = readState(d);
     if (s0.status !== 'DECISION' || !s0.decision) die(`no decision is pending (status: ${s0.status})`);
@@ -2440,14 +2522,32 @@ function cmdAnswer(args) {
     const m = raw.match(/^(\d+)(?:[.):](?!\d)|(?=\s|$))\s*([\s\S]*)$/);
     const pick = m && dec.options && dec.options[parseInt(m[1], 10) - 1];
     const answer = pick ? `Option ${m[1]}: ${pick}${m[2].trim() ? `\n\n${m[2].trim()}` : ''}` : raw;
+    // Round limit: 2 approves (the plan in the plan phase, else the task), 3 stops, 1 or the user's
+    // own words: 2 more rounds of the current phase, with this review.
+    const n = dec.kind === 'limit' ? (pick ? parseInt(m[1], 10) : 1) : 0;
+    const plan = isPlan(s0);
+    // Approving the task as it is binds the files as they are now, in the same write as DONE, so
+    // no one ever sees a DONE task without its approved tree ('collab verify').
+    let tree = null;
+    if (n === 2 && !plan && s0.repos && s0.repos.length) {
+      try {
+        tree = treeMap(s0, d);
+        saveMap(d, 'approved', tree);
+      } catch (e) {
+        if (!(e instanceof CollabError)) throw e;
+        treeErr = e.message;
+      }
+    }
     addEntry(d, s0, 'human', 'answer', `## User decision\n${answer}\n\n> question (#${pad3(dec.seq)}, ${dec.role}): ${dec.question}\n`);
     return update(d, (s) => {
       s.status = dec.status;
       s.turn = dec.turn;
-      // Round limit: 2 approves, 3 stops, 1 or the user's own words: 2 more rounds with this review.
-      if (dec.kind === 'limit') {
-        const n = pick ? parseInt(m[1], 10) : 1;
-        if (n === 2) { s.status = 'DONE'; s.turn = 'none'; } else if (n === 3) { s.status = 'ESCALATED'; s.turn = 'none'; } else { requestChanges(s); s.max_rounds += 2; }
+      if (n === 2 && plan) approvePlan(s);
+      else if (n === 2) { s.status = 'DONE'; s.turn = 'none'; if (tree) s.approved_digest = tree.id; }
+      else if (n === 3) { s.status = 'ESCALATED'; s.turn = 'none'; }
+      else if (n === 1) {
+        requestChanges(s);
+        if (plan) s.plan_max_rounds = phaseMax(s) + 2; else s.max_rounds += 2;
       }
       delete s.decision;
       s.seq += 1; s.updated_by = 'human'; s.turn_since = epoch();
@@ -2455,17 +2555,9 @@ function cmdAnswer(args) {
   });
   holdParts(st);
   out(isTerminal(st.status) ? `answer recorded; the task is ${st.status}` : `answer recorded; back to the ${st.turn} (status: ${st.status})`);
-  // The user approved the task as it is: that tree is what 'collab verify' checks against.
-  if (st.status === 'DONE' && st.repos && st.repos.length) {
-    try {
-      const tree = treeMap(st, d);
-      saveMap(d, 'approved', tree);
-      withLock(d, () => update(d, (s) => { s.approved_digest = tree.id; }, { touch: false }));
-    } catch (e) {
-      if (!(e instanceof CollabError)) throw e;
-      out(`collab: ${e.message}`);
-      out("no verified approval was recorded: 'collab verify' will not pass for this task.");
-    }
+  if (treeErr) {
+    out(`collab: ${treeErr}`);
+    out("no verified approval was recorded: 'collab verify' will not pass for this task.");
   }
   if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
 }
@@ -2474,19 +2566,42 @@ function cmdAnswer(args) {
 // sections in which the agents note judgment calls they made themselves.
 // Body of the '## <heading>' section of a message, up to the next '## ' heading (null if absent).
 function section(text, heading) {
-  const m = text.match(new RegExp(`^##[ \\t]+${heading}[ \\t]*\\n([\\s\\S]*?)(?=^##[ \\t]|(?![\\s\\S]))`, 'im'));
+  const m = stripCheckLine(text).match(new RegExp(`^##[ \\t]+${heading}[ \\t]*\\n([\\s\\S]*?)(?=^##[ \\t]|(?![\\s\\S]))`, 'im'));
   return m ? m[1].trim() : null;
 }
 
-const CLOSEOUT_LABELS = [['Verified', /^verified\s*:/], ['Attempted, blocked', /^attempted[\s,/-]*blocked\s*:/],
-  ['Deferred', /^deferred\s*:/], ['Not claimed', /^not\s+claimed\s*:/]];
+// [name, the label as required, the label's words alone (for a near miss like 'Verified (x):')]
+const CLOSEOUT_LABELS = [['Verified', /^verified\s*:/, /^verified\b/],
+  ['Attempted, blocked', /^attempted[\s,/-]*blocked\s*:/, /^attempted\b/],
+  ['Deferred', /^deferred\s*:/, /^deferred\b/], ['Not claimed', /^not\s+claimed\s*:/, /^not\s+claimed\b/]];
+
+// The lines of a message's '## Closeout', without list markers, quotes and bold/italic marks:
+// `norm` (lowercased) for matching, `raw` (trimmed) for quoting back.
+function closeoutLines(text) {
+  return (section(text, 'Closeout') || '').split('\n').map((l) => {
+    const raw = l.replace(/[*_]/g, '').replace(/^\s*(?:[-+>]\s*)*/, '');
+    return { raw: raw.trim(), norm: raw.toLowerCase() };
+  });
+}
 
 // Labels missing from a message's '## Closeout' (all of them if it has none). List markers,
 // quotes and bold/italic marks around a label are fine.
 function closeoutMissing(text) {
-  const body = section(text, 'Closeout');
-  const lines = (body || '').split('\n').map((l) => l.replace(/[*_]/g, '').replace(/^\s*(?:[-+>]\s*)*/, '').toLowerCase());
-  return CLOSEOUT_LABELS.filter(([, re]) => !lines.some((l) => re.test(l))).map(([name]) => name);
+  const lines = closeoutLines(text);
+  return CLOSEOUT_LABELS.filter(([, re]) => !lines.some((l) => re.test(l.norm))).map(([name]) => name);
+}
+
+// For each missing label, the first '## Closeout' line that starts with the label's words but
+// doesn't follow them directly with a colon (e.g. 'Verified (logs in x):'), quoted for the refusal.
+function closeoutNearMisses(text, missing) {
+  const lines = closeoutLines(text);
+  const out = [];
+  for (const [name, , loose] of CLOSEOUT_LABELS) {
+    if (!missing.includes(name)) continue;
+    const hit = lines.find((l) => loose.test(l.norm));
+    if (hit) out.push(`'${hit.raw.length > 40 ? `${hit.raw.slice(0, 40)}…` : hit.raw}'`);
+  }
+  return out;
 }
 
 // The closeout of each task's last build-phase ready, and the '## For the user' briefing of the
@@ -2621,7 +2736,8 @@ function wrapText(text, width) {
       const candidate = cur ? `${cur} ${word}` : `${indent}${word}`;
       if ([...candidate].length <= width) { cur = candidate; continue; }
       if (cur) lines.push(cur);
-      let rest = [...`${cur ? indent : ''}${word}`];
+      // The word starts a new line either way, so it keeps the line's indent.
+      let rest = [...`${indent}${word}`];
       while (rest.length > width) { lines.push(rest.slice(0, width).join('')); rest = rest.slice(width); }
       cur = rest.join('');
     }
@@ -2678,7 +2794,7 @@ function renderWatch(view, cols, rows, { color = true, keys = true, pad = true }
   const waiting = queueCount(st.project_dir);
   const taskPos = view.siblings.length > 1 ? `  ${D}task ${pos + 1}/${view.siblings.length}${view.pinned ? ' (←→)' : ''}${R}` : '';
   const partPos = st.part ? `  ${Y}part ${st.part.index}/${st.part.total}${R}` : '';
-  lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  round ${st.round}/${st.max_rounds}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(endedAt - created)} · ${localTime(Date.now())}${R}`);
+  lines.push(`${B}collab watch${R}  ${st.id}${partPos}${taskPos}  ${sc}${B}${st.status}${R}  ${roundLabel(st)}${waiting ? `  ${Y}queue: ${waiting} waiting${R}` : ''}  ${D}total ${fmtDur(endedAt - created)} · ${localTime(Date.now())}${R}`);
   lines.push(`${D}project${R} ${st.project_dir}`);
   const live = active ? liveProgress(st) : null;
   if (st.status === 'DECISION') {

@@ -90,7 +90,10 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
 - **Start both agents from the same project folder** when you can. A folder and the folders
   inside it count as one project (e.g. a repo root and a module in it), so tasks and the queue
   are still shared if they differ. But `--check` runs, and `collab diff` paths are shown,
-  relative to the folder the task was started from.
+  relative to the folder the task was started from. A plain `collab join` only sees tasks of
+  the project of the folder it runs in, and `collab watch` shows that project's newest (active)
+  task (the last task started anywhere only if the folder has none); from another folder, pass
+  `-t <task-id>`.
 - If a submit fails with "task already finished", the user stopped the task: stop looping and
   give them a short report of where you were.
 
@@ -234,6 +237,10 @@ you to stop, they will interrupt you.
    "use the collab skill to review task <task-id>"), which pairs
    the reviewer with this task even if another pair is running, and that they can watch live with
    `collab watch` and steer with `collab note "…"`.
+   If the files the task changes live outside the project folder (another worktree or repo), say
+   so in the brief's `## Scope`, and tell the user to start the reviewer and `collab watch` from the
+   project folder, or to use the pinned commands `/collab review <task-id>` and
+   `collab -t <task-id> watch`.
    If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
    If the request has several stages (a staged plan, a list of deliverables) or is too big for
    one review, split it now into **all** its parts (see *Splitting a task*), not just the first
@@ -264,7 +271,8 @@ you to stop, they will interrupt you.
    - what you chose, the alternatives, and why it is the safe choice
    ```
    `## Closeout` is required, with exactly that heading and all four labels (the CLI refuses a
-   `ready` without them; write "none" where nothing applies). Only put under `Verified` what you
+   `ready` without them; write "none" where nothing applies). Each label is followed directly by its
+   colon: `Verified: (logs in x) …`, not `Verified (logs in x):`. Only put under `Verified` what you
    actually ran or checked in this turn.
    **Exit 14** means the task's check failed and nothing was submitted: fix the problem and submit
    again. If the check can't pass for reasons outside the task, escalate.
@@ -493,7 +501,8 @@ The user's answer takes priority, like a human note.
 Don't escalate a disagreement or a technical judgment call. Keep reviewing. If the reviewer
 still requests changes once the round limit (default 4) is reached, the CLI asks the user
 through the implementer (its `wait` returns 16; the reviewer just keeps waiting): 2 more rounds,
-approve as it is, or stop. The task continues with their choice. For a technical choice you can make yourself, pick the safest option (or the one the codebase already
+approve as it is (in the plan phase: approve the plan and start the build), or stop. The task
+continues with their choice. For a technical choice you can make yourself, pick the safest option (or the one the codebase already
 leans towards), carry on, and note it under `## Decisions taken` in your summary or review. The
 final report lists these for the user.
 

@@ -32,12 +32,17 @@ Run it from a VS Code integrated terminal. Setup: docs/vscode.md`;
 
 // --- the code CLI -------------------------------------------------------------
 
+// Whether spawning `code` failed because it isn't installed: ENOENT when run directly, or on
+// Windows, where it runs through cmd.exe, cmd's "is not recognized" status 9009.
+const codeMissing = (r, platform = process.platform) =>
+  !!(r.error && r.error.code === 'ENOENT') || (platform === 'win32' && r.status === 9009);
+
 // Windows needs a shell to find code.cmd; elsewhere run it directly.
 function code(args) {
   const r = process.platform === 'win32'
     ? spawnSync(['code', ...args.map((a) => `"${a}"`)].join(' '), { shell: true, stdio: 'inherit' })
     : spawnSync('code', args, { stdio: 'inherit' });
-  if (r.error && r.error.code === 'ENOENT') return 127;
+  if (codeMissing(r)) return 127;
   return r.status === null ? 1 : r.status;
 }
 
@@ -181,4 +186,4 @@ function main(args) {
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
-module.exports = { packExtension, crc32 };
+module.exports = { packExtension, crc32, codeMissing };

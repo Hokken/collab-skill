@@ -9,7 +9,7 @@ const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'collab-up.js');
-const { packExtension, crc32 } = require(CLI);
+const { packExtension, crc32, codeMissing } = require(CLI);
 
 // A fake `code` command first on PATH that records its arguments in args.txt.
 function fakeCode() {
@@ -67,6 +67,25 @@ test('collab-up: --install hands a .vsix to code --install-extension', () => {
   const r = run(['--install'], { env: code.env });
   assert.equal(r.code, 0, r.err);
   assert.match(code.args(), /--install-extension\S* \S*collab-terminals\.vsix\S* \S*--force/);
+});
+
+test('collab-up: a missing code command is reported as such, also through cmd.exe', () => {
+  assert.equal(codeMissing({ error: Object.assign(new Error('x'), { code: 'ENOENT' }) }, 'linux'), true);
+  assert.equal(codeMissing({ status: 9009 }, 'win32'), true, "cmd.exe: 'code' is not recognized");
+  assert.equal(codeMissing({ status: 9009 }, 'linux'), false, 'only cmd.exe means that by 9009');
+  assert.equal(codeMissing({ status: 1 }, 'win32'), false);
+  assert.equal(codeMissing({ status: 0 }, 'darwin'), false);
+
+  // For real: no code on PATH (Node runs from its own path, cmd.exe from ComSpec).
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'collab-up-nopath-'));
+  const env = { ...process.env, TERM_PROGRAM: 'vscode' };
+  const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+  env[key] = empty;
+  for (const args of [[], ['--install']]) {
+    const r = run(args, { env });
+    assert.equal(r.code, 1, r.err);
+    assert.match(r.err, /the VS Code "code" command was not found/, `${args.join(' ') || 'up'}: ${r.err}`);
+  }
 });
 
 test('collab-up: packs the extension as a valid zip with a matching manifest', () => {

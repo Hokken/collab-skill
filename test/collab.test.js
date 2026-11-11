@@ -221,6 +221,256 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
   assert.equal(s.state().plan_round, 2);
 });
 
+test('the round limit in the plan phase: approve starts the build, more rounds stay in the plan', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const toPlanLimit = (slug) => {
+    s.run(['init', slug, '--plan', '--max-rounds', '1'], { input: 'b' });
+    s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+    return s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] plan step 2 is wrong' });
+  };
+
+  // Approve the plan as it is: the build starts, nothing is DONE.
+  let r = toPlanLimit('a-plan-approve');
+  assert.match(r.out, /DECISION \(turn: human, plan round 1\/1\)/);
+  assert.match(s.state().decision.options[1], /Approve the plan as it is/);
+  r = s.run(['answer', '2']);
+  assert.match(r.out, /back to the implementer \(status: IMPLEMENTING\)/);
+  let st = s.state();
+  assert.equal(st.phase, 'build');
+  assert.equal(st.status, 'IMPLEMENTING');
+  assert.equal(st.turn, 'implementer');
+  assert.equal(st.round, 1);
+  assert.equal(st.max_rounds, 1, 'the build keeps its own limit');
+  assert.equal(st.plan_approved_seq, 3, 'the answer entry approved the plan');
+  // The reviewer's recap: the approved plan is named, plan-phase items don't count as build rounds.
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  let out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, /approved plan: #001/);
+  assert.doesNotMatch(out, /earlier blocking items|plan step 2/);
+  assert.match(s.run(['status']).out, /round: {3}1\/1/);
+  s.run(['abort']);
+
+  // Two more plan rounds: only the plan limit grows.
+  toPlanLimit('b-plan-more');
+  s.run(['answer', '1']);
+  st = s.state();
+  assert.equal(st.status, 'PLAN_CHANGES');
+  assert.equal(st.plan_max_rounds, 3);
+  assert.equal(st.max_rounds, 1);
+  assert.match(s.run(['status']).out, /round: {3}plan 2\/3/);
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
+  assert.equal(s.state().plan_approved_seq, 5, "the reviewer's approve is the boundary too");
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  r = s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] build bug' });
+  assert.equal(s.state().status, 'DECISION', 'the build limit is still 1');
+  assert.match(s.state().decision.options[1], /Approve the task as it is/);
+
+  // Approve the task as it is: DONE and the approved tree land in the same write.
+  r = s.run(['answer', '2']);
+  assert.match(r.out, /the task is DONE/);
+  assert.ok(s.state().approved_digest, 'DONE carries its approved tree');
+  assert.equal(s.run(['verify']).code, 0);
+
+  // The tree can't be computed: the answer is still recorded, without a verified approval.
+  s.run(['init', 'c-no-tree', '--max-rounds', '1'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x' });
+  const sp = path.join(s.taskDir(), 'state.json');
+  st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+  st.repos[0].base = '0'.repeat(40);
+  fs.writeFileSync(sp, JSON.stringify(st));
+  r = s.run(['answer', '2']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /the task is DONE[\s\S]*cannot compute the tree digest[\s\S]*no verified approval was recorded/);
+  assert.equal(s.state().status, 'DONE');
+  assert.equal(s.state().approved_digest, undefined);
+  assert.equal(s.run(['verify']).code, 1);
+});
+
+test("wait shows a note that came before the role's own last entry, and never the other role's", () => {
+  const s = sandbox();
+  const count = (out, f) => out.split(`----- ${f} -----`).length - 1;
+  const ack = (n) => `## Summary\nx\n## Review responses\nNote #${n} — done\n`;
+
+  // 2a: a note before a split, which shows no notes.
+  s.run(['init', 'a-split'], { input: 'b' });
+  s.run(['note', '--as-user', '--implementer', 'use port 8080']);
+  assert.equal(s.run(['queue', 'split'], { input: 'p1\n=== part ===\np2' }).code, 0);
+  let out = s.run(['wait', 'implementer', '--timeout', '1']).out;
+  assert.equal(count(out, '001-human-note-implementer.md'), 1, out);
+  out = s.run(['wait', 'implementer', '--timeout', '1']).out;
+  assert.equal(count(out, '001-human-note-implementer.md'), 0, 'shown once');
+  assert.match(out, /----- 002-implementer-split\.md -----/, 'nothing new: the latest visible entry');
+  assert.equal(s.run(['progress', 'x']).out.includes('8080'), false);
+  // Being shown is not acknowledging: the ready still needs Note #1.
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: '## Summary\nx\n' }).code, 12);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: ack(1) }).code, 0);
+  s.run(['abort']);
+  s.run(['queue', 'rm', '1']);
+
+  // 2a: a note before a decide the user answered.
+  s.run(['init', 'b-decide'], { input: 'b' });
+  s.run(['note', '--as-user', '--implementer', 'NOTE-B']);
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Which?\n1. A (Recommended)\n2. B\n' });
+  s.run(['answer', '1']);
+  out = s.run(['wait', 'implementer', '--timeout', '1']).out;
+  assert.equal(count(out, '001-human-note-implementer.md'), 1, out);
+  assert.equal(count(out, '003-human-answer.md'), 1);
+  assert.ok(out.indexOf('001-human-note') < out.indexOf('003-human-answer'), 'in order');
+  s.run(['abort']);
+
+  // 2b: a note only for the reviewer never reaches the implementer's wait.
+  s.run(['init', 'c-private'], { input: 'b' });
+  s.run(['note', '--as-user', '--reviewer', 'SECRET reviewer check']);
+  out = s.run(['wait', 'implementer', '--timeout', '1']).out;
+  assert.doesNotMatch(out, /SECRET/);
+  assert.match(out, /----- 000-implementer-brief\.md -----/);
+  s.run(['abort']);
+
+  // 6: a decide that mentions a reviewer note is not the implementer's reply to it.
+  s.run(['init', 'd-replies'], { input: 'b' });
+  s.run(['note', '--from', 'reviewer', 'check the parser'], { env: { COLLAB_AGENT_SHELL: '' } });
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## About Note #1, A or B?\n1. A (Recommended)\n2. B\n' });
+  s.run(['answer', '1']);
+  s.run(['submit', 'implementer', 'ready'], { input: ack(1) });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] more' });
+  // The reviewer's next recap lists notes since its last review: send another one.
+  s.run(['note', '--from', 'reviewer', 'and the lexer']);
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Note #6 first?\n1. Yes (Recommended)\n2. No\n' });
+  s.run(['answer', '1']);
+  s.run(['submit', 'implementer', 'ready'], { input: '## Summary\nv2\n## Review responses\n1. Fixed\nNote #6 — handled the lexer too\n' });
+  // The protocol always puts an acknowledging ready last, so plant a later non-handoff entry that
+  // mentions the note: only plan/ready entries count as replies.
+  fs.writeFileSync(path.join(s.taskDir(), 'entries', '010-implementer-decide.md'), '## Note #6 again?\n1. WRONG reply\n');
+  out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.doesNotMatch(out, /→ #010/);
+  assert.match(out, /Note #6: and the lexer\n {3}→ #009: Note #6 — handled the lexer too/, out);
+});
+
+test("the check-passed line never leaks into a message's sections", () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const CO = '## Closeout\nVerified: ran it\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n';
+  const task = (slug, msg) => {
+    s.run(['init', slug, '--check', 'node -e 0'], { input: 'b' });
+    const r = s.run(['submit', 'implementer', 'ready'], { input: msg, raw: true });
+    assert.equal(r.code, 0, r.err);
+    const entry = fs.readFileSync(path.join(s.taskDir(), 'entries', '001-implementer-ready.md'), 'utf8');
+    assert.match(entry, /> collab: check passed: `node -e 0`.*\n$/, 'the entry keeps the line');
+    assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
+  };
+  // Lessons last; a wrapped line joins the bullet, a quote and text after a blank line don't.
+  task('a-lessons', `## Summary\nx\n${CO}## Lessons\n- Keep paths normalised\n  before comparing\n> an aside\n\nnot a lesson\n`);
+  const lessons = fs.readFileSync(lessonsMd(s.project), 'utf8');
+  assert.match(lessons, /^- Keep paths normalised before comparing <!-- collab:/m);
+  assert.doesNotMatch(lessons, /check passed|an aside|not a lesson/);
+  // Decisions taken last, saying none.
+  task('b-none', `## Summary\nx\n${CO}## Decisions taken\nnone\n`);
+  // Closeout last; a quoted check line in the middle of a message is the agent's own text.
+  task('c-closeout', `## Summary\nx\n## Decisions taken\n- kept the old API\n> collab: check passed: quoted by me\n${CO}`);
+
+  assert.equal(s.run(['end'], { input: '## Final report\ndone\n' }).code, 0);
+  const report = s.run(['show']).out;
+  const part = (from, to) => report.slice(report.indexOf(from), to ? report.indexOf(to) : undefined);
+  const closeouts = part('## Closeouts (collected by collab)', '## Decisions recorded');
+  const decisions = part('## Decisions recorded', '## Lessons recorded');
+  const recorded = part('## Lessons recorded', '> collab: run ended');
+  assert.match(closeouts, /c-closeout[^\n]*\nVerified: ran it\n[\s\S]*Not claimed: none/);
+  assert.doesNotMatch(closeouts, /check passed: `node/);
+  assert.doesNotMatch(decisions, /b-none/, "a trailing 'none' is not a decision");
+  assert.match(decisions, /kept the old API\n> collab: check passed: quoted by me/);
+  assert.doesNotMatch(decisions, /check passed: `node/);
+  assert.match(recorded, /Keep paths normalised before comparing\n/);
+  assert.doesNotMatch(recorded, /check passed/);
+});
+
+test('a build-phase recap without plan_approved_seq (older tasks) uses the reviewer approve', () => {
+  const s = sandbox();
+  s.run(['init', 'legacy-plan', '--plan'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] plan item' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
+  const sp = path.join(s.taskDir(), 'state.json');
+  const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+  delete st.plan_approved_seq;
+  fs.writeFileSync(sp, JSON.stringify(st));
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] build item' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  const out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
+  assert.match(out, /approved plan: #003/);
+  assert.match(out, /round 1 \(#006\):\n1\. \[blocking\] build item/);
+  assert.doesNotMatch(out, /plan item/);
+});
+
+test('non-ASCII and special file names: diff, scope, snapshots and since-review', () => {
+  const s = sandbox();
+  const p = s.project;
+  const g = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: p, encoding: 'utf8' });
+  const put = (f, text) => { fs.mkdirSync(path.dirname(path.join(p, f)), { recursive: true }); fs.writeFileSync(path.join(p, f), text); };
+  gitRepo(p);
+  put('src/café.js', 'old café\n');
+  put('.gitignore', 'plans/\n');
+  g('add', '.'); g('commit', '-qm', 'more');
+  put('plans/résumé.md', 'pre-existing ignored doc\n');
+  put('src/déjà.js', 'pre-existing untracked\n');
+  s.run(['init', 'names', '--scope', 'src/**,plans/**'], { input: 'b' });
+  const snap = (n) => path.join(s.taskDir(), 'untracked', n);
+  assert.equal(fs.readFileSync(snap('0.txt'), 'utf8'), 'src/déjà.js\0', 'raw names, NUL-delimited');
+  assert.equal(fs.readFileSync(snap('0-ignored-md.txt'), 'utf8'), 'plans/résumé.md\0');
+
+  put('src/café.js', 'new café, longer\n');
+  put('src/über.js', 'hello über\n');
+  put('plans/nouveau-é.md', 'new doc\n');
+  let out = s.run(['diff']).out;
+  assert.match(out, /\+new café, longer/);
+  assert.match(out, /hello über/);
+  assert.match(out, /plans\/nouveau-é\.md/);
+  assert.doesNotMatch(out, /OUTSIDE SCOPE|unreadable|résumé|déjà|\\303/);
+  assert.match(s.run(['diff', '--stat']).out, /src\/café\.js/);
+
+  // --since-review needs two build handoffs.
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] more' });
+  put('src/über.js', 'hello über, again\n');
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  out = s.run(['diff', '--since-review']).out;
+  assert.match(out, /src\/über\.js/);
+  assert.match(out, /\+hello über, again/);
+  assert.doesNotMatch(out, /OUTSIDE SCOPE|café|\\303/);
+
+  // Snapshots written by earlier versions: one git-quoted name per line.
+  fs.writeFileSync(snap('0.txt'), '"src/d\\303\\251j\\303\\240.js"\n');
+  fs.writeFileSync(snap('0-ignored-md.txt'), '"plans/r\\303\\251sum\\303\\251.md"\n');
+  out = s.run(['diff']).out;
+  assert.doesNotMatch(out, /déjà|résumé/, 'legacy quoted snapshots still match');
+  assert.match(out, /plans\/nouveau-é\.md/);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(s.run(['verify']).code, 0, 'the approval digest reads the legacy ignored-md list too');
+});
+
+test('file names with quotes and newlines round-trip through the init snapshot', { skip: process.platform === 'win32' }, () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  fs.writeFileSync(path.join(s.project, '"quoted".txt'), 'q\n');
+  fs.writeFileSync(path.join(s.project, 'new\nline.txt'), 'n\n');
+  s.run(['init', 'odd-names'], { input: 'b' });
+  fs.writeFileSync(path.join(s.project, '"other".txt'), 'o\n');
+  let out = s.run(['diff']).out;
+  assert.match(out, /"other"\.txt/);
+  assert.doesNotMatch(out, /"quoted"|new\nline/, 'pre-existing names are known');
+
+  // A legacy (newline) snapshot written with core.quotePath=false: raw emoji inside a quoted name.
+  fs.writeFileSync(path.join(s.project, 'emoji-😀\t.txt'), 'e\n');
+  fs.writeFileSync(path.join(s.taskDir(), 'untracked', '0.txt'), '"emoji-😀\\t.txt"\n"\\"quoted\\".txt"\n"new\\nline.txt"\n');
+  out = s.run(['diff']).out;
+  assert.doesNotMatch(out, /emoji|"quoted"|new\nline/, 'legacy quoted names decode whole code points');
+  assert.match(out, /"other"\.txt/);
+});
+
 test('diff across nested repos ignores pre-existing changes', () => {
   const s = sandbox();
   const a = path.join(s.project, 'a');
@@ -349,6 +599,43 @@ test('diff --since-review falls back to the full diff when the reviewed handoff 
   assert.match(r.out, /no snapshot of the reviewed handoff #00\d: showing the full task diff/);
   assert.doesNotMatch(r.out, /no changes since/);
   assert.match(r.out, /\+A/);
+});
+
+test('a same-size edit in the same second as the index write is not missed', (t) => {
+  const sec = (f) => Math.floor(fs.statSync(f).mtimeMs / 1000);
+  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  // f.txt is written, committed and edited to the same size within one second, then handed off.
+  // Returns the sandbox, or null when the machine was too slow to hit that window.
+  const racyReady = () => {
+    const s = sandbox();
+    sleep(1005 - (Date.now() % 1000));
+    gitRepo(s.project); // f.txt = 'one\n', added and committed: the index is written now
+    s.run(['init', 'racy'], { input: 'b' });
+    const f = path.join(s.project, 'f.txt');
+    fs.writeFileSync(f, 'two\n');
+    if (sec(f) !== sec(path.join(s.project, '.git', 'index'))) return null;
+    assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v1' }).code, 0);
+    sleep(1100); // from here on, a fresh copy of the index is clearly newer than the edit
+    return s;
+  };
+  const tries = (fn) => { for (let i = 0; i < 4; i++) { const s = racyReady(); if (s) { fn(s); return true; } } return false; };
+
+  // The approval digest, taken later, sees the same tree as the handoff.
+  const a = tries((s) => {
+    const r = s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+    assert.equal(r.code, 10, `approve sees the edit the handoff saw:\n${r.out}`);
+    assert.equal(s.run(['verify']).code, 0);
+  });
+  // The next handoff's tree too: nothing changed since the first one.
+  const b = tries((s) => {
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] again' });
+    assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'v2, nothing changed' }).code, 0);
+    const r = s.run(['diff', '--since-review']);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /no changes since review handoff #001 in: /, `the second tree still has the edit:\n${r.out}`);
+    assert.doesNotMatch(r.out, /f\.txt/);
+  });
+  if (!a || !b) t.skip(`could not hit the same-second window on this machine (approve ${a}, since-review ${b})`);
 });
 
 test('diff --since-review sees files behind index flags and never writes a split index', () => {
@@ -885,6 +1172,15 @@ test('watch --once renders every step, the live row and the selected step', () =
   const narrow = s.run(['watch', '--once'], { env: { COLUMNS: '60', LINES: '30' } }).out;
   for (const line of narrow.split('\n')) assert.ok([...line].length <= 60, `line wider than 60: ${line}`);
   assert.doesNotMatch(narrow, /wor\nd/, 'wraps at spaces, not inside words');
+
+  // An indented line whose first word is wider than the pane keeps its indent.
+  const t = sandbox();
+  t.run(['init', 'wrap'], { input: `## Goal\nshort intro\n    ${'x'.repeat(80)}\n` });
+  const lines = t.run(['watch', '--once'], { env: { COLUMNS: '40', LINES: '40' } }).out.split('\n');
+  const at = lines.indexOf('short intro');
+  assert.ok(at >= 0, lines.join('\n'));
+  assert.equal(lines[at + 1], `    ${'x'.repeat(35)}`, 'the first chunk keeps the indent, within the width');
+  assert.ok(lines[at + 2].startsWith('x'), 'the rest of the word continues on the next line');
 });
 
 test('queue: add, list, next, skip, rm, move, clear and per-project filtering', () => {
@@ -1215,6 +1511,56 @@ test('join --after follows the run to the next task and stops when the implement
   approveCurrent(s);
   r = s.run(['end'], { input: 'done' });
   assert.match(r.out, /1 task\(s\), 0 recorded decision/);
+});
+
+test('idle and stall count from the turn start: notes and reads are no sign of life', () => {
+  const backdate = (s, mins, { legacy = false } = {}) => {
+    const sp = path.join(s.taskDir(), 'state.json');
+    const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+    const then = Math.floor(Date.now() / 1000) - mins * 60;
+    st.updated_epoch = then;
+    if (legacy) delete st.turn_since; else st.turn_since = then;
+    fs.writeFileSync(sp, JSON.stringify(st));
+  };
+  const waitReviewer = (s) => s.run(['wait', 'reviewer', '--timeout', '1']);
+
+  // A note to the unresponsive implementer, from the user or the reviewer, doesn't reset the clock.
+  let s = sandbox();
+  s.run(['init', 'idle'], { input: 'b' });
+  backdate(s, 60);
+  s.run(['note', '--as-user', 'still there?']);
+  s.run(['note', '--from', 'reviewer', 'ping'], { env: { COLLAB_AGENT_SHELL: '' } });
+  assert.ok(s.state().updated_epoch > Math.floor(Date.now() / 1000) - 60, 'the notes did write the state');
+  let r = waitReviewer(s);
+  assert.equal(r.code, 13, r.out);
+  assert.match(r.out, /the implementer has not handed off for 60 min/);
+  assert.match(s.run(['status']).out, /by reviewer/, 'status still shows the last writer');
+  // Snooze and progress still count.
+  s.run(['snooze', '30']);
+  assert.equal(waitReviewer(s).code, 11, 'snoozed');
+  s = sandbox();
+  s.run(['init', 'progress'], { input: 'b' });
+  backdate(s, 60);
+  s.run(['progress', 'running the tests']);
+  s.run(['note', '--as-user', 'hello']);
+  assert.equal(waitReviewer(s).code, 11, 'a progress post this turn is a sign of life');
+
+  // Stall: a note 121 min into the turn doesn't save it (idle prompt off, so the stall timer decides).
+  s = sandbox({ COLLAB_IDLE_SECS: '999999' });
+  s.run(['init', 'stall'], { input: 'b' });
+  backdate(s, 121);
+  s.run(['note', '--as-user', 'hello?']);
+  r = waitReviewer(s);
+  assert.equal(r.code, 10, r.out);
+  assert.match(r.out, /STALLED/);
+
+  // State from before turn_since: updated_epoch is the turn start, as before.
+  s = sandbox();
+  s.run(['init', 'legacy'], { input: 'b' });
+  backdate(s, 60, { legacy: true });
+  r = waitReviewer(s);
+  assert.equal(r.code, 13, r.out);
+  assert.match(r.out, /has not handed off for 60 min/);
 });
 
 test('join --after: unresponsive implementer after DONE, snooze, and a paused queue', async () => {
@@ -1695,6 +2041,16 @@ test('a build ready needs a closeout with all four labels', () => {
   r = ready('## Summary\nx\n## Closeout\nVerified: npm test, 12 pass\nDeferred: none\n## Decisions taken\nNot claimed: outside the section\n');
   assert.equal(r.code, 1);
   assert.match(r.err, /labels 'Attempted, blocked:', 'Not claimed:'/);
+  assert.doesNotMatch(r.err, /found/, 'no hint when the label is simply absent');
+  r = ready('## Summary\nx\n## Closeout\nVerified (log in x): npm test\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n');
+  assert.equal(r.code, 1, 'text between the label and its colon is refused');
+  assert.match(r.err, /labels 'Verified:' .*; found 'Verified \(log in x\): npm test': each label must be followed directly by its colon/);
+  r = ready('## Summary\nx\n## Closeout\nVerified: npm test\nAttempted, blocked: none\nDeferred: none\n- **Not claimed** (by me): Windows\n');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /found 'Not claimed \(by me\): Windows'/, 'list markers and bold are stripped from the quote');
+  r = ready('## Summary\nx\n## Closeout\nVerified: npm test\nAttempted, blocked: none\nDeferred: none\nNothing else: ok\nNotes (x): y\n');
+  assert.equal(r.code, 1);
+  assert.doesNotMatch(r.err, /found/, 'a line that only starts with the same letters is not a near miss');
   assert.equal(s.state().seq, before.seq, 'nothing written');
   assert.equal(s.state().status, 'IMPLEMENTING');
 
