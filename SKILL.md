@@ -66,6 +66,11 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   task id, pass `-t <task-id>` as the first argument on **every** later call, e.g.
   `collab -t dark-mode-20260926-120000 wait reviewer`. That way a second collab pair started
   elsewhere can never redirect you to its task.
+- **Never mute the task's sounds:** run the task's commands (`note`, `progress`, `wait`, `submit`,
+  `diff`, `answer`, …) as they are, never with `COLLAB_SOUND=0` or any other mute in front. The user
+  follows the run by ear, and a muted command makes its event silent for them. `COLLAB_SOUND=0` is
+  only for your own test runs against a separate temporary `COLLAB_HOME` (e.g. the project's test
+  sandbox). To change sound, see *Sound on request*.
 - **Passing messages** (brief, summary, review), depending on your shell:
   - *bash / zsh / Git Bash:* a quoted heredoc on stdin:
     `collab -t <id> submit implementer ready <<'EOF' … EOF`
@@ -442,7 +447,8 @@ EOF
      `## Divergence from plan` is blocking; a declared one is judged on its merits.
    - Check them against the brief's acceptance criteria. Look for correctness, edge cases,
      regressions, security, and consistency with the surrounding code and project conventions.
-   - You can run read-only checks (lint, type-check, tests). **Don't edit project files**;
+   - You can run read-only checks (lint, type-check, tests; never mute the task's own commands, see
+     *The CLI*). **Don't edit project files**;
      your only output is the review.
    - Stay within the brief's scope. Don't ask for unrelated refactors.
    - A new document outside the brief's `## Deliverables` location, or a handoff draft (brief,
@@ -562,7 +568,8 @@ it reports), and carry on:
 | back to my usual settings | `sound use default` |
 
 Change the permanent settings (`collab sound off`, `collab sound voice …`) only when the user
-explicitly asks for a permanent change. Never change sound on your own initiative.
+explicitly asks for a permanent change. Never change sound on your own initiative, and never mute it
+by running the task's commands with `COLLAB_SOUND=0` (see *The CLI*).
 
 ## Human controls
 

@@ -18,7 +18,7 @@ All optional, via environment variables:
 | `COLLAB_CHECK_TIMEOUT` | `1800` | Seconds before a `--check` command is stopped |
 | `COLLAB_NOTIFY` | `1` | `0` turns off desktop notifications (phone pushes only depend on `--phone`) |
 | `COLLAB_PHONE_URL` | | Where `--phone` pushes go, overriding `collab phone set` |
-| `COLLAB_SOUND` | | `0` turns off every sound and spoken sentence, whatever the task or config says |
+| `COLLAB_SOUND` | | `0` turns off every sound and spoken sentence from the commands run with it, whatever the task or config says (agents never set it on a task's commands, only on their own test runs) |
 | `COLLAB_SOUND_STALE_SECS` | `120` | Sounds still waiting to play after this long are dropped |
 | `ELEVENLABS_API_KEY` | | Your ElevenLabs key, for `--sound=elevenlabs` |
 | `COLLAB_ELEVENLABS_TIMEOUT_SECS` | `15` | How long to wait for ElevenLabs before the system voice speaks instead |
