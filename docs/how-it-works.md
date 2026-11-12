@@ -224,6 +224,34 @@ task needs the flag again. Queued items carry it like any other option.
 - **Privacy:** anyone who knows an ntfy.sh topic name can read it; the random name is the
   secret. Pushes contain the task id and the decision question or escalation headline.
 
+## Sounds
+
+Off unless a task has `--sound[=voice|tones]` (carried on through a run exactly like `--phone`) or
+`config.json` has `sound.on: true`; `sound.on: false` and `COLLAB_SOUND=0` mute everything.
+Reference and config format: [reference.md](reference.md#sounds-and-speech).
+
+- **Who sounds:** the command that makes a transition (`init`, `submit`, `answer`, `abort`, `end`,
+  `note`, `queue split`), while it still holds the task's lock (so a task's sounds queue in the order
+  of its transitions; `init` queues before the task can be seen). A round-limit answer sounds as its outcome (`plan-approve`,
+  `approve` + `part-done`, `escalate`, or `answer`). Events several processes can observe win a
+  claim first: `idle` per quiet spell (turn, last activity, snooze, and on the implementer's
+  turn the newest project file change, in `state.json` `audio_claims`, written without counting as
+  activity), `stall` only by the process that writes `STALLED`, `confirm` once per queue item and
+  `agent-waiting` (only for the project's running task) once a minute per task and message (in `audio/claims.json`).
+- **How:** the command writes a job (tone and sentence) to `~/.collab/audio/queue/` and starts a
+  detached `collab sound drain`. One drainer at a time holds `audio/.lock` and plays the jobs
+  oldest first, each step to the end (tone 30 s, sentence 60 s at most); others exit and leave it
+  their jobs. A drainer whose owner died is taken over only after the player it started is gone.
+  Jobs older than `COLLAB_SOUND_STALE_SECS` (120) are dropped.
+- **ElevenLabs** (`--sound=elevenlabs`, or `sound.voice.engine: "elevenlabs"`): the drainer, never the
+  command, turns each sentence into an mp3 (`POST /v1/text-to-speech/<voice_id>`, cached in
+  `audio/tts/` by text, voice, model and settings, at most 300 files / 50 MB) and plays it as a
+  tone. The key (`ELEVENLABS_API_KEY`, else `sound.voice.api_key`) is read at that moment and never
+  stored in a job. Any failure speaks that sentence with the system voice; 401/403/404 pause
+  ElevenLabs for 10 min, 429 for 2, network errors for 1 (`audio/tts-status.json`, scoped to the
+  endpoint, key, voice and model, so changing one retries at once).
+- With a sound queued, the event's desktop notification makes no sound of its own.
+
 ## States
 
 | Status | Whose turn | Meaning |
@@ -329,7 +357,8 @@ work go where the brief's `## Deliverables` line says.
 ~/.collab/
   current                          id of the most recent task
   queue.json                       queued tasks, each with its project folder and options
-  config.json                      settings: phone_url (where --phone tasks push to)
+  config.json                      settings: phone_url (where --phone tasks push to), sound
+  audio/                           queue/ of sounds waiting to play, .lock of the drainer, claims.json
   drafts/                          agents' drafts written before a task exists (e.g. a brief)
   tasks/<slug>-<YYYYMMDD-HHMMSS>/
     state.json                     status, turn, rounds, repos, progress, …

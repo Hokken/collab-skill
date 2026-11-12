@@ -12,6 +12,9 @@ const CLI = path.join(__dirname, '..', 'bin', 'collab.js');
 // The tests act as the user unless a test sets an agent marker itself.
 const NO_AGENT = { CLAUDECODE: '', COLLAB_AGENT: '', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '', CODEX_SANDBOX: '', CODEX_SANDBOX_NETWORK_DISABLED: '', OPENCODE: '' };
 
+// Tests never reach the real ElevenLabs API, even when the developer's shell has a key.
+const NO_ELEVENLABS = { ELEVENLABS_API_KEY: '', COLLAB_ELEVENLABS_URL: 'http://127.0.0.1:9' };
+
 const CLOSEOUT = '## Closeout\nVerified: none\nAttempted, blocked: none\nDeferred: none\nNot claimed: none\n';
 
 function sandbox(extraEnv = {}) {
@@ -20,8 +23,8 @@ function sandbox(extraEnv = {}) {
   const project = path.join(root, 'project');
   fs.mkdirSync(project, { recursive: true });
   const env = {
-    ...process.env, COLLAB_HOME: home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0',
-    COLLAB_TASK: '', ...NO_AGENT, ...extraEnv,
+    ...process.env, COLLAB_HOME: home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0', COLLAB_SOUND: '0',
+    COLLAB_TASK: '', ...NO_AGENT, ...NO_ELEVENLABS, ...extraEnv,
   };
   // A build 'ready' needs a closeout; tests that aren't about it get a minimal one (raw: send as is).
   const run = (args, { input, cwd = project, env: more = {}, raw = false } = {}) => {
@@ -2852,4 +2855,799 @@ test('phone: Claude Code questions (PreToolUse AskUserQuestion) and a first conf
     await pause(800);
     assert.equal(p.got.length, 2, JSON.stringify(p.got.map((g) => g.body)));
   } finally { p.close(); }
+});
+
+// --- sounds and speech ------------------------------------------------------------------------
+
+// Stub players: every name collab can launch, as a node script that records its argv, the sound
+// environment and when it started and ended (STUB_SLEEP_MS keeps it playing, STUB_EXIT fails it).
+const STUB = `const fs = require('fs');
+const log = process.env.STUB_LOG;
+const rec = (phase) => fs.appendFileSync(log, JSON.stringify({ phase, name: require('path').basename(__filename, '.js'), pid: process.pid, at: Date.now(),
+  argv: process.argv.slice(2), event: process.env.COLLAB_SOUND_EVENT, file: process.env.COLLAB_SOUND_FILE, text: process.env.COLLAB_SAY_TEXT }) + '\\n');
+rec('start');
+setTimeout(() => { rec('end'); process.exit(parseInt(process.env.STUB_EXIT || '0', 10)); }, parseInt(process.env.STUB_SLEEP_MS || '0', 10));
+`;
+const ALL_PLAYERS = ['afplay', 'say', 'powershell', 'pw-play', 'paplay', 'aplay', 'mpg123', 'ogg123', 'play', 'ffplay', 'spd-say', 'espeak-ng', 'espeak'];
+const MAC_SOUNDS = ['Blow', 'Submarine', 'Bottle', 'Pop', 'Tink', 'Glass', 'Hero', 'Morse', 'Sosumi', 'Basso', 'Funk', 'Ping', 'Frog', 'Purr'];
+
+function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {} } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'collab-sound-'));
+  const bin = path.join(root, 'bin');
+  const sys = path.join(root, 'system');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(sys);
+  for (const p of players) fs.writeFileSync(path.join(bin, `${p}.js`), STUB);
+  for (const n of MAC_SOUNDS) fs.writeFileSync(path.join(sys, `${n}.aiff`), '');
+  const log = path.join(root, 'stub.log');
+  const s = sandbox({ COLLAB_SOUND: '', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env });
+  const records = () => { try { return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  const started = () => records().filter((r) => r.phase === 'start');
+  const queueDir = path.join(s.home, 'audio', 'queue');
+  // Wait until every queued job has been played and the drainer is gone.
+  const settle = async (ms = 20000) => {
+    const t0 = Date.now();
+    for (;;) {
+      let jobs = [];
+      try { jobs = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')); } catch { /* none yet */ }
+      const busy = fs.existsSync(path.join(s.home, 'audio', '.lock'));
+      if (!jobs.length && !busy) { await pause(300); if (!fs.existsSync(path.join(s.home, 'audio', '.lock'))) return; }
+      if (Date.now() - t0 > ms) throw new Error(`audio queue did not drain: ${jobs.length} job(s), lock ${busy}`);
+      await pause(100);
+    }
+  };
+  const events = () => started().map((r) => `${r.event}:${r.name === 'say' ? 'say' : 'tone'}`);
+  const tones = () => started().filter((r) => r.name !== 'say').map((r) => r.event);
+  const runAsync = (args, more = {}) => new Promise((resolve) => {
+    const c = require('child_process').spawn(process.execPath, [CLI, ...args], {
+      cwd: s.project, env: { ...process.env, COLLAB_HOME: s.home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0', COLLAB_TASK: '', ...NO_AGENT, ...NO_ELEVENLABS,
+        COLLAB_SOUND: '', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env, ...more },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    c.stdout.on('data', (b) => { out += b; });
+    c.on('close', (code) => resolve({ code, out }));
+  });
+  return { ...s, bin, sys, log, records, started, settle, events, tones, runAsync, root };
+}
+
+test('sound: silent unless a task has --sound or sound is on; COLLAB_SOUND=0 always wins', async () => {
+  const s = soundBox();
+  s.run(['init', 'quiet'], { input: 'b' });
+  s.run(['note', '--as-user', 'hi']);
+  await pause(800);
+  assert.equal(fs.existsSync(path.join(s.home, 'audio', 'queue')), false, 'nothing queued without --sound');
+  s.run(['abort']);
+  const r = s.run(['init', 'loud', '--sound'], { input: 'b', env: { COLLAB_SOUND: '0' } });
+  assert.equal(r.code, 0, r.err);
+  s.run(['note', '--as-user', 'hi'], { env: { COLLAB_SOUND: '0' } });
+  await pause(800);
+  assert.deepEqual(s.started(), []);
+  // An old config.json without a 'sound' key still works.
+  fs.writeFileSync(path.join(s.home, 'config.json'), '{"phone_url":"https://ntfy.sh/x"}\n');
+  assert.match(s.run(['sound']).out, /only for tasks started with --sound/);
+});
+
+test('sound: --sound parsing, queue options and carrying on through a run', async () => {
+  const s = soundBox({ env: { COLLAB_SOUND: '0' } });
+  let r = s.run(['init', '--sound', 'first'], { input: 'b' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /task: +first-/, 'a bare --sound does not eat the slug');
+  assert.equal(s.state().options.sound, 'voice');
+  s.run(['abort']);
+  r = s.run(['init', 'second', '--sound', 'tones'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'tones');
+  assert.match(r.out, /options: sounds\n/);
+  s.run(['abort']);
+  r = s.run(['init', 'third', '--sound=loud'], { input: 'b' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--sound takes voice or tones/);
+  // Queued and split tasks keep the option.
+  s.run(['init', 'run', '--sound=tones'], { input: 'b' });
+  r = s.run(['queue', 'split'], { input: 'part one\n=== part ===\npart two\n' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'queue.json'), 'utf8')).items[0].options.sound, 'tones');
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'part2', '--from-queue'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'tones');
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  // The next task of the run carries it on; after 'end' (or an abort) it needs a new opt-in.
+  s.run(['init', 'carried'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'tones');
+  s.run(['abort']);
+  s.run(['init', 'after-abort'], { input: 'b' });
+  assert.equal(s.state().options.sound, undefined);
+  s.run(['abort']);
+  s.run(['queue', 'add', '--sound', 'fix the thing']);
+  const q = JSON.parse(fs.readFileSync(path.join(s.home, 'queue.json'), 'utf8')).items;
+  assert.equal(q[q.length - 1].options.sound, 'voice');
+  assert.match(q[q.length - 1].text, /^fix the thing/);
+});
+
+test('sound: every handoff of a plan task sounds once, tone then sentence, in order', async () => {
+  const s = soundBox();
+  s.run(['init', 'Dark Mode', '--plan', '--sound=full'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. a\n2. b\n' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's1' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix\n' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['end'], { input: '## Final report\ndone\n' });
+  await s.settle();
+  const ev = s.events();
+  const order = ['brief', 'plan', 'plan-changes', 'plan', 'plan-approve', 'ready', 'changes', 'ready', 'approve', 'end'];
+  assert.deepEqual(ev, order.flatMap((e) => [`${e}:tone`, `${e}:say`]));
+  const said = s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
+  assert.equal(said[0], 'dark mode: new task started. The implementer is writing a plan');
+  assert.equal(said[2], "dark mode: the reviewer requested 2 changes to the plan. The implementer's turn");
+  assert.equal(said[6], "dark mode: the reviewer requested 1 change. The implementer's turn, round 2");
+  assert.match(said[9], /work complete, 1 task\. Run collab show/);
+  assert.equal(s.started().find((r) => r.event === 'approve').argv.slice(-1)[0], path.join(s.sys, 'Hero.aiff'));
+  // Nothing overlapped.
+  const recs = s.records();
+  for (let i = 1; i < recs.length; i += 2) assert.equal(recs[i].phase === 'end' && recs[i].pid === recs[i - 1].pid, true, 'each step ends before the next starts');
+});
+
+test('sound: --sound=tones plays no speech; decisions read out every option and how to answer', async () => {
+  const s = soundBox();
+  s.run(['init', 'calm', '--sound=tones'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  await s.settle();
+  assert.deepEqual(s.events(), ['brief:tone', 'ready:tone']);
+  s.run(['abort']);
+  s.run(['init', 'ask', '--sound=full'], { input: 'b' });
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Which DB?\n1. **Postgres** (Recommended) — solid\n2. SQLite — simple\n' });
+  s.run(['answer', '2']);
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
+  const decide = said.find((t) => /decision is needed/.test(t));
+  assert.match(decide, /Which DB\? Option 1: Postgres \(Recommended\) — solid\. Option 2: SQLite — simple\./);
+  assert.match(decide, /Answer in the implementer's terminal, or run collab answer with the option number/);
+  assert.match(said[said.length - 1], /decision recorded: option 2, SQLite — simple\. Back to the implementer/);
+});
+
+test('sound: round-limit answers sound as their outcome, split parts sound when they start and end', async () => {
+  const s = soundBox({ env: { COLLAB_SOUND_PLATFORM: 'darwin' } });
+  s.run(['init', 'limit', '--plan', '--max-rounds', '1', '--sound=tones'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['answer', '2']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['answer', '1']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's2' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. y\n' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's3' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. z\n' });
+  s.run(['answer', '3']);
+  await s.settle();
+  assert.deepEqual(s.tones(), ['brief', 'plan', 'decide', 'plan-approve', 'ready', 'decide', 'answer', 'ready', 'changes', 'ready', 'decide', 'escalate']);
+
+  const p = soundBox();
+  p.run(['init', 'big', '--sound=full'], { input: 'b' });
+  p.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n' });
+  p.run(['submit', 'implementer', 'ready'], { input: 's' });
+  p.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  p.run(['submit', 'implementer', 'ready'], { input: 's' + '2' });
+  p.run(['submit', 'reviewer', 'changes'], { input: '1. y\n' });
+  p.run(['submit', 'implementer', 'ready'], { input: 's3' });
+  p.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  p.run(['init', 'big-2', '--from-queue'], { input: 'b' });
+  p.run(['submit', 'implementer', 'ready'], { input: 's' });
+  p.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  await p.settle();
+  const said = p.started().filter((r) => r.name === 'say').map((r) => `${r.event}: ${r.argv[r.argv.length - 1]}`);
+  assert.deepEqual(said.filter((t) => /^(split|part-|approve)/.test(t)), [
+    'split: big: split into 2 parts',
+    'part-start: big: part 1 of 2 started. The implementer is working',
+    'approve: big: approved. Task done',
+    'part-done: big: part 1 of 2 done. 1 to go',
+    'part-start: big 2: part 2 of 2 started. The implementer is working',
+    'approve: big 2: approved. Task done',
+    'part-done: big 2: part 2 of 2 done. All parts done',
+  ]);
+  assert.ok(!said.some((t) => t.startsWith('brief: big 2')), 'a queued part sounds as part-start, not as a new task');
+});
+
+test('sound: events from several processes never overlap; a command never waits for the audio', async () => {
+  const s = soundBox({ env: { STUB_SLEEP_MS: '400' } });
+  s.run(['init', 'busy', '--sound'], { input: 'b' });
+  const t0 = Date.now();
+  const rs = await Promise.all([1, 2, 3].map((i) => s.runAsync(['note', '--as-user', `n${i}`])));
+  assert.deepEqual(rs.map((r) => r.code), [0, 0, 0]);
+  assert.ok(Date.now() - t0 < 4000, 'notes return without waiting for 3.2 s of audio');
+  await s.settle();
+  const recs = s.records();
+  assert.equal(recs.filter((r) => r.phase === 'start').length, 8, 'brief + 3 notes, each tone + sentence');
+  const spans = recs.filter((r) => r.phase === 'start').map((st) => [st.at, recs.find((e) => e.phase === 'end' && e.pid === st.pid).at]).sort((a, b) => a[0] - b[0]);
+  for (let i = 1; i < spans.length; i++) assert.ok(spans[i][0] >= spans[i - 1][1], `step ${i} started before step ${i - 1} ended`);
+
+  // A slow player never holds the command open, and a failing or missing one changes no exit code.
+  const slow = soundBox({ env: { STUB_SLEEP_MS: '8000' } });
+  slow.run(['init', 'slow', '--sound'], { input: 'b' });
+  const t1 = Date.now();
+  assert.equal(slow.run(['note', '--as-user', 'x']).code, 0);
+  assert.ok(Date.now() - t1 < 3000, 'note returned while the player still plays');
+  const bad = soundBox({ env: { STUB_EXIT: '1' } });
+  bad.run(['init', 'bad', '--sound'], { input: 'b' });
+  assert.equal(bad.run(['submit', 'implementer', 'ready'], { input: 's' }).code, 0);
+  assert.equal(bad.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
+  await bad.settle();
+  assert.equal(bad.started().length, 6, 'a failing step does not stop the next ones');
+  const none = soundBox({ players: [] });
+  none.run(['init', 'none', '--sound', '--check', 'node -e "process.exit(3)"'], { input: 'b' });
+  assert.equal(none.run(['submit', 'implementer', 'ready'], { input: 's' }).code, 14);
+  assert.equal(none.run(['abort']).code, 0);
+  await none.settle();
+  const t = none.run(['sound', 'test', 'decide']);
+  assert.equal(t.code, 1);
+  assert.match(t.out, /not played: no player/);
+  assert.match(t.out, /not played: no speech engine found/);
+});
+
+test('sound: a dead drainer is taken over only after the sound it started has finished', async () => {
+  const s = soundBox({ env: { STUB_SLEEP_MS: '2500' } });
+  s.run(['init', 'crash', '--sound=tones'], { input: 'b' });
+  let first;
+  for (let i = 0; i < 100 && !first; i++) { await pause(100); first = s.started()[0]; }
+  assert.ok(first, 'the first tone started');
+  const owner = parseInt(fs.readFileSync(path.join(s.home, 'audio', '.lock', 'owner'), 'utf8'), 10);
+  process.kill(owner, 'SIGKILL');
+  await pause(200);
+  s.run(['note', '--as-user', 'after the crash']);
+  await s.settle();
+  const recs = s.records();
+  const second = recs.filter((r) => r.phase === 'start')[1];
+  const firstEnd = recs.find((r) => r.phase === 'end' && r.pid === first.pid);
+  assert.ok(second && firstEnd, 'both tones played');
+  assert.ok(second.at >= firstEnd.at, 'the takeover waited for the dead drainer\'s tone');
+});
+
+test('sound: idle, stall, confirm-first and agent waits sound once per episode', async () => {
+  const s = soundBox({ env: { COLLAB_IDLE_SECS: '1' } });
+  s.run(['init', 'idle', '--sound=tones'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  await pause(1500);
+  const rs = await Promise.all([s.runAsync(['wait', 'implementer', '--timeout', '3']), s.runAsync(['wait', 'implementer', '--timeout', '3'])]);
+  assert.deepEqual(rs.map((r) => r.code), [13, 13]);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13);
+  await s.settle();
+  assert.deepEqual(s.tones().filter((e) => e === 'idle'), ['idle'], 'one sound for one idle episode');
+  const updated = s.state().updated_epoch;
+  // Activity (a progress update) starts a new episode.
+  s.run(['progress', 'still reviewing']);
+  await pause(1500);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13);
+  await s.settle();
+  assert.equal(s.tones().filter((e) => e === 'idle').length, 2);
+  assert.equal(s.state().updated_epoch, updated, 'sound claims are not agent activity');
+
+  const st = soundBox({ env: { COLLAB_STALL_SECS: '1', COLLAB_IDLE_SECS: '100' } });
+  st.run(['init', 'stall', '--sound=tones'], { input: 'b' });
+  st.run(['submit', 'implementer', 'ready'], { input: 's' });
+  await pause(1500);
+  const ss = await Promise.all([st.runAsync(['wait', 'implementer', '--timeout', '3']), st.runAsync(['wait', 'implementer', '--timeout', '3'])]);
+  assert.deepEqual(ss.map((r) => r.code), [10, 10]);
+  await st.settle();
+  assert.deepEqual(st.tones().filter((e) => e === 'stall'), ['stall']);
+
+  const q = soundBox();
+  q.run(['queue', 'add', '--confirm', '--sound=tones', 'needs a yes']);
+  q.run(['queue', 'next']);
+  q.run(['queue', 'next']);
+  // An agent CLI waiting: no --phone needed, and the same event within a minute sounds once.
+  q.run(['init', 'hooks', '--sound=tones', '--force'], { input: 'b' });
+  const ev = JSON.stringify({ hook_event_name: 'PermissionRequest', tool_input: { command: 'rm -rf build' }, cwd: q.project });
+  q.run(['phone', 'send'], { input: ev });
+  q.run(['phone', 'send'], { input: ev });
+  // The same prompt in another project's running task is its own event; outside a task, silence.
+  const other = path.join(q.root, 'other');
+  fs.mkdirSync(other);
+  q.run(['init', 'elsewhere', '--sound=tones'], { input: 'b', cwd: other });
+  q.run(['phone', 'send'], { input: JSON.stringify({ hook_event_name: 'PermissionRequest', tool_input: { command: 'rm -rf build' }, cwd: other }) });
+  q.run(['sound', 'on']);
+  const nowhere = path.join(q.root, 'nowhere');
+  fs.mkdirSync(nowhere);
+  q.run(['phone', 'send'], { input: JSON.stringify({ message: 'x', cwd: nowhere }) });
+  await q.settle();
+  assert.deepEqual(q.tones(), ['confirm', 'brief', 'agent-waiting', 'brief', 'agent-waiting']);
+});
+
+test('sound: config overrides, packs, explicit silence and custom sentences', async () => {
+  const s = soundBox();
+  const pack = path.join(s.root, 'my pack');
+  let r = s.run(['sound', 'pack', '--init', pack]);
+  assert.equal(r.code, 0, r.err);
+  const manifest = path.join(pack, 'collab-sounds.json');
+  const tpl = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  assert.equal(tpl.events.approve.file, null);
+  assert.equal(tpl.events.ready.say, '{task}: ready, round {round}');
+  assert.equal(s.run(['sound', 'pack', '--init', pack]).code, 1, 'never overwrites a manifest');
+  fs.writeFileSync(path.join(pack, 'done.wav'), '');
+  fs.writeFileSync(path.join(pack, 'any.wav'), '');
+  fs.writeFileSync(manifest, JSON.stringify({ name: 'mine', events: {
+    approve: 'done.wav', '*': 'any.wav', 'note-*': { file: 'missing.wav' }, ready: { say: '{task} round {round} is up' }, typo: 'x.wav',
+  } }));
+  r = s.run(['sound', 'pack', pack]);
+  assert.equal(r.code, 1, 'a missing file refuses the pack');
+  assert.match(r.err, /note-\*: file not found/);
+  assert.equal(fs.existsSync(path.join(s.home, 'config.json')), false, 'nothing written');
+  fs.writeFileSync(path.join(pack, 'missing.wav'), '');
+  fs.writeFileSync(path.join(pack, 'x.wav'), '');
+  r = s.run(['sound', 'pack', pack]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /'typo' matches no event/);
+  // A file that goes missing later just falls through to the next key ('*').
+  fs.rmSync(path.join(pack, 'missing.wav'));
+  const mine = path.join(s.root, 'with space é.wav');
+  fs.writeFileSync(mine, '');
+  r = s.run(['sound', 'set', 'brief', path.basename(mine)], { cwd: s.root });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(fs.realpathSync(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.events.brief), fs.realpathSync(mine), 'stored as an absolute path');
+  assert.equal(s.run(['sound', 'set', 'plan', 'none']).code, 0);
+  assert.equal(s.run(['sound', 'set', 'bogus', mine]).code, 1);
+  assert.equal(s.run(['sound', 'set', 'peer-*', path.join(s.root, 'nope.wav')]).code, 1);
+  assert.equal(s.run(['sound', 'set', 'peer-*', mine]).code, 0, 'a glob that matches events is fine');
+  fs.writeFileSync(path.join(s.home, 'tilde.wav'), '');
+  assert.equal(s.run(['sound', 'set', 'end', '~/tilde.wav'], { env: { HOME: s.home, USERPROFILE: s.home } }).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.events.end, path.join(s.home, 'tilde.wav'));
+  assert.equal(s.run(['sound', 'unset', 'end']).code, 0);
+  assert.equal(s.run(['sound', 'unset', 'end']).code, 1);
+  assert.equal(s.run(['sound', 'volume', '150']).code, 1);
+  assert.equal(s.run(['sound', 'volume', '40']).code, 0);
+
+  s.run(['init', 'packed', '--plan', '--sound=full'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['note', '--as-user', 'n']);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok\nNote #4 — seen' }).code, 10);
+  await s.settle();
+  const got = s.started().map((r) => `${r.event}:${r.name === 'say' ? r.argv[r.argv.length - 1] : path.basename(r.argv[r.argv.length - 1])}`);
+  assert.deepEqual(got, [
+    `brief:${path.basename(mine)}`, 'brief:packed: new task started. The implementer is writing a plan',
+    // plan: silenced in config (no tone, no sentence)
+    'plan-approve:any.wav', 'plan-approve:packed: plan approved. The implementer is building it',
+    'ready:any.wav', 'ready:packed round 1 is up',
+    'note-all:any.wav', 'note-all:packed: your note for both agents was added',
+    'approve:done.wav', 'approve:packed: approved. Task done',
+  ]);
+  assert.equal(s.started()[0].argv[1], '0.4', 'volume');
+  fs.writeFileSync(manifest, '{ not json');
+  r = s.run(['sound', 'pack', pack]);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /is not valid/);
+  assert.match(s.run(['sound']).out, /✗ pack: .*is not valid/);
+});
+
+test('sound: setup, on/off and the player and speech commands per platform', () => {
+  const s = soundBox();
+  let r = s.run(['sound', 'setup']);
+  assert.equal(r.code, 0, r.err);
+  let cfg = JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound;
+  assert.equal(cfg.on, true);
+  assert.equal(cfg.voice.on, true);
+  assert.equal(cfg.events.decide, path.join(s.sys, 'Sosumi.aiff'));
+  s.run(['sound', 'set', 'decide', path.join(s.sys, 'Pop.aiff')]);
+  s.run(['sound', 'setup']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.events.decide, path.join(s.sys, 'Pop.aiff'));
+  s.run(['sound', 'setup', '--force']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.events.decide, path.join(s.sys, 'Sosumi.aiff'));
+  assert.match(s.run(['sound', 'off']).out, /muted/);
+  assert.match(s.run(['sound']).out, /sound: +off: muted/);
+  s.run(['sound', 'unmute']);
+  assert.match(s.run(['sound']).out, /only for tasks started with --sound/);
+
+  // A real file name valid on every OS (no double quotes on Windows); quotes are tested in speech text.
+  const odd = path.join(s.root, `it's odd ü 日本.mp3`);
+  fs.writeFileSync(odd, '');
+  const wav = path.join(s.root, 'a b.wav');
+  fs.writeFileSync(wav, '');
+  const ogg = path.join(s.root, 'c.ogg');
+  fs.writeFileSync(ogg, '');
+  const dry = (file, platform, more = {}) => s.run(['sound', 'test', file, '--dry-run'], { env: { COLLAB_SOUND_PLATFORM: platform, ...more } });
+  r = dry(odd, 'darwin');
+  assert.match(r.out, /afplay\.js -v 1 /);
+  assert.match(dry(ogg, 'darwin').out, /\.ogg files can't be played on macOS/);
+  r = dry(wav, 'win32');
+  assert.match(r.out, /powershell\.js -NoProfile -NonInteractive -WindowStyle Hidden -Command .*SoundPlayer/);
+  assert.ok(r.out.includes(`"COLLAB_SOUND_FILE":${JSON.stringify(wav)}`));
+  assert.match(dry(odd, 'win32').out, /MediaPlayer/);
+  assert.match(dry(ogg, 'win32').out, /\.ogg files can't be played on Windows/);
+  assert.match(dry(ogg, 'linux').out, /pw-play\.js --volume 1 /);
+  const linuxBin = path.join(s.root, 'linux-bin');
+  fs.mkdirSync(linuxBin);
+  fs.writeFileSync(path.join(linuxBin, 'aplay.js'), STUB);
+  fs.writeFileSync(path.join(linuxBin, 'espeak-ng.js'), STUB);
+  assert.match(dry(wav, 'linux', { COLLAB_SOUND_BIN: linuxBin }).out, /aplay\.js -q /);
+  assert.match(dry(odd, 'linux', { COLLAB_SOUND_BIN: linuxBin }).out, /no player for \.mp3 files found \(mpg123, ffplay\); install/);
+  r = s.run(['sound', 'test', 'abort', '--full', '--dry-run'], { env: { COLLAB_SOUND_PLATFORM: 'linux', COLLAB_SOUND_BIN: linuxBin } });
+  assert.match(r.out, /speech "dark mode: aborted\. Both agents stop": .*espeak-ng\.js -a 200 /);
+  r = s.run(['sound', 'test', 'abort', '--full', '--dry-run'], { env: { COLLAB_SOUND_PLATFORM: 'win32' } });
+  assert.match(r.out, /SpeechSynthesizer/);
+  assert.ok(r.out.includes('"COLLAB_SAY_TEXT":"dark mode: aborted. Both agents stop"'));
+  // The real launch passes the odd file name through intact.
+  r = s.run(['sound', 'test', odd]);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(s.started().pop().argv.slice(-1)[0], odd);
+  r = s.run(['sound', 'test', odd], { env: { COLLAB_SOUND_PLATFORM: 'win32' } });
+  assert.equal(s.started().pop().file, odd);
+  assert.match(s.run(['sound'], { env: { COLLAB_SOUND_BIN: linuxBin, COLLAB_SOUND_PLATFORM: 'darwin' } }).out, /speech: +no speech engine found \(say\)/);
+  const cfgFile = path.join(s.home, 'config.json');
+  const conf = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+  conf.sound.events.abort = { file: null, say: 'she said "stop" — it\'s über 日本' };
+  fs.writeFileSync(cfgFile, JSON.stringify(conf));
+  assert.equal(s.run(['sound', 'test', 'abort']).code, 0);
+  assert.equal(s.started().pop().argv.slice(-1)[0], 'she said "stop" — it\'s über 日本');
+  assert.equal(s.run(['sound', 'test', 'abort'], { env: { COLLAB_SOUND_PLATFORM: 'win32' } }).code, 0);
+  assert.equal(s.started().pop().text, 'she said "stop" — it\'s über 日本');
+  assert.match(s.run(['sound', 'events']).out, /idle +an agent looks unresponsive/);
+});
+
+test('sound: different transitions racing each other are announced in the order they happened', async () => {
+  for (let round = 0; round < 3; round++) {
+    const s = soundBox();
+    s.run(['init', 'race', '--sound=tones'], { input: 'b' });
+    const msg = path.join(s.root, 'ready.md');
+    fs.writeFileSync(msg, `## Summary\ns\n${CLOSEOUT}`);
+    const rs = await Promise.all([
+      s.runAsync(['submit', 'implementer', 'ready', '--file', msg]),
+      s.runAsync(['note', '--as-user', '--reviewer', 'look at x']),
+      s.runAsync(['note', '--from', 'reviewer', 'early finding']),
+      s.runAsync(['note', '--as-user', '--implementer', 'and y']),
+    ].map((p) => p));
+    assert.ok(rs.every((r) => [0, 12].includes(r.code)), rs.map((r) => r.code).join(","));
+    await s.settle();
+    const order = fs.readdirSync(path.join(s.taskDir(), 'entries')).sort().map((f) => f.replace(/^\d+-/, '').replace(/\.md$/, ''))
+      .map((k) => (k === 'implementer-brief' ? 'brief' : k === 'implementer-ready' ? 'ready' : k.replace(/^human-/, '')));
+    assert.deepEqual(s.tones(), order, `round ${round + 1}`);
+  }
+});
+
+test('sound: a long decision keeps every option number and the answering instruction', async () => {
+  const s = soundBox();
+  s.run(['init', 'a-very-long-task-name-about-many-things-at-once', '--sound=full'], { input: 'b' });
+  const long = 'word '.repeat(60).trim();
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: `## ${long}?\n1. ${long}\n2. ${long}\n3. ${long}\n4. ${long}\n` });
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]).find((t) => /decision is needed/.test(t));
+  for (const n of [1, 2, 3, 4]) assert.match(said, new RegExp(`Option ${n}: word`));
+  assert.match(said, /Answer in the implementer's terminal, or run collab answer with the option number$/);
+});
+
+test('sound: an unusable audio store never changes a command\'s result', async () => {
+  const s = soundBox();
+  fs.mkdirSync(s.home, { recursive: true });
+  fs.writeFileSync(path.join(s.home, 'audio'), 'not a folder');
+  s.run(['queue', 'add', '--confirm', '--sound', 'needs a yes']);
+  let r = s.run(['queue', 'next']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /CONFIRM FIRST/);
+  assert.match(r.out, /needs a yes/);
+  r = s.run(['init', 'broken', '--sound', '--from-queue', '--confirmed', 'yes'], { input: 'b' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(s.run(['note', '--as-user', 'n']).code, 0);
+  assert.equal(s.run(['phone', 'send'], { input: JSON.stringify({ message: 'Claude needs your permission', cwd: s.project }) }).code, 0);
+  assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 's\nNote #2 — ok' }).code, 0);
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok\nNote #2 — ok' }).code, 10);
+});
+
+// --- ElevenLabs voice ----------------------------------------------------------------------------
+
+// A stand-in for the ElevenLabs API: records each request, answers with `reply(req)`. It runs in
+// this process, so commands that call it must use runAsync (spawnSync would block it).
+async function fakeElevenLabs(reply) {
+  const http = require('http');
+  const reqs = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (b) => { body += b; });
+    req.on('end', () => {
+      const r = { method: req.method, url: req.url, key: req.headers['xi-api-key'], body: body ? JSON.parse(body) : null };
+      reqs.push(r);
+      const a = reply(r);
+      if (a === 'hang') return;
+      res.writeHead(a.status || 200, { 'Content-Type': a.type || 'audio/mpeg' });
+      res.end(a.body === undefined ? Buffer.from('ID3fake-mp3') : a.body);
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  return { url, reqs, close: () => { server.closeAllConnections && server.closeAllConnections(); server.close(); } };
+}
+const KEY = 'sk_test_SECRET_123';
+
+test('elevenlabs: --sound=elevenlabs speaks through the API, caches, and never leaks the key', async () => {
+  const api = await fakeElevenLabs(() => ({}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY, STUB_SLEEP_MS: '300' } });
+    let r = s.run(['init', 'Voice', '--sound', 'elevenlabs'], { input: 'b' });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(s.state().options.sound, 'elevenlabs');
+    assert.match(r.out, /options: sounds and ElevenLabs voice/);
+    // Jobs waiting in the queue carry no key.
+    s.run(['note', '--as-user', 'one']);
+    s.run(['note', '--as-user', 'one']);
+    const q = path.join(s.home, 'audio', 'queue');
+    const queued = (() => { try { return fs.readdirSync(q).map((f) => fs.readFileSync(path.join(q, f), 'utf8')).join(''); } catch { return ''; } })();
+    assert.ok(!queued.includes(KEY));
+    await s.settle();
+    assert.equal(api.reqs.length, 2, 'brief + one note sentence; the identical second note is a cache hit');
+    const [first] = api.reqs;
+    assert.equal(first.method, 'POST');
+    assert.equal(first.url, '/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM?output_format=mp3_44100_128');
+    assert.equal(first.key, KEY);
+    assert.deepEqual(first.body, { text: 'voice: new task', model_id: 'eleven_flash_v2_5' }, 'the short sentence (the default)');
+    const played = s.started().filter((x) => x.event === 'brief').map((x) => x.name);
+    assert.deepEqual(played, ['afplay', 'afplay'], 'tone, then the ElevenLabs mp3 through the tone player');
+    assert.ok(s.started().every((x) => x.name !== 'say'), 'no system voice when ElevenLabs works');
+    const mp3 = s.started()[1].argv.slice(-1)[0];
+    assert.match(mp3, /audio[\\/]tts[\\/][0-9a-f]{64}\.mp3$/);
+    // The key is nowhere on disk or in any output.
+    const all = [];
+    const walk = (d) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, f.name); if (f.isDirectory()) walk(p); else all.push(fs.readFileSync(p, 'latin1')); } };
+    walk(s.home);
+    assert.ok(!all.join('').includes(KEY), 'no key under COLLAB_HOME');
+    assert.ok(!JSON.stringify(s.records()).includes(KEY), 'no key in player argv/env');
+    r = s.run(['sound']);
+    assert.ok(!r.out.includes(KEY));
+    assert.match(r.out, /key from ELEVENLABS_API_KEY; cache 2 file/);
+    assert.match(r.out, /last call .* ago: ok/);
+  } finally { api.close(); }
+});
+
+test('elevenlabs: failures fall back to the system voice, with a scoped backoff', async () => {
+  let status = 401;
+  const api = await fakeElevenLabs(() => ({ status, type: 'application/json', body: `{"detail":"bad key ${KEY}"}` }));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
+    s.run(['init', 'fall', '--sound=elevenlabs'], { input: 'b' });
+    s.run(['note', '--as-user', 'a']);
+    await s.settle();
+    assert.equal(api.reqs.length, 1, 'after a 401, ElevenLabs is skipped (backoff)');
+    assert.deepEqual(s.started().map((x) => x.name), ['afplay', 'say', 'afplay', 'say']);
+    let r = s.run(['sound']);
+    assert.match(r.out, /failed, HTTP 401 \(invalid or missing API key\); system voice until/);
+    assert.ok(!r.out.includes(KEY) && !r.out.includes('bad key'), 'no response body');
+    // A new key retries at once.
+    s.run(['note', '--as-user', 'b'], { env: { ELEVENLABS_API_KEY: 'sk_other' } });
+    await s.settle();
+    assert.equal(api.reqs.length, 2);
+    status = 429;
+    r = await s.runAsync(['sound', 'test', 'abort', '--elevenlabs'], { ELEVENLABS_API_KEY: 'sk_third' });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /ElevenLabs not used: ElevenLabs failed: HTTP 429 \(rate limit or character quota reached\); the system voice spoke instead/);
+    // A 200 without audio is a failure too.
+    status = 200;
+    r = await s.runAsync(['sound', 'test', 'end', '--elevenlabs'], { ELEVENLABS_API_KEY: 'sk_fourth' });
+    assert.match(r.out, /ElevenLabs sent no audio/);
+  } finally { api.close(); }
+
+  const hang = await fakeElevenLabs(() => 'hang');
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: hang.url, ELEVENLABS_API_KEY: KEY, COLLAB_ELEVENLABS_TIMEOUT_SECS: '1' } });
+    const r = await s.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    assert.match(r.out, /no answer within 1 s; the system voice spoke instead/);
+  } finally { hang.close(); }
+
+  // No key, or no mp3 player: no request at all.
+  const api2 = await fakeElevenLabs(() => ({}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api2.url } });
+    let r = await s.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    assert.match(r.out, /no ElevenLabs API key/);
+    const lin = soundBox({ platform: 'linux', players: ['aplay', 'espeak-ng'], env: { COLLAB_ELEVENLABS_URL: api2.url, ELEVENLABS_API_KEY: KEY } });
+    r = await lin.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    assert.match(r.out, /can't play ElevenLabs audio: no player for \.mp3 files found/);
+    assert.equal(lin.started().pop().name, 'espeak-ng');
+    // The player failing on the mp3 falls back for that sentence.
+    const bad = soundBox({ env: { COLLAB_ELEVENLABS_URL: api2.url, ELEVENLABS_API_KEY: KEY, STUB_EXIT: '1' } });
+    r = await bad.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    assert.match(r.out, /the player failed on the ElevenLabs audio \(exit code 1\)/);
+    // An unusable cache falls back too.
+    const nocache = soundBox({ env: { COLLAB_ELEVENLABS_URL: api2.url, ELEVENLABS_API_KEY: KEY } });
+    fs.mkdirSync(path.join(nocache.home, 'audio'), { recursive: true });
+    fs.writeFileSync(path.join(nocache.home, 'audio', 'tts'), 'not a folder');
+    r = await nocache.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    assert.match(r.out, /can't write the ElevenLabs audio cache; the system voice spoke instead/);
+    assert.equal(api2.reqs.length, 2, 'only the two runs that had a key and a player called the API');
+  } finally { api2.close(); }
+});
+
+test('elevenlabs: setup commands, config key, voices, dry run and cache', async () => {
+  const api = await fakeElevenLabs((r) => (r.url.startsWith('/v2/voices')
+    ? { type: 'application/json', body: JSON.stringify(r.url.includes('next_page_token=p2')
+      ? { voices: [{ voice_id: 'v2', name: 'Bea', category: 'cloned' }], has_more: false }
+      : { voices: [{ voice_id: 'v1', name: 'Al', category: 'premade' }], has_more: true, next_page_token: 'p2' }) }
+    : {}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url } });
+    let r = s.run(['sound', 'voice', 'elevenlabs', '--voice', 'v2', '--model', 'eleven_multilingual_v2']);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /key: missing/);
+    assert.match(r.out, /sent to ElevenLabs/);
+    r = s.run(['sound', 'voice', 'key'], { input: `${KEY}\n` });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /plain text/);
+    assert.ok(!r.out.includes(KEY));
+    const cfg = JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8'));
+    assert.equal(cfg.sound.voice.api_key, KEY);
+    assert.equal(cfg.sound.voice.engine, 'elevenlabs');
+    assert.match(s.run(['sound']).out, /engine: +ElevenLabs/);
+    // Dry run: the request, no call.
+    r = await s.runAsync(['sound', 'test', 'abort', '--dry-run']);
+    assert.match(r.out, /ElevenLabs voice v2, model eleven_multilingual_v2 \(not cached: POST /);
+    assert.equal(api.reqs.length, 0);
+    // A config key works, and a job built under 'voice' mode with the config engine never holds it.
+    s.run(['init', 'cfgkey', '--sound', 'voice'], { input: 'b' });
+    await s.settle();
+    assert.equal(api.reqs.length, 1);
+    assert.equal(api.reqs[0].key, KEY);
+    assert.equal(api.reqs[0].body.model_id, 'eleven_multilingual_v2');
+    assert.ok(api.reqs[0].url.startsWith('/v1/text-to-speech/v2?'));
+    r = await s.runAsync(['sound', 'voices']);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /Al +v1 +premade\nBea +v2 +cloned/);
+    assert.ok(api.reqs.some((x) => x.url === '/v2/voices?page_size=100&next_page_token=p2'));
+    // Different settings are a different cached file; 'cache clear' empties it.
+    await s.runAsync(['sound', 'test', 'end']);
+    await s.runAsync(['sound', 'test', 'end']);
+    const before = api.reqs.length;
+    const conf = JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8'));
+    conf.sound.voice.stability = 0.3;
+    fs.writeFileSync(path.join(s.home, 'config.json'), JSON.stringify(conf));
+    await s.runAsync(['sound', 'test', 'end']);
+    assert.equal(api.reqs.length, before + 1);
+    assert.deepEqual(api.reqs[api.reqs.length - 1].body.voice_settings, { stability: 0.3 });
+    assert.match(s.run(['sound', 'cache', 'clear']).out, /deleted [1-9]\d* cached/);
+    assert.equal(s.run(['sound', 'voice', 'key', '--clear']).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.voice.api_key, undefined);
+    assert.equal(s.run(['sound', 'voice', 'system']).code, 0);
+    assert.match(s.run(['sound']).out, /engine: +system voice/);
+    // Carry-forward and queue options keep the engine.
+    s.run(['abort']);
+    s.run(['queue', 'add', '--sound=elevenlabs', 'later']);
+    s.run(['init', 'q', '--from-queue'], { input: 'b' });
+    assert.equal(s.state().options.sound, 'elevenlabs');
+  } finally { api.close(); }
+});
+
+test('elevenlabs: the cache keeps at most 300 sentences', async () => {
+  const api = await fakeElevenLabs(() => ({}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
+    const dir = path.join(s.home, 'audio', 'tts');
+    fs.mkdirSync(dir, { recursive: true });
+    const old = new Date(Date.now() - 86400e3);
+    for (let i = 0; i < 305; i++) {
+      const f = path.join(dir, `${String(i).padStart(64, '0')}.mp3`);
+      fs.writeFileSync(f, 'x');
+      fs.utimesSync(f, old, old);
+    }
+    await s.runAsync(['sound', 'test', 'abort', '--elevenlabs']);
+    const left = fs.readdirSync(dir).filter((f) => f.endsWith('.mp3'));
+    assert.equal(left.length, 300);
+    assert.ok(!left.includes(`${'0'.repeat(64)}.mp3`), 'the oldest went first');
+  } finally { api.close(); }
+});
+
+test('sound: short sentences by default, full ones on request, custom sentences still win', async () => {
+  const s = soundBox();
+  s.run(['init', 'Dark Mode', '--plan', '--sound'], { input: 'b' });
+  s.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. a\n' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Which?\n1. A\n2. B\n' });
+  s.run(['answer', '1']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
+  assert.deepEqual(said, [
+    'dark mode: new task', 'dark mode: split into 2 parts', 'dark mode: part 1 of 2 started', 'dark mode: plan ready',
+    'dark mode: plan changes', 'dark mode: plan ready', 'dark mode: plan approved', 'dark mode: decision needed',
+    'dark mode: answered', 'dark mode: ready, round 1', 'dark mode: changes, round 2', 'dark mode: ready, round 2',
+    'dark mode: approved', 'dark mode: part 1 of 2 done',
+  ]);
+  // --sound=full is a mode like the others: parsed, shown, carried on to the next task of the run.
+  s.run(['init', 'next', '--from-queue'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'voice', 'the split part keeps the task option');
+  s.run(['abort']);
+  let r = s.run(['init', 'wordy', '--sound', 'full'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'full');
+  assert.match(r.out, /options: sounds and full sentences/);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'carried'], { input: 'b' });
+  assert.equal(s.state().options.sound, 'full');
+  await s.settle();
+  const last = s.started().filter((x) => x.name === 'say').pop().argv.slice(-1)[0];
+  assert.equal(last, 'carried: new task started. The implementer is working');
+  s.run(['abort']);
+  // The config style; a custom sentence wins over either style.
+  assert.match(s.run(['sound']).out, /style: +short sentences/);
+  r = s.run(['sound', 'voice', 'style', 'full']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(s.run(['sound']).out, /style: +full sentences/);
+  assert.match(s.run(['sound', 'test', 'approve', '--dry-run']).out, /speech "dark mode: approved\. Task done"/);
+  s.run(['sound', 'voice', 'style', 'short']);
+  assert.match(s.run(['sound', 'test', 'approve', '--dry-run']).out, /speech "dark mode: approved"/);
+  assert.match(s.run(['sound', 'test', 'approve', '--full', '--dry-run']).out, /speech "dark mode: approved\. Task done"/);
+  assert.equal(s.run(['sound', 'voice', 'style', 'long']).code, 1);
+  const cfgFile = path.join(s.home, 'config.json');
+  const conf = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+  conf.sound.events = { approve: { say: '{task} is done' } };
+  fs.writeFileSync(cfgFile, JSON.stringify(conf));
+  assert.match(s.run(['sound', 'test', 'approve', '--full', '--dry-run']).out, /speech "dark mode is done"/);
+  assert.match(s.run(['sound', 'events']).out, /approve +the reviewer approved: the task is done\n +short: "dark mode: approved"\n +full: +"dark mode: approved\. Task done"/);
+});
+
+test('sound: a short idle names the quiet agent, during a turn and after DONE', async () => {
+  const s = soundBox({ env: { COLLAB_IDLE_SECS: '1' } });
+  s.run(['init', 'quiet', '--sound'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  await pause(1500);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  await pause(1500);
+  assert.equal(s.run(['join', '--after', s.state().id, '--timeout', '3']).code, 13);
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say' && r.event === 'idle').map((r) => r.argv[r.argv.length - 1]);
+  assert.deepEqual(said, ['quiet: the reviewer is quiet', 'quiet: the implementer is quiet']);
+});
+
+test('elevenlabs: style_exaggeration is separate from the sentence style; old numeric styles still count', async () => {
+  const api = await fakeElevenLabs(() => ({}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
+    const cfgFile = path.join(s.home, 'config.json');
+    fs.mkdirSync(s.home, { recursive: true });
+    const write = (voice) => fs.writeFileSync(cfgFile, JSON.stringify({ sound: { voice } }));
+    const settingsOf = async (what) => { await s.runAsync(['sound', 'test', what, '--elevenlabs']); return api.reqs[api.reqs.length - 1].body; };
+    write({ engine: 'elevenlabs', style: 0 });
+    let b = await settingsOf('approve');
+    assert.deepEqual(b.voice_settings, { style: 0 }, 'a legacy numeric style, even 0, still reaches ElevenLabs');
+    assert.equal(b.text, 'dark mode: approved');
+    // The setter keeps the number under its own key before writing the sentence style.
+    assert.equal(s.run(['sound', 'voice', 'style', 'full']).code, 0);
+    const v = JSON.parse(fs.readFileSync(cfgFile, 'utf8')).sound.voice;
+    assert.equal(v.style, 'full');
+    assert.equal(v.style_exaggeration, 0);
+    b = await settingsOf('abort');
+    assert.deepEqual(b.voice_settings, { style: 0 });
+    assert.equal(b.text, 'dark mode: aborted. Both agents stop', 'full sentences with the numeric setting kept');
+    write({ engine: 'elevenlabs', style: 'short', style_exaggeration: 0.4, stability: 0.5 });
+    b = await settingsOf('end');
+    assert.deepEqual(b.voice_settings, { stability: 0.5, style: 0.4 });
+    write({ engine: 'elevenlabs', style: 'full' });
+    b = await settingsOf('stall');
+    assert.equal(b.voice_settings, undefined, "'short'/'full' never go out as voice_settings.style");
+  } finally { api.close(); }
+});
+
+test('sound: a generated pack keeps the quiet agent of idle at run time', async () => {
+  const s = soundBox({ env: { COLLAB_IDLE_SECS: '1' } });
+  const pack = path.join(s.root, 'gen');
+  assert.equal(s.run(['sound', 'pack', '--init', pack]).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pack, 'collab-sounds.json'), 'utf8')).events.idle.say, '{task}: the {quiet} is quiet');
+  assert.equal(s.run(['sound', 'pack', pack]).code, 0);
+  s.run(['init', 'gen', '--sound=full'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  await pause(1500);
+  assert.equal(s.run(['wait', 'implementer', '--timeout', '3']).code, 13);
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  await pause(1500);
+  assert.equal(s.run(['join', '--after', s.state().id, '--timeout', '3']).code, 13);
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say' && r.event === 'idle').map((r) => r.argv[r.argv.length - 1]);
+  assert.deepEqual(said, ['gen: the reviewer is quiet', 'gen: the implementer is quiet'], 'the pack sentence wins even over --sound=full');
 });

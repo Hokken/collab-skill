@@ -202,6 +202,7 @@ Add these to `/collab implement …` or to `collab queue add`:
 | `--commit` | Commit the changes when the task is done (never pushes) |
 | `--confirm` | Queued tasks only: ask you before this one starts |
 | `--phone` | Push to your phone when you're needed (see [Phone notifications](#phone-notifications)); stays on for the rest of the run |
+| `--sound[=tones\|full\|elevenlabs]` | A sound and a short spoken update at every step (see [Sounds](#sounds)); `full`: full sentences, `elevenlabs`: ElevenLabs voices; stays on for the rest of the run |
 | `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
 | `--first` | Queued tasks only: put it at the front of the queue |
 
@@ -282,6 +283,23 @@ presents decisions (usually the implementer) in Claude Code with
 or say *keep waiting* or *stop*, from the Claude app, and the pair carries on. From any terminal,
 `collab answer <N>` works too.
 
+### Sounds
+
+Add `--sound` to a request and you know where the run is without looking: every step plays a tone
+and says a few words ("dark mode: changes, round 2", "dark mode: decision needed", "dark mode:
+approved"). It uses your system's own sounds and voice, so there is nothing to set up;
+`--sound=tones` skips the voice, and `--sound=full` says everything needed to follow the run by
+ear alone (whose turn it is, what you need to do, the options of a decision). Sounds never overlap
+and never slow the agents down.
+
+`collab sound` shows what each event plays, `collab sound test decide` plays one, and
+`collab sound setup` turns sound on for every task. Bring your own sounds with
+`collab sound set approve ~/Sounds/done.mp3`, or make a whole pack with
+`collab sound pack --init <folder>`. For more natural voices, `--sound=elevenlabs` speaks the
+sentences with [ElevenLabs](https://elevenlabs.io) (your own API key in `ELEVENLABS_API_KEY`;
+your system voice takes over offline or on any error). Details:
+[docs/reference.md](docs/reference.md#sounds-and-speech).
+
 ## Command reference
 
 The same list as `collab help`, grouped by what you'd use it for. 🤖 marks commands the agents
@@ -317,6 +335,7 @@ also run themselves. Add `-t <task-id>` to any command to target a task other th
 | `collab queue rm N` · `move N M` · `clear [--all]` | Edit the queue |
 | `collab lessons [add "text" \| rm N]` | List, add or remove this project's lessons (see [Project lessons](#project-lessons)) |
 | `collab phone [set <topic \| url> \| test \| send]` | Show, change or test where `--phone` tasks push to; `send` is for agent CLI hooks (see [Phone notifications](#phone-notifications)) |
+| `collab sound [setup \| test \| set \| pack \| on \| off …]` | Show, test and change the sounds and spoken sentences (see [Sounds](#sounds)) |
 | `collab clean [--older-than D] [-n] [-y]` | Delete finished tasks and drafts older than a day (asks first; `-n` dry run, `-y` no prompt) |
 | `collab help` | Print the command list |
 

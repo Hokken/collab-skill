@@ -112,13 +112,29 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Phone**: task option `--phone`; `pushPhone(st, msg)` is a no-op without it, otherwise a detached
   `node -e` child POSTs to `COLLAB_PHONE_URL` or `config.json`'s `phone_url` (ntfy). `cmdInit`
   carries `phone` on from a DONE, not-ended previous task and creates a topic on first use (`ensurePhoneUrl`).
+- **Sound**: task option `--sound[=voice|tones]` (an `optional` value in `takeOpts`, carried on like
+  `phone`), or `config.json` `sound.on`; `soundMode` decides (`COLLAB_SOUND=0` and `sound.on: false`
+  mute). Events are `SOUND_EVENTS` (name → description, full sentence, short sentence); `soundStyle` picks short
+  (default) or full (`--sound=full`, `sound.voice.style`). `style_exaggeration` is ElevenLabs' numeric style. Commands call
+  `sound(st, event, ctx)` / `queueSound(st, [...])` after a transition (`handoffSounds`, `doneSounds`);
+  observed events (idle, stall, confirm, agent-waiting) first win a claim (`claimTaskEvent` in
+  `state.json` `audio_claims`, `claimHomeEvent` in `audio/claims.json`). `resolveSound`: config
+  `sound.events` > pack (`collab-sounds.json`, `readPack`) > `SYSTEM_SOUNDS`, most specific key first.
+  Jobs go to `$COLLAB_HOME/audio/queue/`; a detached `collab sound drain` plays them one at a
+  time under `audio/.lock` (`tryAudioLock` waits for a dead drainer's `child` before taking over).
+  `toneCommand`/`speechCommand` build per-platform commands; tests use `COLLAB_SOUND_PLATFORM`,
+  `COLLAB_SOUND_BIN` (stub `<name>.js` players) and `COLLAB_SOUND_SYSTEM_DIR`.
+  ElevenLabs (`--sound=elevenlabs` / `sound.voice.engine`): `jobVoice` is the allowlist a job carries (never the
+  key); the drainer's `speakStep` → `elevenLabsAudio` (cache `audio/tts/`, scoped backoff in
+  `audio/tts-status.json`) falls back to `systemSpeak`. Tests point `COLLAB_ELEVENLABS_URL` at an
+  in-process HTTP server (`fakeElevenLabs`, so use `runAsync`), and `sandbox()` clears `ELEVENLABS_API_KEY`.
 - **Dashboard**: `cmdWatch` is a raw-mode TTY UI; rendering is the pure function `renderWatch(view, cols, rows, opts)`,
   which tests exercise through `watch --once`.
 
 ## Tests
 
 `test/collab.test.js` drives the real CLI end to end via `spawnSync`. Use the `sandbox()` helper: it
-creates a temp `COLLAB_HOME` and project dir with `COLLAB_POLL_SECS=1`, `COLLAB_NOTIFY=0` and
+creates a temp `COLLAB_HOME` and project dir with `COLLAB_POLL_SECS=1`, `COLLAB_NOTIFY=0`, `COLLAB_SOUND=0` and
 `COLLAB_TASK=''`, and returns `run(args, { input, cwd, env })`, `state()` and `taskDir()`. `gitRepo(dir)`
 makes a committed repo for diff tests. Add a test for any behaviour change; keep timing-based tests
 tolerant of slow CI runners.

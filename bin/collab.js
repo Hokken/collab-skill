@@ -103,8 +103,9 @@ function retry(fn, tries = 20) {
   }
 }
 
-function notify(msg) {
-  process.stderr.write('\x07');
+// silent: a collab sound already plays for this event, so the notification makes none of its own.
+function notify(msg, { silent = false } = {}) {
+  if (!silent) process.stderr.write('\x07');
   if (process.env.COLLAB_NOTIFY === '0') return;
   const run = (cmd, args) => {
     try {
@@ -115,7 +116,7 @@ function notify(msg) {
   };
   if (process.platform === 'darwin') {
     const m = msg.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    run('osascript', ['-e', `display notification "${m}" with title "collab" sound name "Glass"`]);
+    run('osascript', ['-e', `display notification "${m}" with title "collab"${silent ? '' : ' sound name "Glass"'}`]);
   } else if (process.platform === 'win32') {
     const m = msg.replace(/'/g, "''");
     const script = [
@@ -194,6 +195,1107 @@ function pushPhone(st, msg, { priority = 'default' } = {}) {
     child.on('error', () => {});
     child.unref();
   } catch { /* pushes are best effort */ }
+}
+
+// --- sounds and speech (task option --sound, or config.json 'sound') ---------------------
+
+// Every event collab can sound: what it means, the full sentence (made to follow a session by ear
+// alone) and the short one (the default: just where the collab is). `c` is the event's context
+// (soundCtx): c.t is the spoken task name, c.st the task state after the event.
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const SOUND_EVENTS = {
+  brief: ['a new task starts', (c) => `${c.t}: new task started. ${startLine(c.st)}`, (c) => `${c.t}: new task`],
+  'part-start': ['a part of a split task starts', (c) => `${c.t}: part ${c.part.index} of ${c.part.total} started. ${startLine(c.st)}`, (c) => `${c.t}: part ${c.part.index} of ${c.part.total} started`],
+  split: ['the implementer split the task into parts', (c) => `${c.t}: split into ${c.part.total} parts.`, (c) => `${c.t}: split into ${c.part.total} parts`],
+  plan: ['the implementer handed in a plan', (c) => `${c.t}: plan submitted, plan round ${phaseRound(c.st)}. The reviewer's turn.`, (c) => `${c.t}: plan ready`],
+  'plan-changes': ['the reviewer asked for changes to the plan', (c) => `${c.t}: the reviewer requested ${plural(c.n, 'change')} to the plan. The implementer's turn.`, (c) => `${c.t}: plan changes`],
+  'plan-approve': ['the plan is approved: the build starts', (c) => `${c.t}: plan approved. The implementer is building it.`, (c) => `${c.t}: plan approved`],
+  ready: ['the implementer handed in its work for review', (c) => `${c.t}: ready for review, round ${c.st.round}. The reviewer's turn.`, (c) => `${c.t}: ready, round ${c.st.round}`],
+  changes: ['the reviewer asked for changes', (c) => `${c.t}: the reviewer requested ${plural(c.n, 'change')}. The implementer's turn, round ${c.st.round}.`, (c) => `${c.t}: changes, round ${c.st.round}`],
+  approve: ['the reviewer approved: the task is done', (c) => `${c.t}: approved. Task done.`, (c) => `${c.t}: approved`],
+  'part-done': ['a part of a split task is done', (c) => `${c.t}: part ${c.part.index} of ${c.part.total} done.${c.part.total > c.part.index ? ` ${c.part.total - c.part.index} to go.` : ' All parts done.'}`, (c) => `${c.t}: part ${c.part.index} of ${c.part.total} done`],
+  decide: ['you have to choose (an agent asks, or the round limit)', (c) => decideSpeech(c), (c) => `${c.t}: decision needed`],
+  answer: ['your answer to a decision was recorded', (c) => `${c.t}: decision recorded: ${clipSpeech(c.answer, 80)}. Back to the ${c.st.turn}.`, (c) => `${c.t}: answered`],
+  escalate: ['the task was escalated: the loop stopped and needs you', (c) => `${c.t}: escalated by the ${c.role}: ${clipSpeech(c.text, 140)}. The loop has stopped and needs you.`, (c) => `${c.t}: escalated`],
+  abort: ['the task was aborted', (c) => `${c.t}: aborted. Both agents stop.`, (c) => `${c.t}: aborted`],
+  stall: ['the task stalled (no handoff for too long)', (c) => `${c.t}: stalled, no handoff for ${c.mins} minutes. The loop has stopped.`, (c) => `${c.t}: stalled`],
+  idle: ['an agent looks unresponsive: stop or keep waiting?', (c) => `${c.t}: ${clipSpeech(c.why, 160)}. Stop or keep waiting? Answer in the ${c.waiter}'s terminal.`, (c) => `${c.t}: the ${quietAgent(c)} is quiet`],
+  'check-fail': ["the task's --check failed, so nothing was handed off", (c) => `${c.t}: the check failed, nothing was handed off. The implementer is fixing it.`, (c) => `${c.t}: check failed`],
+  confirm: ['a queued task waits for your go-ahead', (c) => `${c.t ? `${c.t}: q` : 'Q'}ueued task ${c.item.id} needs your go-ahead: ${clipSpeech(c.text, 120)}. Answer in the implementer's terminal.`, (c) => `${c.t ? `${c.t}: q` : 'Q'}ueued task ${c.item.id} waiting for you`],
+  'agent-waiting': ['an agent CLI waits for you (permission prompt, question, turn ended)', (c) => `${c.t ? `${c.t}: ` : ''}${clipSpeech(c.text, 200)}`, (c) => `${c.t ? `${c.t}: a` : 'A'}n agent is waiting for you`],
+  'note-all': ['you added a note for both agents', (c) => `${c.t}: your note for both agents was added.`, (c) => `${c.t}: note added`],
+  'note-implementer': ['you added a note for the implementer', (c) => `${c.t}: your note for the implementer was added.`, (c) => `${c.t}: note for the implementer`],
+  'note-reviewer': ['you added a note for the reviewer', (c) => `${c.t}: your note for the reviewer was added.`, (c) => `${c.t}: note for the reviewer`],
+  'peer-note-implementer': ['the reviewer sent the implementer a note', (c) => `${c.t}: the reviewer sent the implementer a note.`, (c) => `${c.t}: note from the reviewer`],
+  'peer-note-reviewer': ['the implementer sent the reviewer a note', (c) => `${c.t}: the implementer sent the reviewer a note.`, (c) => `${c.t}: note from the implementer`],
+  end: ['the implementer ended the run: all work is done', (c) => `${c.t}: work complete, ${plural(c.n, 'task')}. Run collab show for the final report.`, (c) => `${c.t}: work complete`],
+};
+const SOUND_MODES = ['voice', 'tones', 'elevenlabs', 'full'];
+const SOUND_STYLES = ['short', 'full'];
+// The agent that went quiet: the one holding the turn in 'wait', the implementer after DONE ('join --after').
+const quietAgent = (c) => (ROLES.includes(c.st.turn) ? c.st.turn : 'implementer');
+// Sentence style: --sound=full, else sound.voice.style ('short' unless it is 'full').
+const soundStyle = (cfg, mode) => (mode === 'full' || (cfg.voice && cfg.voice.style === 'full') ? 'full' : 'short');
+const sentence = (event, c, style) => clipSpeech(SOUND_EVENTS[event][style === 'full' ? 1 : 2](c), Infinity);
+
+const startLine = (st) => (st.phase === 'plan' ? 'The implementer is writing a plan.' : 'The implementer is working.');
+const spokenTask = (id) => String(id || '').replace(/-\d{8}-\d{6}(-\d+)?$/, '').replace(/[-_]+/g, ' ').trim();
+
+// Plain text for the voice: no markdown, no leading dash (a speech CLI would take it as an option),
+// clipped at a word boundary.
+function clipSpeech(s, max = 300) {
+  let t = String(s || '').replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]*)`/g, '$1').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^[#>*\s-]+/gm, '').replace(/[*_~#|<>]+/g, ' ').replace(/\s+/g, ' ').replace(/([?!…])\s*\./g, '$1')
+    .trim().replace(/[.:;,\s]+$/, '').replace(/^-+\s*/, '');
+  if ([...t].length > max) t = `${[...t].slice(0, max).join('').replace(/\s+\S*$/, '')}…`;
+  return t;
+}
+
+// A decision is read out whole: the question (clipped), every option with its number (each
+// clipped), and always how to answer.
+function decideSpeech(c) {
+  const opts = (c.options || []).map((o, i) => `Option ${i + 1}: ${clipSpeech(o, 80)}.`).join(' ');
+  return `${c.t}: your decision is needed. ${clipSpeech(c.question, 160)}. ${opts} Answer in the ${c.presenter}'s terminal, or run collab answer with the option number.`;
+}
+
+function soundCtx(st, extra = {}) {
+  return { t: st ? spokenTask(st.id) : '', st: st || {}, part: (st && st.part) || { index: 1, total: 1 }, ...extra };
+}
+
+// {task} {round} {part} {parts} {turn} {role} {count} {question} {options} {text} {quiet} in custom
+// sentences ({quiet}: the agent an idle event is about).
+function fillSay(tpl, c) {
+  const vals = {
+    task: c.t, round: c.st.phase ? phaseRound(c.st) : '', part: c.part.index, parts: c.part.total, turn: c.st.turn || '',
+    role: c.role || '', count: c.n === undefined ? '' : c.n, question: clipSpeech(c.question, 160),
+    options: (c.options || []).map((o, i) => `Option ${i + 1}: ${clipSpeech(o, 80)}.`).join(' '),
+    text: clipSpeech(c.text || c.why || c.answer, 200), quiet: quietAgent(c),
+  };
+  return clipSpeech(String(tpl).replace(/\{(\w+)\}/g, (m, k) => (k in vals ? String(vals[k]) : m)), 1500);
+}
+
+// --- platform players -----------------------------------------------------------------------
+
+// COLLAB_SOUND_PLATFORM lets tests build another platform's commands; COLLAB_SOUND_BIN makes
+// collab look up players only in that folder (a stub `<name>.js` there runs with node).
+const soundPlatform = () => process.env.COLLAB_SOUND_PLATFORM || process.platform;
+const soundOs = () => (['darwin', 'win32'].includes(soundPlatform()) ? soundPlatform() : 'linux');
+const OS_NAME = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
+const vol01 = (v) => Math.max(0, Math.min(100, Number(v))) / 100;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const extOf = (f) => path.extname(String(f)).slice(1).toLowerCase();
+
+// Windows: the file and text go in environment variables, never into the script text.
+const PS_WAV = '$p = New-Object System.Media.SoundPlayer $env:COLLAB_SOUND_FILE; $p.PlaySync()';
+const PS_MEDIA = [
+  'Add-Type -AssemblyName PresentationCore',
+  '$p = New-Object System.Windows.Media.MediaPlayer',
+  '$p.Volume = [double]$env:COLLAB_SOUND_VOLUME',
+  '$p.Open((New-Object System.Uri $env:COLLAB_SOUND_FILE))',
+  '$p.Play()',
+  '$n = 0; while (-not $p.NaturalDuration.HasTimeSpan -and $n -lt 50) { Start-Sleep -Milliseconds 100; $n++ }',
+  '$ms = 3000; if ($p.NaturalDuration.HasTimeSpan) { $ms = [Math]::Min($p.NaturalDuration.TimeSpan.TotalMilliseconds, 30000) - $n * 100 }',
+  'if ($ms -gt 0) { Start-Sleep -Milliseconds ([int]$ms + 300) }',
+  '$p.Close()',
+].join('; ');
+const PS_SAY = [
+  'Add-Type -AssemblyName System.Speech',
+  '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+  '$s.Volume = [int]$env:COLLAB_SAY_VOLUME',
+  'if ($env:COLLAB_SAY_RATE) { $s.Rate = [int]$env:COLLAB_SAY_RATE }',
+  '$s.Speak($env:COLLAB_SAY_TEXT)',
+].join('; ');
+const psArgs = (script) => ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script];
+
+const TONE_PLAYERS = {
+  darwin: [{ bin: 'afplay', exts: ['wav', 'aiff', 'aif', 'mp3', 'm4a', 'aac', 'caf', 'flac'], args: (f, v) => ['-v', String(vol01(v)), f] }],
+  win32: [
+    { bin: 'powershell', exts: ['wav'], ps: PS_WAV },
+    { bin: 'powershell', exts: ['mp3', 'wma', 'm4a', 'aac', 'flac'], ps: PS_MEDIA },
+  ],
+  linux: [
+    { bin: 'pw-play', exts: ['wav', 'ogg', 'oga', 'flac'], args: (f, v) => ['--volume', String(vol01(v)), f] },
+    { bin: 'paplay', exts: ['wav', 'ogg', 'oga', 'flac'], args: (f, v) => [`--volume=${Math.round(vol01(v) * 65536)}`, f] },
+    { bin: 'aplay', exts: ['wav'], args: (f) => ['-q', f] },
+    { bin: 'mpg123', exts: ['mp3'], args: (f, v) => ['-q', '-f', String(Math.round(vol01(v) * 32768)), f] },
+    { bin: 'ogg123', exts: ['ogg', 'oga'], args: (f) => ['-q', f] },
+    { bin: 'play', exts: ['wav', 'ogg', 'oga', 'flac', 'aiff', 'aif'], args: (f, v) => ['-q', '-v', String(vol01(v)), f] },
+    { bin: 'ffplay', exts: ['wav', 'mp3', 'ogg', 'oga', 'opus', 'flac', 'm4a', 'aac', 'aiff', 'aif', 'wma'], args: (f, v) => ['-nodisp', '-autoexit', '-loglevel', 'quiet', '-volume', String(Math.round(vol01(v) * 100)), f] },
+  ],
+};
+const toneExts = (os = soundOs()) => [...new Set(TONE_PLAYERS[os].flatMap((p) => p.exts))];
+
+// Speech rate is in words per minute (macOS 'say' and espeak use that; the others are mapped).
+const SPEECH = {
+  darwin: [{ bin: 'say', args: (t, o) => [...(o.rate ? ['-r', String(o.rate)] : []), t] }],
+  win32: [{ bin: 'powershell', ps: PS_SAY }],
+  linux: [
+    { bin: 'spd-say', args: (t, o) => ['-w', '-i', String(clamp(Math.round(o.volume * 2 - 100), -100, 100)), ...(o.rate ? ['-r', String(clamp(Math.round((o.rate - 180) / 2), -100, 100))] : []), t] },
+    { bin: 'espeak-ng', args: (t, o) => ['-a', String(Math.round(o.volume * 2)), ...(o.rate ? ['-s', String(o.rate)] : []), t] },
+    { bin: 'espeak', args: (t, o) => ['-a', String(Math.round(o.volume * 2)), ...(o.rate ? ['-s', String(o.rate)] : []), t] },
+  ],
+};
+const INSTALL_HINT = {
+  tone: { darwin: 'afplay ships with macOS', win32: 'powershell.exe ships with Windows', linux: 'install pipewire (pw-play), pulseaudio-utils (paplay), alsa-utils (aplay) or ffmpeg (ffplay)' },
+  speech: { darwin: "'say' ships with macOS", win32: 'Windows PowerShell 5.1 (powershell.exe) with System.Speech ships with Windows', linux: 'install speech-dispatcher (spd-say) or espeak-ng' },
+};
+
+function isExecFile(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    if (process.platform !== 'win32' && !p.endsWith('.js')) fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch { return false; }
+}
+
+function soundBin(name) {
+  const stubs = process.env.COLLAB_SOUND_BIN;
+  if (stubs) return [`${name}.js`, name, `${name}.exe`].map((f) => path.join(stubs, f)).find(isExecFile) || '';
+  if (process.platform === 'win32' && name === 'powershell') {
+    const sys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    if (isExecFile(sys)) return sys;
+  }
+  // Only real executables: a .cmd/.bat can't be spawned without a shell.
+  const exts = process.platform === 'win32' ? ['.exe', '.com'] : [''];
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const e of exts) { const p = path.join(dir, name + e); if (isExecFile(p)) return p; }
+  }
+  return '';
+}
+
+const launch = (bin, args, env = {}) => (bin.endsWith('.js') ? { cmd: process.execPath, args: [bin, ...args], env, bin } : { cmd: bin, args, env, bin });
+
+// The command that plays a sound file, or { why } when this machine can't.
+function toneCommand(file, volume = 100) {
+  const os = soundOs();
+  const ext = extOf(file);
+  const players = TONE_PLAYERS[os].filter((p) => p.exts.includes(ext));
+  if (!players.length) return { why: `${ext ? `.${ext}` : 'this'} files can't be played on ${OS_NAME[os]} (it plays ${toneExts(os).join(', ')})` };
+  for (const p of players) {
+    const bin = soundBin(p.bin);
+    if (!bin) continue;
+    if (p.ps) return launch(bin, psArgs(p.ps), { COLLAB_SOUND_FILE: file, COLLAB_SOUND_VOLUME: String(vol01(volume)) });
+    return launch(bin, p.args(file, volume));
+  }
+  return { why: `no player for .${ext} files found (${players.map((p) => p.bin).join(', ')}); ${INSTALL_HINT.tone[os]}` };
+}
+
+// The OS's own voice ('system'). ElevenLabs audio is made by the drainer (speakStep) and played
+// as a tone, with this as its fallback.
+function speechCommand(text, voice = {}, volume = 100) {
+  const os = soundOs();
+  const engine = voice.engine || 'system';
+  const note = engine === 'system' || engine === 'elevenlabs' ? '' : `unknown voice engine '${engine}', using the system voice`;
+  const rate = Number.isFinite(Number(voice.rate)) && Number(voice.rate) > 0 ? Math.round(Number(voice.rate)) : 0;
+  const o = { volume: clamp(Number(volume), 0, 100), rate };
+  for (const p of SPEECH[os]) {
+    const bin = soundBin(p.bin);
+    if (!bin) continue;
+    if (p.ps) {
+      return { ...launch(bin, psArgs(p.ps), { COLLAB_SAY_TEXT: text, COLLAB_SAY_VOLUME: String(o.volume), COLLAB_SAY_RATE: rate ? String(clamp(Math.round((rate - 180) / 20), -10, 10)) : '' }), note };
+    }
+    return { ...launch(bin, p.args(text, o)), note };
+  }
+  return { why: `no speech engine found (${SPEECH[os].map((p) => p.bin).join(', ')}); ${INSTALL_HINT.speech[os]}`, note };
+}
+
+// --- built-in sounds, config and packs --------------------------------------------------------
+
+// The OS's own sounds, grouped so they can be told apart by ear: soft for handoffs, bright for
+// milestones, loud for "you're needed", their own for notes. Only files that exist are used.
+const SYSTEM_SOUNDS = {
+  darwin: {
+    dir: () => '/System/Library/Sounds', ext: 'aiff',
+    map: {
+      brief: 'Blow', 'part-start': 'Submarine', split: 'Bottle', plan: 'Pop', ready: 'Pop', answer: 'Pop',
+      'plan-changes': 'Tink', changes: 'Tink', 'plan-approve': 'Glass', approve: 'Hero', 'part-done': 'Morse', end: 'Purr',
+      decide: 'Sosumi', confirm: 'Sosumi', 'agent-waiting': 'Sosumi', idle: 'Basso', escalate: 'Basso', stall: 'Basso',
+      abort: 'Funk', 'check-fail': 'Funk', 'note-all': 'Ping', 'note-implementer': 'Ping', 'note-reviewer': 'Ping',
+      'peer-note-implementer': 'Frog', 'peer-note-reviewer': 'Frog',
+    },
+  },
+  win32: {
+    dir: () => path.join(process.env.SystemRoot || 'C:\\Windows', 'Media'), ext: 'wav',
+    map: {
+      brief: 'Windows Unlock', 'part-start': 'Windows Proximity Notification', split: 'chord', plan: 'Windows Notify System Generic',
+      ready: 'Windows Notify System Generic', answer: 'Windows Notify System Generic', 'plan-changes': 'Windows Ding', changes: 'Windows Ding',
+      'plan-approve': 'chimes', approve: 'tada', 'part-done': 'Windows Notify Calendar', end: 'tada',
+      decide: 'Windows Exclamation', confirm: 'Windows Exclamation', 'agent-waiting': 'Windows Exclamation', idle: 'Windows Critical Stop',
+      escalate: 'Windows Critical Stop', stall: 'Windows Critical Stop', abort: 'Windows Background', 'check-fail': 'Windows Background',
+      'note-all': 'Windows Notify Messaging', 'note-implementer': 'Windows Notify Messaging', 'note-reviewer': 'Windows Notify Messaging',
+      'peer-note-implementer': 'Windows Notify Email', 'peer-note-reviewer': 'Windows Notify Email',
+    },
+  },
+  linux: {
+    dir: () => '/usr/share/sounds/freedesktop/stereo', ext: 'oga',
+    map: {
+      brief: 'service-login', 'part-start': 'device-added', split: 'device-added', plan: 'message', ready: 'message', answer: 'message',
+      'plan-changes': 'bell', changes: 'bell', 'plan-approve': 'dialog-information', approve: 'complete', 'part-done': 'complete', end: 'service-logout',
+      decide: 'window-attention', confirm: 'window-attention', 'agent-waiting': 'window-attention', idle: 'dialog-warning', escalate: 'suspend-error',
+      stall: 'suspend-error', abort: 'device-removed', 'check-fail': 'dialog-warning', 'note-all': 'message-new-instant',
+      'note-implementer': 'message-new-instant', 'note-reviewer': 'message-new-instant', 'peer-note-implementer': 'message-new-instant',
+      'peer-note-reviewer': 'message-new-instant',
+    },
+  },
+};
+
+function systemSound(event) {
+  const s = SYSTEM_SOUNDS[soundOs()];
+  const name = s.map[event];
+  if (!name) return '';
+  const f = path.join(process.env.COLLAB_SOUND_SYSTEM_DIR || s.dir(), `${name}.${s.ext}`);
+  return fs.existsSync(f) ? f : '';
+}
+
+function soundConfig() {
+  const c = readConfig().sound;
+  return c && typeof c === 'object' && !Array.isArray(c) ? c : {};
+}
+
+const PACK_FILE = 'collab-sounds.json';
+const expandHome = (p) => (/^~(?=$|[\\/])/.test(p) ? path.join(os.homedir(), p.slice(1)) : p);
+const soundPath = (p, base) => path.resolve(base, expandHome(String(p)));
+
+// A sound pack: a folder with collab-sounds.json ({ name, events }). Never throws.
+function readPack(dir) {
+  if (!dir) return null;
+  const folder = soundPath(dir, COLLAB_HOME);
+  const res = { dir: folder, name: '', events: {}, error: '' };
+  let raw;
+  try { raw = fs.readFileSync(path.join(folder, PACK_FILE), 'utf8'); } catch (e) {
+    res.error = e.code === 'ENOENT' ? `${fs.existsSync(folder) ? `no ${PACK_FILE} in` : 'no such folder:'} ${folder}` : `can't read ${path.join(folder, PACK_FILE)}: ${e.message}`;
+    return res;
+  }
+  try {
+    const j = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('not a JSON object');
+    res.name = typeof j.name === 'string' ? j.name : '';
+    if (j.events !== undefined && (typeof j.events !== 'object' || !j.events || Array.isArray(j.events))) throw new Error("'events' is not an object");
+    res.events = j.events || {};
+  } catch (e) {
+    res.error = `${path.join(folder, PACK_FILE)} is not valid: ${e.message}`;
+  }
+  return res;
+}
+
+// A mapping value: a file path, null / "" / "none" (silent: no tone and no speech), or
+// { file, say } where file null = no tone and say false = no speech.
+function soundEntry(v) {
+  if (v === null || v === '' || v === 'none' || v === false) return { file: null, say: false };
+  if (typeof v === 'string') return { file: v };
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    const e = {};
+    if (v.file !== undefined) e.file = v.file === '' || v.file === 'none' ? null : v.file;
+    if (v.say !== undefined) e.say = v.say === '' ? false : v.say;
+    return e;
+  }
+  return {};
+}
+
+const eventGlob = (k) => new RegExp(`^${String(k).split('*').map((p) => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
+const keyMatches = (k) => Object.keys(SOUND_EVENTS).filter((e) => eventGlob(k).test(e));
+
+// The keys of a mapping that match an event, most specific first: the exact name, then globs by
+// their number of literal characters ('*' alone is the weakest).
+function matchingKeys(map, event) {
+  const score = (k) => (k === event ? Infinity : (k.includes('*') && eventGlob(k).test(event) ? k.replace(/\*/g, '').length : -1));
+  return Object.keys(map && typeof map === 'object' ? map : {}).filter((k) => score(k) >= 0).sort((a, b) => score(b) - score(a));
+}
+
+// What an event plays: your config.json overrides, then the pack, then the OS's built-in sounds;
+// within each, the most specific key first. Tone and sentence are looked up separately, so
+// { "ready": { "say": "…" } } keeps the tone a '*' key gives. A missing or unplayable file falls
+// through to the next key; the default sentence is used when nothing sets 'say'.
+function resolveSound(event, cfg = soundConfig()) {
+  const levels = [
+    { map: cfg.events, base: COLLAB_HOME, from: 'config' },
+  ];
+  const pack = readPack(cfg.pack);
+  if (pack && !pack.error) levels.push({ map: pack.events, base: pack.dir, from: `pack${pack.name ? ` '${pack.name}'` : ''}` });
+  let file;
+  let fileFrom = '';
+  let say;
+  for (const lv of levels) {
+    for (const k of matchingKeys(lv.map, event)) {
+      const e = soundEntry(lv.map[k]);
+      if (file === undefined && e.file !== undefined) {
+        if (e.file === null) { file = null; fileFrom = lv.from; } else {
+          const f = soundPath(e.file, lv.base);
+          if (fs.existsSync(f) && toneExts().includes(extOf(f))) { file = f; fileFrom = lv.from; }
+        }
+      }
+      if (say === undefined && e.say !== undefined) say = e.say;
+    }
+  }
+  if (file === undefined) {
+    const f = systemSound(event);
+    file = f || null;
+    fileFrom = f ? 'built-in' : '';
+  }
+  return { file, fileFrom, say: say === undefined ? true : say };
+}
+
+// Whether an event sounds, and how: null (silent), 'tones', 'voice' or 'elevenlabs' (a voice mode). COLLAB_SOUND=0 and
+// 'collab sound off' mute everything; a task's --sound turns it on for that task; 'collab
+// sound on' turns it on for every task.
+function soundMode(st, cfg = soundConfig()) {
+  if (process.env.COLLAB_SOUND === '0' || cfg.on === false) return null;
+  const opt = st && st.options && st.options.sound;
+  if (opt) return SOUND_MODES.includes(opt) ? opt : 'voice';
+  if (cfg.on === true) return cfg.voice && cfg.voice.on === true ? 'voice' : 'tones';
+  return null;
+}
+
+const soundVolume = (cfg) => (Number.isFinite(Number(cfg.volume)) ? clamp(Number(cfg.volume), 0, 100) : 100);
+
+// The steps (tone, then sentence) that an event plays, or [] for none.
+function soundSteps(event, c, mode, cfg = soundConfig()) {
+  const r = resolveSound(event, cfg);
+  const steps = [];
+  if (r.file) steps.push({ event, tone: r.file });
+  if (mode !== 'tones' && r.say !== false) {
+    // Each part of a default sentence is clipped on its own, so the whole is never cut: a decision
+    // keeps every option number and the answering instruction.
+    const text = typeof r.say === 'string' ? fillSay(r.say, c) : sentence(event, c, soundStyle(cfg, mode));
+    if (text) steps.push({ event, say: text });
+  }
+  return steps;
+}
+
+// --- the audio queue --------------------------------------------------------------------------
+
+// Commands never play anything themselves: they queue a job and start a detached drainer, which
+// plays the jobs one at a time (tone, then sentence), so sounds from several collab processes
+// never overlap and a command never waits for audio.
+const audioDir = () => path.join(COLLAB_HOME, 'audio');
+const audioQueueDir = () => path.join(audioDir(), 'queue');
+const SOUND_STALE_MS = envInt('COLLAB_SOUND_STALE_SECS', 120) * 1000;
+let audioSeq = 0;
+
+// Queue the events' sounds for a task (st may be null: a run-wide event). Returns whether anything
+// was queued. Never throws: sounds are best effort. Callers that change a task call it while they
+// still hold the task's lock, so the jobs of one task are queued in the order of its transitions
+// (a later transition's job never sorts before an earlier one's: same or later millisecond, and
+// within a millisecond the task's seq decides).
+function queueSound(st, events) {
+  try {
+    const cfg = soundConfig();
+    const mode = soundMode(st, cfg);
+    if (!mode) return false;
+    const steps = events.flatMap(({ event, c }) => soundSteps(event, c, mode, cfg));
+    if (!steps.length) return false;
+    const q = audioQueueDir();
+    fs.mkdirSync(q, { recursive: true });
+    const name = `${String(Date.now()).padStart(15, '0')}-${String(st && Number.isInteger(st.seq) ? st.seq : 0).padStart(6, '0')}-${process.pid}-${audioSeq++}.json`;
+    const job = { at: Date.now(), task: st ? st.id : '', steps, volume: soundVolume(cfg), voice: jobVoice(cfg, mode) };
+    fs.writeFileSync(path.join(q, `${name}.tmp`), JSON.stringify(job));
+    retry(() => fs.renameSync(path.join(q, `${name}.tmp`), path.join(q, name)));
+    const child = spawn(process.execPath, [__filename, 'sound', 'drain'], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+    return true;
+  } catch { return false; }
+}
+const sound = (st, event, extra) => queueSound(st, [{ event, c: soundCtx(st, extra) }]);
+
+// The sounds of a handoff, from the state it led to (one process makes each transition).
+const doneSounds = (st, c) => [{ event: 'approve', c }, ...(st.part ? [{ event: 'part-done', c }] : [])];
+function handoffSounds(st, role, body) {
+  const n = (body.match(/^\s*\d+[.)]\s+\S/gm) || []).length;
+  const c = soundCtx(st, { role, n });
+  switch (st.status) {
+    case 'DECISION': {
+      const dec = st.decision;
+      return [{ event: 'decide', c: { ...c, question: dec.question, options: dec.options, presenter: decisionPresenter(dec) } }];
+    }
+    case 'ESCALATED': return [{ event: 'escalate', c: { ...c, text: headline(body) } }];
+    case 'DONE': return doneSounds(st, c);
+    case 'PLAN_REVIEW': return [{ event: 'plan', c }];
+    case 'PLAN_CHANGES': return [{ event: 'plan-changes', c }];
+    case 'IMPLEMENTING': return [{ event: 'plan-approve', c }];
+    case 'READY_FOR_REVIEW': return [{ event: 'ready', c }];
+    case 'CHANGES_REQUESTED': return [{ event: 'changes', c }];
+    default: return [];
+  }
+}
+
+const pendingJobs = () => { try { return fs.readdirSync(audioQueueDir()).filter((f) => f.endsWith('.json')).sort(); } catch { return []; } };
+
+// The audio lock, without waiting: null when a live drainer holds it (it plays our job too).
+// A dead drainer's lock is only taken over once the tone or speech process it started is gone,
+// so a takeover never plays over it.
+async function tryAudioLock() {
+  const l = path.join(audioDir(), '.lock');
+  const me = `${process.pid} ${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  fs.mkdirSync(audioDir(), { recursive: true });
+  for (let i = 0; i < 5; i++) {
+    try {
+      fs.mkdirSync(l);
+      fs.writeFileSync(path.join(l, 'owner'), me);
+      return { l, me };
+    } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    const owner = lockOwner(l);
+    if (!lockIsStale(l, owner)) return null;
+    let child = 0;
+    try { child = parseInt(fs.readFileSync(path.join(l, 'child'), 'utf8'), 10); } catch { /* none */ }
+    for (let t = 0; child && ownerAlive(String(child)) && t < 900; t++) await sleep(100);
+    breakLock(l, owner);
+  }
+  return null;
+}
+
+function runStep(cmd, timeoutMs, lock) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd.cmd, cmd.args, { env: { ...process.env, ...cmd.env }, stdio: 'ignore', windowsHide: true });
+    } catch (e) { resolve({ ok: false, why: e.message }); return; }
+    if (lock && child.pid) { try { fs.writeFileSync(path.join(lock.l, 'child'), String(child.pid)); } catch { /* best effort */ } }
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, why: e.message }); });
+    child.on('exit', (code, sig) => {
+      clearTimeout(timer);
+      if (lock) { try { fs.rmSync(path.join(lock.l, 'child'), { force: true }); } catch { /* best effort */ } }
+      resolve({ ok: code === 0, why: code === 0 ? '' : (sig ? `stopped (${sig})` : `exit code ${code}`) });
+    });
+  });
+}
+
+// The event name goes along in the environment (handy for a custom player, and for tests).
+function stepCommand(step, job) {
+  const cmd = step.tone ? toneCommand(step.tone, job.volume) : speechCommand(step.say, job.voice || {}, job.volume);
+  return cmd.why ? cmd : { ...cmd, env: { ...cmd.env, COLLAB_SOUND_EVENT: step.event || '' } };
+}
+
+async function playJob(job, lock) {
+  for (const step of job.steps || []) {
+    if (step.say) { await speakStep(step, job, lock); continue; }
+    const cmd = stepCommand(step, job);
+    if (cmd.why) continue;
+    await runStep(cmd, 30000, lock);
+  }
+}
+
+async function soundDrain() {
+  for (;;) {
+    const lock = await tryAudioLock();
+    if (!lock) return;
+    try {
+      for (;;) {
+        const jobs = pendingJobs();
+        if (!jobs.length) break;
+        const f = path.join(audioQueueDir(), jobs[0]);
+        let job = null;
+        try { job = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { /* unreadable: dropped */ }
+        try { fs.rmSync(f, { force: true }); } catch { /* best effort */ }
+        // A backlog of old sounds is worse than silence.
+        if (job && Date.now() - job.at <= SOUND_STALE_MS) await playJob(job, lock);
+      }
+    } finally {
+      if (lockOwner(lock.l) === lock.me) fs.rmSync(lock.l, { recursive: true, force: true });
+    }
+    // A job queued after our last look, whose drainer found the lock still held: play it too.
+    if (!pendingJobs().length) return;
+  }
+}
+
+// Observed events (idle, stall, a confirm-first item, an agent CLI waiting) can be seen by
+// several processes or retries: only the one whose claim succeeds sounds. Task claims live in
+// state.json (never counted as activity), run-wide ones in audio/claims.json. Like queueSound,
+// a claim is best effort: if it fails, nothing sounds and the command carries on.
+function claimTaskEvent(d, key, onClaim) {
+  try { return claimTask(d, key, onClaim); } catch { return false; }
+}
+function claimTask(d, key, onClaim) {
+  return withLock(d, () => {
+    let ok = false;
+    const st = update(d, (s) => {
+      const c = s.audio_claims || [];
+      if (c.includes(key)) return;
+      ok = true;
+      s.audio_claims = [...c, key].slice(-50);
+    }, { touch: false });
+    return ok && onClaim(st);
+  });
+}
+
+function claimHomeEvent(key, windowSecs = Infinity) {
+  try { return claimHome(key, windowSecs); } catch { return false; }
+}
+function claimHome(key, windowSecs) {
+  const file = path.join(audioDir(), 'claims.json');
+  fs.mkdirSync(audioDir(), { recursive: true });
+  const read = () => { try { const j = JSON.parse(fs.readFileSync(file, 'utf8')); return { claims: Array.isArray(j.claims) ? j.claims : [] }; } catch { return { claims: [] }; } };
+  return withHomeFile(file, read, (j) => {
+    const now = epoch();
+    const last = j.claims.filter((c) => c.key === key).pop();
+    if (last && now - last.epoch < windowSecs) return false;
+    j.claims = [...j.claims.filter((c) => c.key !== key), { key, epoch: now }].slice(-100);
+    return true;
+  });
+}
+
+// --- ElevenLabs voice (opt-in: --sound=elevenlabs, or sound.voice.engine) -------------------------
+
+// Only the drainer calls the API (plus the explicit 'collab sound test' and 'collab sound voices');
+// the key is read at call time and never written to a job, a log, the status file or a command line.
+const EL_DEFAULT_VOICE = '21m00Tcm4TlvDq8ikWAM'; // a stock premade voice
+const EL_DEFAULT_MODEL = 'eleven_flash_v2_5';    // the lowest-latency model
+const EL_FORMAT = 'mp3_44100_128';
+// ElevenLabs voice_settings, and the config key each one is read from. 'style' is ElevenLabs' style
+// exaggeration (a number): in config it is 'style_exaggeration', because sound.voice.style is the
+// sentence style (short | full). A number in sound.voice.style (written before that) still counts.
+const EL_SETTINGS = ['stability', 'similarity_boost', 'style', 'speed'];
+const EL_SETTING_KEYS = { stability: 'stability', similarity_boost: 'similarity_boost', style: 'style_exaggeration', speed: 'speed' };
+const numSetting = (x) => (typeof x === 'number' || (typeof x === 'string' && x.trim() !== '')) && Number.isFinite(Number(x));
+const EL_TIMEOUT_MS = () => envInt('COLLAB_ELEVENLABS_TIMEOUT_SECS', 15) * 1000;
+const EL_CACHE_MAX_FILES = 300;
+const EL_CACHE_MAX_BYTES = 50 * 1024 * 1024;
+const elBase = () => (process.env.COLLAB_ELEVENLABS_URL || 'https://api.elevenlabs.io').replace(/\/+$/, '');
+const ttsDir = () => path.join(audioDir(), 'tts');
+const ttsStatusFile = () => path.join(audioDir(), 'tts-status.json');
+
+// The voice options a job carries: an allowlist, so nothing else in config (e.g. api_key) is copied.
+function jobVoice(cfg, mode) {
+  const v = cfg.voice && typeof cfg.voice === 'object' && !Array.isArray(cfg.voice) ? cfg.voice : {};
+  const engine = mode === 'elevenlabs' || v.engine === 'elevenlabs' ? 'elevenlabs' : 'system';
+  const res = { engine };
+  if (Number(v.rate) > 0) res.rate = Math.round(Number(v.rate));
+  if (engine === 'elevenlabs') {
+    res.voice_id = typeof v.voice_id === 'string' && v.voice_id.trim() ? v.voice_id.trim() : EL_DEFAULT_VOICE;
+    res.model_id = typeof v.model_id === 'string' && v.model_id.trim() ? v.model_id.trim() : EL_DEFAULT_MODEL;
+    const settings = {};
+    for (const k of EL_SETTINGS) {
+      const x = v[EL_SETTING_KEYS[k]];
+      if (numSetting(x)) settings[k] = Number(x);
+      else if (k === 'style' && typeof v.style === 'number' && Number.isFinite(v.style)) settings.style = v.style;
+    }
+    if (Object.keys(settings).length) res.settings = settings;
+  }
+  return res;
+}
+
+function elevenLabsKey() {
+  if (process.env.ELEVENLABS_API_KEY) return { key: process.env.ELEVENLABS_API_KEY.trim(), from: 'ELEVENLABS_API_KEY' };
+  const v = soundConfig().voice;
+  if (v && typeof v.api_key === 'string' && v.api_key.trim()) return { key: v.api_key.trim(), from: 'config.json' };
+  return { key: '', from: '' };
+}
+
+// Everything that changes the generated audio, so two settings never share a cached file.
+const ttsCacheFile = (text, voice) => path.join(ttsDir(),
+  `${sha256(JSON.stringify([text, voice.voice_id, voice.model_id, EL_SETTINGS.map((k) => (voice.settings || {})[k] ?? null), EL_FORMAT]))}.mp3`);
+
+// Backoff is scoped to the endpoint, the key (as a hash) and the voice and model, so fixing any of
+// them takes effect at once.
+const ttsScope = (key, voice) => sha256(JSON.stringify([elBase(), sha256(key), voice.voice_id, voice.model_id])).slice(0, 16);
+function readTtsStatus() { try { return JSON.parse(fs.readFileSync(ttsStatusFile(), 'utf8')); } catch { return null; } }
+function writeTtsStatus(st) {
+  try {
+    fs.mkdirSync(audioDir(), { recursive: true });
+    const tmp = `${ttsStatusFile()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(st));
+    retry(() => fs.renameSync(tmp, ttsStatusFile()));
+    return true;
+  } catch { return false; }
+}
+
+// Why a call failed, from the status code or the error code only: never a response body or a raw
+// message (either could echo request details).
+function ttsFailure(res, err) {
+  if (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') return { reason: `no answer within ${EL_TIMEOUT_MS() / 1000} s`, backoff: 60 };
+    const code = (err.cause && err.cause.code) || err.code || 'network error';
+    return { reason: `network error (${code})`, backoff: 60 };
+  }
+  const s = res.status;
+  if (s === 401) return { reason: 'HTTP 401 (invalid or missing API key)', http: s, backoff: 600 };
+  if (s === 403) return { reason: 'HTTP 403 (the key may not use this voice or model)', http: s, backoff: 600 };
+  if (s === 404) return { reason: 'HTTP 404 (unknown voice id or model)', http: s, backoff: 600 };
+  if (s === 429) return { reason: 'HTTP 429 (rate limit or character quota reached)', http: s, backoff: 120 };
+  if (s >= 500) return { reason: `HTTP ${s} (ElevenLabs server error)`, http: s, backoff: 60 };
+  return { reason: `HTTP ${s}`, http: s, backoff: 60 };
+}
+
+function pruneTtsCache() {
+  try {
+    const files = fs.readdirSync(ttsDir()).filter((f) => f.endsWith('.mp3'))
+      .map((f) => { const p = path.join(ttsDir(), f); const st = fs.statSync(p); return { p, size: st.size, at: st.mtimeMs }; })
+      .sort((a, b) => a.at - b.at);
+    let total = files.reduce((n, f) => n + f.size, 0);
+    while (files.length > EL_CACHE_MAX_FILES || total > EL_CACHE_MAX_BYTES) {
+      const f = files.shift();
+      total -= f.size;
+      fs.rmSync(f.p, { force: true });
+    }
+  } catch { /* best effort */ }
+}
+
+function ttsCacheSize() {
+  try {
+    const files = fs.readdirSync(ttsDir()).filter((f) => f.endsWith('.mp3'));
+    return { n: files.length, bytes: files.reduce((n, f) => n + fs.statSync(path.join(ttsDir(), f)).size, 0) };
+  } catch { return { n: 0, bytes: 0 }; }
+}
+
+// The audio file for a sentence: { file, cached } or { why } (then the caller uses the system voice).
+async function elevenLabsAudio(text, voice) {
+  // No mp3 player here: don't spend a request (and characters) on audio nobody can play.
+  const player = toneCommand('speech.mp3');
+  if (player.why) return { why: `can't play ElevenLabs audio: ${player.why}` };
+  const file = ttsCacheFile(text, voice);
+  try {
+    if (fs.statSync(file).size > 0) {
+      const now = new Date();
+      try { fs.utimesSync(file, now, now); } catch { /* best effort */ }
+      return { file, cached: true };
+    }
+  } catch { /* not cached */ }
+  const { key } = elevenLabsKey();
+  if (!key) return { why: "no ElevenLabs API key (set ELEVENLABS_API_KEY, or run 'collab sound voice key')" };
+  const scope = ttsScope(key, voice);
+  const last = readTtsStatus();
+  if (last && last.scope === scope && last.skip_until && Date.now() < last.skip_until) {
+    return { why: `ElevenLabs paused until ${localTime(last.skip_until)} after ${last.reason}` };
+  }
+  const url = `${elBase()}/v1/text-to-speech/${encodeURIComponent(voice.voice_id)}?output_format=${EL_FORMAT}`;
+  const body = { text, model_id: voice.model_id, ...(voice.settings ? { voice_settings: voice.settings } : {}) };
+  let res = null;
+  let err = null;
+  let audio = null;
+  const t0 = Date.now();
+  try {
+    res = await fetch(url, {
+      method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(EL_TIMEOUT_MS()),
+      headers: { 'xi-api-key': key, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
+    });
+    if (res.ok) audio = Buffer.from(await res.arrayBuffer());
+  } catch (e) { err = e; }
+  const type = res && res.headers.get('content-type') || '';
+  if (!err && res && res.ok && !(audio && audio.length && /^audio\//i.test(type))) {
+    writeTtsStatus({ scope, at: Date.now(), ok: false, reason: `unexpected answer (${type || 'no content type'}, ${audio ? audio.length : 0} bytes)`, skip_until: Date.now() + 60000 });
+    return { why: 'ElevenLabs sent no audio' };
+  }
+  if (err || !res.ok) {
+    const f = ttsFailure(res, err);
+    writeTtsStatus({ scope, at: Date.now(), ok: false, reason: f.reason, http: f.http, skip_until: Date.now() + f.backoff * 1000 });
+    return { why: `ElevenLabs failed: ${f.reason}` };
+  }
+  try {
+    fs.mkdirSync(ttsDir(), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, audio);
+    retry(() => fs.renameSync(tmp, file));
+  } catch { return { why: "can't write the ElevenLabs audio cache" }; }
+  const ms = Date.now() - t0;
+  writeTtsStatus({ scope, at: Date.now(), ok: true, reason: 'ok' });
+  pruneTtsCache();
+  return { file, cached: false, ms };
+}
+
+// A sentence through ElevenLabs, else (any failure, including the player failing) the system voice.
+async function speakStep(step, job, lock) {
+  if ((job.voice || {}).engine === 'elevenlabs') {
+    const r = await elevenLabsAudio(step.say, job.voice);
+    if (r.file) {
+      const cmd = toneCommand(r.file, job.volume);
+      if (!cmd.why) {
+        const res = await runStep({ ...cmd, env: { ...cmd.env, COLLAB_SOUND_EVENT: step.event || '' } }, 60000, lock);
+        if (res.ok) return { engine: 'elevenlabs', cached: r.cached, ms: r.ms };
+        return { engine: 'system', why: `the player failed on the ElevenLabs audio (${res.why})`, ...(await systemSpeak(step, job, lock)) };
+      }
+    }
+    return { why: r.why || 'ElevenLabs audio could not be played', ...(await systemSpeak(step, job, lock)) };
+  }
+  return systemSpeak(step, job, lock);
+}
+
+async function systemSpeak(step, job, lock) {
+  const cmd = speechCommand(step.say, { ...(job.voice || {}), engine: 'system' }, job.volume);
+  if (cmd.why) return { engine: 'none', none: cmd.why };
+  const res = await runStep({ ...cmd, env: { ...cmd.env, COLLAB_SOUND_EVENT: step.event || '' } }, 60000, lock);
+  return { engine: 'system', failed: res.ok ? '' : res.why };
+}
+
+// Read the key from stdin (hidden when typed at a terminal), never from the command line.
+function readSecret(prompt) {
+  if (!process.stdin.isTTY) {
+    let t = '';
+    try { t = fs.readFileSync(0, 'utf8'); } catch { /* none */ }
+    return Promise.resolve(t.trim());
+  }
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+    const stdin = process.stdin;
+    stdin.setRawMode(true);
+    stdin.resume();
+    let s = '';
+    const done = (v) => { stdin.setRawMode(false); stdin.pause(); stdin.removeListener('data', onData); out(); resolve(v); };
+    const onData = (b) => {
+      for (const ch of b.toString('utf8')) {
+        if (ch === '\r' || ch === '\n') return done(s.trim());
+        if (ch === '\u0003') return done('');
+        if (ch === '\u007f' || ch === '\b') s = s.slice(0, -1); else s += ch;
+      }
+      return undefined;
+    };
+    stdin.on('data', onData);
+  });
+}
+
+async function listVoices() {
+  const { key } = elevenLabsKey();
+  if (!key) die("no ElevenLabs API key: set ELEVENLABS_API_KEY, or run 'collab sound voice key'");
+  const voices = [];
+  let token = '';
+  for (let page = 0; page < 20; page++) {
+    let res;
+    try {
+      res = await fetch(`${elBase()}/v2/voices?page_size=100${token ? `&next_page_token=${encodeURIComponent(token)}` : ''}`,
+        { headers: { 'xi-api-key': key, Accept: 'application/json' }, signal: AbortSignal.timeout(EL_TIMEOUT_MS()) });
+    } catch (e) { die(`listing voices failed: ${ttsFailure(null, e).reason}`); }
+    if (!res.ok) die(`listing voices failed: ${ttsFailure(res, null).reason}`);
+    let j;
+    try { j = await res.json(); } catch { die('listing voices failed: not a JSON answer'); }
+    voices.push(...(Array.isArray(j.voices) ? j.voices : []));
+    if (!j.has_more || !j.next_page_token) break;
+    token = j.next_page_token;
+  }
+  return voices;
+}
+
+// --- collab sound -------------------------------------------------------------------------------
+
+const SOUND_EXAMPLE = {
+  t: 'dark mode', st: { id: 'dark-mode', phase: 'build', round: 2, plan_round: 1, max_rounds: 4, turn: 'implementer' },
+  part: { index: 2, total: 3 }, n: 3, role: 'reviewer', question: 'Which theme should be the default?',
+  options: ['Follow the system setting (Recommended)', 'Always dark'], presenter: 'implementer',
+  text: 'the database credentials are missing', why: 'the reviewer has not handed off for 30 min', waiter: 'implementer',
+  item: { id: 4 }, answer: 'option 1', mins: 120,
+};
+const exampleSentence = (event, style) => sentence(event, SOUND_EXAMPLE, style);
+
+function withSoundConfig(fn) {
+  return withHomeFile(configPath(), readConfig, (c) => {
+    if (!c.sound || typeof c.sound !== 'object' || Array.isArray(c.sound)) c.sound = {};
+    return fn(c.sound);
+  });
+}
+
+function soundKey(k) {
+  if (!k) die("name an event (or a glob such as 'note-*'): 'collab sound events' lists them");
+  if (SOUND_EVENTS[k]) return k;
+  if (k.includes('*') && keyMatches(k).length) return k;
+  die(`unknown event: ${k} ('collab sound events' lists them)`);
+}
+
+function fileWarning(f) {
+  const cmd = toneCommand(f);
+  return cmd.why ? `warning: ${cmd.why}` : '';
+}
+
+function soundProblems(cfg) {
+  const lines = [];
+  const check = (map, base, where) => {
+    for (const [k, v] of Object.entries(map || {})) {
+      if (!SOUND_EVENTS[k] && !(k.includes('*') && keyMatches(k).length)) lines.push(`${where}: '${k}' matches no event`);
+      const e = soundEntry(v);
+      if (typeof e.file === 'string') {
+        const f = soundPath(e.file, base);
+        if (!fs.existsSync(f)) lines.push(`${where}: ${k}: file not found: ${f}`);
+        else if (!toneExts().includes(extOf(f))) lines.push(`${where}: ${k}: .${extOf(f)} can't be played on ${OS_NAME[soundOs()]}`);
+      }
+      if (e.say !== undefined && e.say !== false && typeof e.say !== 'string') lines.push(`${where}: ${k}: 'say' must be text or false`);
+    }
+  };
+  if (cfg.events !== undefined && (typeof cfg.events !== 'object' || !cfg.events || Array.isArray(cfg.events))) lines.push("config: 'sound.events' is not an object");
+  else check(cfg.events, COLLAB_HOME, 'config');
+  const pack = readPack(cfg.pack);
+  if (pack && pack.error) lines.push(`pack: ${pack.error}`);
+  else if (pack) check(pack.events, pack.dir, `pack ${pack.dir}`);
+  return lines;
+}
+
+function soundStatus() {
+  const cfg = soundConfig();
+  const os = soundOs();
+  let state;
+  if (process.env.COLLAB_SOUND === '0') state = 'off (COLLAB_SOUND=0)';
+  else if (cfg.on === false) state = "off: muted ('collab sound on' for every task, or remove the mute with 'collab sound unmute')";
+  else if (cfg.on === true) state = 'on for every task';
+  else state = "only for tasks started with --sound ('collab sound on' turns it on for every task)";
+  out(`sound:   ${state}`);
+  out(`voice:   ${cfg.voice && cfg.voice.on === true ? 'on' : 'off'} for 'collab sound on' (a task's --sound speaks unless it is --sound=tones)${cfg.voice && cfg.voice.engine ? `, engine ${cfg.voice.engine}` : ''}${cfg.voice && cfg.voice.rate ? `, ${cfg.voice.rate} words/min` : ''}`);
+  out(`style:   ${soundStyle(cfg)} sentences${cfg.voice && cfg.voice.style === 'full' ? '' : " ('collab sound voice style full' for full ones, or --sound=full for one task)"}`);
+  out(`volume:  ${soundVolume(cfg)}`);
+  const players = [...new Set(TONE_PLAYERS[os].map((p) => p.bin))].filter((b) => soundBin(b));
+  out(`players: ${players.length ? `${players.join(', ')} (${OS_NAME[os]} plays ${toneExts(os).join(', ')})` : `none found: ${INSTALL_HINT.tone[os]}`}`);
+  const sp = speechCommand('test', cfg.voice || {});
+  out(`speech:  ${sp.why ? sp.why : path.basename(sp.bin)}${sp.note ? ` (${sp.note})` : ''}`);
+  const jv = jobVoice(cfg, 'voice');
+  out(`engine:  ${jv.engine === 'elevenlabs' ? 'ElevenLabs' : 'system voice'} (--sound=elevenlabs uses ElevenLabs for that task)`);
+  const k = elevenLabsKey();
+  const el = jobVoice(cfg, 'elevenlabs');
+  const cache = ttsCacheSize();
+  out(`elevenlabs: voice ${el.voice_id}, model ${el.model_id}${el.settings ? `, ${JSON.stringify(el.settings)}` : ''}; key ${k.key ? `from ${k.from}` : 'missing'}; cache ${cache.n} file(s), ${(cache.bytes / 1048576).toFixed(1)} MB`);
+  const last = readTtsStatus();
+  if (last) {
+    const ago = fmtDur(Math.max(0, Math.floor((Date.now() - last.at) / 1000)));
+    out(`            last call ${ago} ago: ${last.ok ? 'ok' : `failed, ${last.reason}`}${!last.ok && last.skip_until > Date.now() ? `; system voice until ${localTime(last.skip_until)} (changing the key, voice or model retries at once)` : ''}`);
+  }
+  const pack = readPack(cfg.pack);
+  out(`pack:    ${pack ? `${pack.dir}${pack.name ? ` (${pack.name})` : ''}` : 'none'}`);
+  out('events:');
+  const w = Math.max(...Object.keys(SOUND_EVENTS).map((e) => e.length));
+  for (const e of Object.keys(SOUND_EVENTS)) {
+    const r = resolveSound(e, cfg);
+    const tone = r.file ? `${r.file} (${r.fileFrom})` : (r.fileFrom ? `no tone (${r.fileFrom})` : 'no tone');
+    const say = r.say === false ? 'no speech' : (typeof r.say === 'string' ? 'custom speech' : 'speech');
+    out(`  ${e.padEnd(w)}  ${tone} · ${say}`);
+  }
+  const problems = soundProblems(cfg);
+  if (problems.length) { out('problems:'); for (const p of problems) out(`  ✗ ${p}`); }
+}
+
+async function cmdSound(args) {
+  const [sub = 'status', ...rest] = args;
+  if (sub === 'drain') { await soundDrain(); return; }
+  if (sub === 'voices') {
+    const voices = await listVoices();
+    if (!voices.length) { out('no voices on this account'); return; }
+    const w = Math.max(...voices.map((x) => String(x.name || '').length));
+    for (const x of voices) out(`${String(x.name || '').padEnd(w)}  ${x.voice_id}  ${x.category || ''}`.trimEnd());
+    out("Use one: collab sound voice elevenlabs --voice <id>");
+    return;
+  }
+  if (sub === 'cache') {
+    if (rest[0] !== 'clear') die('usage: collab sound cache clear');
+    const { n } = ttsCacheSize();
+    fs.rmSync(ttsDir(), { recursive: true, force: true });
+    out(`deleted ${n} cached ElevenLabs sentence(s)`);
+    return;
+  }
+  if (sub === 'status' || sub === 'show') { soundStatus(); return; }
+  if (sub === 'events') {
+    const w = Math.max(...Object.keys(SOUND_EVENTS).map((e) => e.length));
+    for (const [e, [desc]] of Object.entries(SOUND_EVENTS)) {
+      out(`${e.padEnd(w)}  ${desc}`);
+      out(`${' '.repeat(w)}  short: "${exampleSentence(e, 'short')}"`);
+      out(`${' '.repeat(w)}  full:  "${exampleSentence(e, 'full')}"`);
+    }
+    out("Map one with 'collab sound set <event|glob> <file>'; globs such as 'note-*' or '*' work too.");
+    return;
+  }
+  if (sub === 'on' || sub === 'off' || sub === 'unmute') {
+    withSoundConfig((s) => { if (sub === 'unmute') delete s.on; else s.on = sub === 'on'; });
+    out(sub === 'on' ? "sound: on for every task ('collab sound voice on' adds the spoken sentences)"
+      : sub === 'off' ? 'sound: off (muted, even for tasks started with --sound)' : 'sound: only for tasks started with --sound');
+    return;
+  }
+  if (sub === 'volume') {
+    if (!/^\d+$/.test(rest[0] || '') || +rest[0] > 100) die('usage: collab sound volume <0-100>');
+    withSoundConfig((s) => { s.volume = +rest[0]; });
+    out(`volume: ${+rest[0]}`);
+    return;
+  }
+  if (sub === 'voice') {
+    const [v, ...more] = rest;
+    if (v === 'on' || v === 'off') {
+      withSoundConfig((s) => { s.voice = { ...(s.voice || {}), on: v === 'on' }; });
+      out(`voice: ${v}${v === 'on' && soundConfig().on !== true ? " (used by 'collab sound on'; a task's --sound speaks anyway)" : ''}`);
+      return;
+    }
+    if (v === 'rate' && more[0] === 'default') {
+      withSoundConfig((s) => { if (s.voice) delete s.voice.rate; });
+      out('voice rate: the engine default');
+      return;
+    }
+    if (v === 'rate') {
+      if (!/^\d+$/.test(more[0] || '') || +more[0] < 80 || +more[0] > 500) die('usage: collab sound voice rate <80-500> (words per minute), or: collab sound voice rate default');
+      withSoundConfig((s) => { s.voice = { ...(s.voice || {}), rate: +more[0] }; });
+      out(`voice rate: ${+more[0]} words per minute`);
+      return;
+    }
+    if (v === 'style') {
+      if (!SOUND_STYLES.includes(more[0])) die('usage: collab sound voice style <short | full>');
+      withSoundConfig((s) => {
+        s.voice = { ...(s.voice || {}) };
+        // A number here was ElevenLabs' style exaggeration: keep it under its own key.
+        if (typeof s.voice.style === 'number' && s.voice.style_exaggeration === undefined) s.voice.style_exaggeration = s.voice.style;
+        s.voice.style = more[0];
+      });
+      out(more[0] === 'full' ? 'sentences: full (what happened, whose turn, what you need to do)' : "sentences: short (just where the collab is; --sound=full for one task's full sentences)");
+      return;
+    }
+    if (v === 'elevenlabs' || v === 'system') {
+      const { opts } = takeOpts(more, { values: { '--voice': 'voice', '--model': 'model' } }, { strict: true });
+      withSoundConfig((s) => {
+        s.voice = { ...(s.voice || {}), engine: v };
+        if (opts.voice) s.voice.voice_id = opts.voice.trim();
+        if (opts.model) s.voice.model_id = opts.model.trim();
+      });
+      if (v === 'system') { out("voice engine: the system voice (a task's --sound=elevenlabs still uses ElevenLabs)"); return; }
+      const el = jobVoice(soundConfig(), 'elevenlabs');
+      const k = elevenLabsKey();
+      out(`voice engine: ElevenLabs (voice ${el.voice_id}, model ${el.model_id})`);
+      out(k.key ? `key: from ${k.from}` : "key: missing. Set ELEVENLABS_API_KEY in your shell profile (the agents' shells need it), or run 'collab sound voice key'");
+      out('Every spoken sentence (task name, event, decision questions and options, escalation headlines) is sent to ElevenLabs; tones stay local.');
+      out("Without a key, offline or on any error, the system voice speaks instead. Try: 'collab sound test decide'; voices: 'collab sound voices'.");
+      return;
+    }
+    if (v === 'key') {
+      if (more[0] === '--clear') {
+        withSoundConfig((s) => { if (s.voice) delete s.voice.api_key; });
+        out('key: removed from config.json');
+        return;
+      }
+      const key = await readSecret('ElevenLabs API key (input hidden): ');
+      if (!key || /\s/.test(key)) die('no key given (pipe it on stdin, or paste it at the prompt)');
+      withSoundConfig((s) => { s.voice = { ...(s.voice || {}), api_key: key }; });
+      out(`key: saved in ${configPath()} in plain text (readable by anyone who can read that file).`);
+      out('ELEVENLABS_API_KEY, when set, is used instead. Remove it with: collab sound voice key --clear');
+      return;
+    }
+    die('usage: collab sound voice <on | off | style short|full | rate WPM | rate default | system | elevenlabs [--voice ID] [--model ID] | key [--clear]>');
+  }
+  if (sub === 'set') {
+    const key = soundKey(rest[0]);
+    if (!rest[1]) die('usage: collab sound set <event|glob> <file | none>');
+    let value = null;
+    if (rest[1] !== 'none') {
+      const f = soundPath(rest.slice(1).join(' '), process.cwd());
+      if (!fs.existsSync(f) || !fs.statSync(f).isFile()) die(`no such file: ${f}`);
+      value = f;
+    }
+    withSoundConfig((s) => { s.events = { ...(s.events && typeof s.events === 'object' ? s.events : {}), [key]: value }; });
+    out(value ? `${key}: ${value}` : `${key}: silent (no tone, no speech)`);
+    if (value && fileWarning(value)) out(fileWarning(value));
+    if (soundMode(null) === null) out("note: sounds only play for tasks started with --sound, or after 'collab sound on'.");
+    return;
+  }
+  if (sub === 'unset') {
+    const key = rest[0];
+    if (!key) die('usage: collab sound unset <event|glob>');
+    const had = withSoundConfig((s) => {
+      if (!s.events || !(key in s.events)) return false;
+      delete s.events[key];
+      return true;
+    });
+    if (!had) die(`config.json has no mapping for '${key}'`);
+    out(`${key}: back to the pack / built-in sound`);
+    return;
+  }
+  if (sub === 'pack') {
+    if (rest[0] === '--init') {
+      if (!rest[1]) die('usage: collab sound pack --init <folder>');
+      const dir = soundPath(rest.slice(1).join(' '), process.cwd());
+      const file = path.join(dir, PACK_FILE);
+      if (fs.existsSync(file)) die(`${file} already exists; edit it, or pick another folder`);
+      fs.mkdirSync(dir, { recursive: true });
+      const events = {};
+      for (const e of Object.keys(SOUND_EVENTS)) events[e] = { file: null, say: exampleSentenceTemplate(e) };
+      fs.writeFileSync(file, `${JSON.stringify({ name: path.basename(dir), events }, null, 2)}\n`, { flag: 'wx' });
+      out(`created ${file}`);
+      out("Put your sound files in that folder, set each event's \"file\" (relative to the folder) and edit or drop its \"say\".");
+      out(`Then: collab sound pack "${dir}"`);
+      return;
+    }
+    if (!rest[0]) die('usage: collab sound pack <folder | none> | collab sound pack --init <folder>');
+    if (rest[0] === 'none') {
+      withSoundConfig((s) => { delete s.pack; });
+      out('pack: none');
+      return;
+    }
+    const dir = soundPath(rest.join(' '), process.cwd());
+    const pack = readPack(dir);
+    if (pack.error) die(pack.error);
+    // A missing file refuses the pack (fix the manifest first); unknown events and formats this
+    // machine can't play are only warnings (the pack may be meant for another OS too).
+    const problems = soundProblems({ pack: dir });
+    const missing = problems.filter((p) => /file not found/.test(p));
+    if (missing.length) die(`pack not used, ${missing.length} mapped file(s) missing:\n${missing.map((p) => `  ✗ ${p}`).join('\n')}`);
+    withSoundConfig((s) => { s.pack = dir; });
+    out(`pack: ${dir}${pack.name ? ` (${pack.name})` : ''}`);
+    for (const p of problems) out(`  ✗ ${p}`);
+    if (!problems.length) out('  every mapped file is there and playable here');
+    return;
+  }
+  if (sub === 'setup') {
+    const force = rest.includes('--force');
+    const set = [];
+    withSoundConfig((s) => {
+      s.on = true;
+      s.voice = { ...(s.voice || {}), on: s.voice && s.voice.on === false && !force ? false : true };
+      s.events = s.events && typeof s.events === 'object' ? s.events : {};
+      for (const e of Object.keys(SOUND_EVENTS)) {
+        const f = systemSound(e);
+        if (!f || (e in s.events && !force)) continue;
+        s.events[e] = f;
+        set.push(`${e}: ${f}`);
+      }
+    });
+    out('sound: on for every task, with spoken sentences');
+    for (const l of set) out(`  ${l}`);
+    if (!set.length) out(force ? `  no built-in ${OS_NAME[soundOs()]} sounds found` : '  every event already had a sound (--force replaces them)');
+    const sp = speechCommand('test', soundConfig().voice || {});
+    if (sp.why) out(`speech: ${sp.why}`);
+    if (!TONE_PLAYERS[soundOs()].some((p) => soundBin(p.bin))) out(`players: none found: ${INSTALL_HINT.tone[soundOs()]}`);
+    out("Try it: 'collab sound test decide'. Change one: 'collab sound set <event> <file>'. Your own pack: 'collab sound pack --init <folder>'.");
+    return;
+  }
+  if (sub === 'test') {
+    const dry = rest.includes('--dry-run');
+    const what = rest.filter((a) => !['--dry-run', '--elevenlabs', '--full'].includes(a)).join(' ') || 'approve';
+    const cfg = soundConfig();
+    let steps;
+    if (SOUND_EVENTS[what]) steps = soundSteps(what, SOUND_EXAMPLE, rest.includes('--full') ? 'full' : 'voice', cfg);
+    else {
+      const f = soundPath(what, process.cwd());
+      if (!fs.existsSync(f)) die(`not an event or a file: ${what} ('collab sound events' lists the events)`);
+      steps = [{ tone: f }];
+    }
+    if (!steps.length) { out(`${what}: silent (no tone, no speech)`); return; }
+    const job = { steps, volume: soundVolume(cfg), voice: jobVoice(cfg, rest.includes('--elevenlabs') ? 'elevenlabs' : 'voice') };
+    let failed = false;
+    for (const step of steps) {
+      if (step.say && job.voice.engine === 'elevenlabs') {
+        const file = ttsCacheFile(step.say, job.voice);
+        const hit = fs.existsSync(file);
+        out(`speech "${step.say}": ElevenLabs voice ${job.voice.voice_id}, model ${job.voice.model_id} (${hit ? 'cached' : `not cached: POST ${elBase()}/v1/text-to-speech/${job.voice.voice_id}`})`);
+        if (dry) continue;
+        const r = await speakStep(step, job, null);
+        if (r.engine === 'elevenlabs') out(`  spoken by ElevenLabs (${r.cached ? 'from the cache' : `generated in ${(r.ms / 1000).toFixed(1)} s`})`);
+        else if (r.engine === 'system') { out(`  ElevenLabs not used: ${r.why}; the system voice spoke instead${r.failed ? `, but failed: ${r.failed}` : ''}`); failed = true; }
+        else { out(`  ElevenLabs not used: ${r.why}; and no system voice: ${r.none}`); failed = true; }
+        continue;
+      }
+      const cmd = stepCommand(step, job);
+      const label = step.tone ? `tone ${step.tone}` : `speech "${step.say}"`;
+      if (cmd.why) { out(`${label}: not played: ${cmd.why}`); failed = true; continue; }
+      if (cmd.note) out(`note: ${cmd.note}`);
+      out(`${label}: ${[cmd.cmd, ...cmd.args].map((a) => (/[\s"']/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
+      if (dry) { if (Object.keys(cmd.env).length) out(`  env: ${JSON.stringify(cmd.env)}`); continue; }
+      const res = await runStep(cmd, step.tone ? 30000 : 60000, null);
+      if (!res.ok) { out(`  failed: ${res.why}`); failed = true; }
+    }
+    if (!dry && soundMode(null, cfg) === null) out("note: sounds only play for tasks started with --sound, or after 'collab sound on'.");
+    if (failed) exit(1);
+    return;
+  }
+  die('usage: collab sound [status | events | setup [--force] | test [event|file] [--dry-run] [--elevenlabs] [--full] | set <event|glob> <file|none> | unset <event|glob> | on | off | unmute | volume N | voice on|off|style short|full|rate WPM|system|elevenlabs|key | voices | cache clear | pack <folder|none> | pack --init <folder>]');
+}
+
+// The short sentence of an event as a template with {placeholders}, for a new pack's manifest
+// ('collab sound events' shows the full ones).
+function exampleSentenceTemplate(e) {
+  const c = {
+    t: '{task}', st: { phase: 'build', round: '{round}', plan_round: '{round}', turn: '{turn}' }, part: { index: '{part}', total: '{parts}' },
+    n: '{count}', role: '{role}', question: '{question}', options: [], presenter: 'implementer', text: '{text}', why: '{text}',
+    waiter: 'implementer', item: { id: 'N' }, answer: '{text}', mins: 'N',
+  };
+  if (e === 'idle') return '{task}: the {quiet} is quiet';
+  return SOUND_EVENTS[e][2](c);
 }
 
 // --- task / state helpers ------------------------------------------------------
@@ -715,6 +1817,7 @@ function progressLines(d, st) {
 const TASK_OPTS = {
   values: { '--max-rounds': 'max_rounds', '--check': 'check', '--scope': 'scope', '--focus': 'focus', '--branch': 'branch' },
   flags: { '--plan': { plan: true }, '--commit': { commit: true }, '--confirm': { confirm: true }, '--phone': { phone: true } },
+  optional: { '--sound': { key: 'sound', known: SOUND_MODES } },
 };
 
 function normTaskOpts(o) {
@@ -728,6 +1831,11 @@ function normTaskOpts(o) {
   if (o.commit) res.commit = true;
   if (o.confirm) res.confirm = true;
   if (o.phone) res.phone = true;
+  if (o.sound) {
+    const m = o.sound === true ? 'voice' : String(o.sound).trim().toLowerCase();
+    if (!SOUND_MODES.includes(m)) die(`--sound takes ${SOUND_MODES.join(' or ')} (--sound=tones), not '${o.sound}'`);
+    res.sound = m;
+  }
   return res;
 }
 
@@ -742,6 +1850,7 @@ function describeOpts(o = {}) {
   if (o.commit) bits.push('commit on DONE');
   if (o.confirm) bits.push('confirm before starting');
   if (o.phone) bits.push('phone notifications');
+  if (o.sound) bits.push(o.sound === 'tones' ? 'sounds' : o.sound === 'elevenlabs' ? 'sounds and ElevenLabs voice' : o.sound === 'full' ? 'sounds and full sentences' : 'sounds and voice');
   return bits;
 }
 
@@ -1164,12 +2273,21 @@ function globRegex(glob) {
 // --- argument parsing ------------------------------------------------------------
 
 // Pulls "--name value" / "--flag" options out of args; returns remaining positionals.
-function takeOpts(args, { values = {}, flags = {} } = {}, { strict = false } = {}) {
+// optional: options whose value is optional ('--sound', '--sound=tones', or '--sound tones' when
+// the next word is one of its known values), so a bare flag never eats the slug or the task text.
+function takeOpts(args, { values = {}, flags = {}, optional = {} } = {}, { strict = false } = {}) {
   const opts = {};
   const rest = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a in values) {
+    const eq = a.indexOf('=');
+    const name = eq > 0 ? a.slice(0, eq) : a;
+    if (name in optional) {
+      const o = optional[name];
+      if (eq > 0) opts[o.key] = a.slice(eq + 1);
+      else if (o.known.includes(args[i + 1])) opts[o.key] = args[++i];
+      else opts[o.key] = true;
+    } else if (a in values) {
       if (i + 1 >= args.length) die(`${a} needs a value`);
       opts[values[a]] = args[++i];
     } else if (a in flags) {
@@ -1200,8 +2318,9 @@ function cmdInit(args) {
   const { opts, rest } = takeOpts(args, {
     values: { ...TASK_OPTS.values, '--dir': 'dir', '--file': 'file', '-f': 'file', '--confirmed': 'confirmed' },
     flags: { ...TASK_OPTS.flags, '--force': { force: true }, '--from-queue': { fromQueue: true } },
+    optional: TASK_OPTS.optional,
   }, { strict: true });
-  const usage = "usage: collab init <slug> [--from-queue] [--plan] [--max-rounds N] [--check CMD] [--scope GLOBS] [--focus TEXT] [--branch NAME] [--commit] [--phone] [--dir PATH] [--force] (brief on stdin or --file PATH)";
+  const usage = "usage: collab init <slug> [--from-queue] [--plan] [--max-rounds N] [--check CMD] [--scope GLOBS] [--focus TEXT] [--branch NAME] [--commit] [--phone] [--sound[=voice|tones]] [--dir PATH] [--force] (brief on stdin or --file PATH)";
   if (!rest[0]) die(usage);
   const slug = rest[0].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (!slug) die(usage);
@@ -1237,6 +2356,8 @@ function cmdInit(args) {
   const prevId = latestTask(dir);
   const prev = prevId && readState(path.join(TASKS, prevId));
   if (!options.phone && prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) options.phone = true;
+  // --sound carries on the same way.
+  if (!options.sound && prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.sound) options.sound = prev.options.sound;
   const phone = options.phone ? ensurePhoneUrl() : null;
   const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
   brief += optionsSection(options);
@@ -1298,6 +2419,8 @@ function cmdInit(args) {
     addEntry(d, st, 'human', 'confirm', `The user approved starting queued task #${item.id}: "${opts.confirmed.trim()}"\n`);
     st.seq = 2;
   }
+  // Queued before the task can be seen, so no later event of it sorts first.
+  sound(st, part ? 'part-start' : 'brief');
   writeState(d, st);
   fs.mkdirSync(COLLAB_HOME, { recursive: true });
   fs.writeFileSync(path.join(COLLAB_HOME, 'current'), `${id}\n`);
@@ -1385,7 +2508,9 @@ async function cmdJoin(args) {
       }
       if (projectDir && epoch() - st.updated_epoch >= IDLE && epoch() >= (st.snooze_until || 0)) {
         const why = `the implementer has neither started a new task nor ended the run for ${Math.floor((epoch() - st.updated_epoch) / 60)} min since ${id} was approved`;
-        notify(`${id}: ${why} — stop or keep waiting?`);
+        const sounded = soundMode(st) && claimTaskEvent(d, `join-idle:${st.updated_epoch}:${st.snooze_until || 0}`,
+          (cst) => sound(cst, 'idle', { why, waiter: 'reviewer' }));
+        notify(`${id}: ${why} — stop or keep waiting?`, { silent: !!sounded });
         pushPhone(st, `${why}. Stop or keep waiting?`, { priority: 'high' });
         out(`OTHER AGENT LOOKS UNRESPONSIVE: ${why}.`);
         out(`Ask the user: stop here, or keep waiting ('collab -t ${id} snooze [MIN]', default 30)?`);
@@ -1599,15 +2724,30 @@ async function cmdWait(args) {
     }
     const idle = idleReason(st);
     if (idle) {
-      notify(`${st.id}: ${idle} — stop or keep waiting?`);
+      // One sound per idle episode: a handoff, a progress update, a file change or a snooze starts a new one.
+      const sounded = soundMode(st) && claimTaskEvent(d, `idle:${st.turn}:${lastActivity(st)}:${st.snooze_until || 0}:${
+        st.turn === 'implementer' ? Math.floor(lastFileChange(st.project_dir) / 60000) : 0}`,
+      (cst) => sound(cst, 'idle', { why: idle, waiter: role }));
+      notify(`${st.id}: ${idle} — stop or keep waiting?`, { silent: !!sounded });
       pushPhone(st, `${idle}. Stop or keep waiting?`, { priority: 'high' });
       out(`OTHER AGENT LOOKS UNRESPONSIVE: ${idle}.`);
       out("Ask the user: stop the task ('collab abort') or keep waiting ('collab snooze [MIN]', default 30)?");
       exit(EXIT_IDLE);
     }
     if (epoch() - lastActivity(st) >= STALL && epoch() >= (st.snooze_until || 0)) {
-      holdParts(withLock(d, () => update(d, (s) => { s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; })));
-      notify(`${st.id}: STALLED (no handoff for ${Math.floor(STALL / 60)} min)`);
+      // Only the process that makes the task STALLED sounds it.
+      let sounded = false;
+      const sst = withLock(d, () => {
+        let stalled = false;
+        const ns = update(d, (s) => {
+          if (isTerminal(s.status)) return;
+          s.status = 'STALLED'; s.turn = 'none'; s.updated_by = 'collab'; stalled = true;
+        });
+        sounded = stalled && sound(ns, 'stall', { mins: Math.floor(STALL / 60) });
+        return ns;
+      });
+      holdParts(sst);
+      notify(`${st.id}: STALLED (no handoff for ${Math.floor(STALL / 60)} min)`, { silent: !!sounded });
       pushPhone(st, `STALLED: no handoff for ${Math.floor(STALL / 60)} min`, { priority: 'high' });
       out(`TASK FINISHED: STALLED — the other agent has not handed off for ${Math.floor(STALL / 60)} min`);
       exit(EXIT_TERMINAL);
@@ -1753,6 +2893,7 @@ async function cmdSubmit(args) {
     if (!res.ok) {
       out('NOT SUBMITTED: the task check failed. Fix it and submit again (or escalate if it cannot pass).');
       printCheck(res, d);
+      sound(pre, 'check-fail');
       exit(EXIT_CHECK);
     }
     body += `\n\n> collab: check passed: \`${res.cmd}\` (${res.secs}s)\n`;
@@ -1810,8 +2951,7 @@ async function cmdSubmit(args) {
     const limitOpts = t.limit && limitOptions(isPlan(st));
     if (t.limit) body += `\n\n## ${question}\n${limitOpts.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n`;
     addEntry(d, st, role, kind, body);
-    return {
-      st: update(d, (s) => {
+    const nst = update(d, (s) => {
         t.apply(s);
         if (tree && kind === 'ready') { s.review_digest = tree.id; delete s.pending_digest; }
         if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap.repos }].slice(-2);
@@ -1822,8 +2962,8 @@ async function cmdSubmit(args) {
         freezeAcked(s);
         if (acks) s.acked = { ...s.acked, [role]: s.seq };
         s.seq += 1; s.updated_by = role; s.turn_since = epoch();
-      }),
-    };
+      });
+    return { st: nst, sounded: queueSound(nst, handoffSounds(nst, role, body)) };
   });
 
   if (result.pending) refuseUnacked(d, result.pending);
@@ -1837,6 +2977,7 @@ async function cmdSubmit(args) {
   }
   const st = result.st;
   out(`submitted: ${role} ${kind} -> ${st.status} (turn: ${st.turn}, ${roundLabel(st)})`);
+  const { sounded } = result;
   // The handoff is done: a lessons problem is reported, never turned into a failed submit.
   const bullets = kind === 'decide' ? [] : lessonBullets(body);
   let res = null;
@@ -1858,14 +2999,14 @@ async function cmdSubmit(args) {
   }
   if (st.status === 'DECISION') {
     const dec = st.decision;
-    notify(`${st.id}: your decision is needed — ${dec.question}`);
+    notify(`${st.id}: your decision is needed — ${dec.question}`, { silent: sounded });
     pushPhone(st, `Decision needed: ${dec.question}`, { priority: 'high' });
     if (dec.kind === 'limit') out(`${dec.question} The user decides; the implementer presents the options, don't ask the user yourself. Run 'collab -t ${st.id} wait ${role}': it returns with the outcome.`);
     else if (dec.self) out(`Ask the user now, then record their choice with 'collab -t ${st.id} answer <N | text>'; the turn comes back to you.`);
     else out(`The other agent presents it to the user (or the user runs 'collab answer <N | text>'); don't ask the user yourself. Run 'collab -t ${st.id} wait ${role}': it returns with the answer.`);
     return;
   }
-  notify(`${st.id}: ${st.status}`);
+  notify(`${st.id}: ${st.status}`, { silent: sounded });
   if (st.status === 'ESCALATED') pushPhone(st, `Escalated by the ${role}: ${headline(body)}`, { priority: 'high' });
   holdParts(st);
   if (st.status === 'DONE' && queueLine(st)) out(queueLine(st));
@@ -1911,6 +3052,7 @@ function cmdNote(args) {
     const seq = st.seq;
     addEntry(d, st, opts.from ? 'peer' : 'human', `note-${to}`, body);
     const nst = update(d, (s) => { s.seq += 1; s.updated_by = opts.from || 'human'; });
+    sound(nst, `${opts.from ? 'peer-' : ''}note-${to}`);
     return { seq, turn: nst.turn };
   });
   out(`note #${res.seq} ${opts.from ? `from the ${opts.from} ` : ''}added for ${to} (turn: ${res.turn}). It is delivered at that agent's`
@@ -1975,6 +3117,7 @@ function cmdQueue(args) {
     const { opts, rest: words } = takeOpts(rest, {
       values: { ...TASK_OPTS.values, '--dir': 'dir', '--file': 'file', '-f': 'file' },
       flags: { ...TASK_OPTS.flags, '--first': { first: true } },
+      optional: TASK_OPTS.optional,
     }, { strict: true });
     const dir = path.resolve(opts.dir || process.cwd());
     if (!fs.existsSync(dir)) die(`no such directory: ${dir}`);
@@ -2012,6 +3155,9 @@ function cmdQueue(args) {
       const msg = `Queued task #${it.id} needs your go-ahead: ${headline(it.text)}`;
       if (prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) pushPhone(prev, msg, { priority: 'high' });
       else if (it.options && it.options.phone) pushPhone({ id: `queued task #${it.id}`, options: it.options }, msg, { priority: 'high' });
+      // The same for sounds, once per queued item however often 'queue next' shows it.
+      const sst = prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.sound ? prev : { id: '', options: it.options || {} };
+      if (soundMode(sst) && claimHomeEvent(`confirm:${it.id}`)) sound(sst, 'confirm', { item: it, text: headline(it.text) });
     }
     out('----- task -----');
     process.stdout.write(it.text.endsWith('\n') ? it.text : `${it.text}\n`);
@@ -2070,7 +3216,8 @@ function cmdQueue(args) {
         '',
       ].join('\n');
       addEntry(d, st, 'implementer', 'split', body);
-      update(d, (s) => { s.seq += 1; s.part = { index: 1, total, parent: st.id }; s.updated_by = 'implementer'; });
+      const sst = update(d, (s) => { s.seq += 1; s.part = { index: 1, total, parent: st.id }; s.updated_by = 'implementer'; });
+      queueSound(sst, [{ event: 'split', c: soundCtx(sst) }, { event: 'part-start', c: soundCtx(sst) }]);
       return { total, queued };
     });
     out(`split into ${res.total} parts: this task is part 1; queued ${res.queued.map((it) => `#${it.id}`).join(', ')} next for this project`);
@@ -2201,6 +3348,9 @@ function phoneSend(args) {
   let st = null;
   try { st = d && readState(d); } catch { /* none */ }
   const running = st && (!isTerminal(st.status) || (st.status === 'DONE' && !st.ended));
+  // Sounds don't need --phone: a running --sound task (or any running task after 'collab sound on')
+  // hears it, once a minute at most per task and message. Outside a running task, nothing sounds.
+  if (running && soundMode(st) && claimHomeEvent(`agent-waiting:${st.id}:${text}`, 60)) sound(st, 'agent-waiting', { text });
   if (!running) return skip('no collab task running in this project');
   if (!(st.options && st.options.phone)) return skip("this task wasn't started with --phone");
   if (!phoneUrl()) return skip("no destination: 'collab phone set <topic|url>'");
@@ -2502,7 +3652,11 @@ function cmdList() {
 
 function cmdAbort() {
   const d = taskDir();
-  const st = withLock(d, () => update(d, (s) => { s.status = 'ABORTED'; s.turn = 'none'; s.updated_by = 'human'; }));
+  const st = withLock(d, () => {
+    const ns = update(d, (s) => { s.status = 'ABORTED'; s.turn = 'none'; s.updated_by = 'human'; });
+    sound(ns, 'abort');
+    return ns;
+  });
   holdParts(st);
   out(`aborted ${st.id}`);
 }
@@ -2515,6 +3669,7 @@ function cmdAnswer(args) {
   const text = rest.join(' ').trim();
   const raw = (text && !opts.file ? text : readBody(opts.file)).trim();
   let treeErr = null;
+  let spoken = '';
   const st = withLock(d, () => {
     const s0 = readState(d);
     if (s0.status !== 'DECISION' || !s0.decision) die(`no decision is pending (status: ${s0.status})`);
@@ -2522,6 +3677,7 @@ function cmdAnswer(args) {
     const m = raw.match(/^(\d+)(?:[.):](?!\d)|(?=\s|$))\s*([\s\S]*)$/);
     const pick = m && dec.options && dec.options[parseInt(m[1], 10) - 1];
     const answer = pick ? `Option ${m[1]}: ${pick}${m[2].trim() ? `\n\n${m[2].trim()}` : ''}` : raw;
+    spoken = pick ? `option ${m[1]}, ${pick}` : raw;
     // Round limit: 2 approves (the plan in the plan phase, else the task), 3 stops, 1 or the user's
     // own words: 2 more rounds of the current phase, with this review.
     const n = dec.kind === 'limit' ? (pick ? parseInt(m[1], 10) : 1) : 0;
@@ -2539,7 +3695,7 @@ function cmdAnswer(args) {
       }
     }
     addEntry(d, s0, 'human', 'answer', `## User decision\n${answer}\n\n> question (#${pad3(dec.seq)}, ${dec.role}): ${dec.question}\n`);
-    return update(d, (s) => {
+    const ns = update(d, (s) => {
       s.status = dec.status;
       s.turn = dec.turn;
       if (n === 2 && plan) approvePlan(s);
@@ -2552,6 +3708,13 @@ function cmdAnswer(args) {
       delete s.decision;
       s.seq += 1; s.updated_by = 'human'; s.turn_since = epoch();
     });
+    // The answer's outcome is the event: a round-limit approval or stop sounds like one.
+    const c = soundCtx(ns, { role: 'user', answer: spoken });
+    if (ns.status === 'DONE') queueSound(ns, doneSounds(ns, c));
+    else if (ns.status === 'ESCALATED') sound(ns, 'escalate', { role: 'user', text: 'you chose to stop at the round limit' });
+    else if (n === 2 && plan) sound(ns, 'plan-approve');
+    else queueSound(ns, [{ event: 'answer', c }]);
+    return ns;
   });
   holdParts(st);
   out(isTerminal(st.status) ? `answer recorded; the task is ${st.status}` : `answer recorded; back to the ${st.turn} (status: ${st.status})`);
@@ -2678,13 +3841,16 @@ function cmdEnd(args) {
   body += runLessons(run);
   body += `\n> collab: run ended after ${run.length} task(s): ${run.join(', ')}\n`;
 
+  let endSounded = false;
   const st = withLock(d, () => {
     const s0 = readState(d);
     if (s0.ended) die(`the run already ended after ${s0.id}`);
     addEntry(d, s0, 'implementer', 'end', body);
-    return update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
+    const ns = update(d, (s) => { s.ended = { seq: s.seq, at: nowIso(), epoch: epoch() }; s.seq += 1; s.updated_by = 'implementer'; });
+    endSounded = sound(ns, 'end', { n: run.length });
+    return ns;
   });
-  notify(`${st.id}: work complete`);
+  notify(`${st.id}: work complete`, { silent: endSounded });
   pushPhone(st, `Work complete: ${run.length} task(s). 'collab show' has the final report.`, { priority: 'high' });
   out(`ended the run after ${st.id}: ${run.length} task(s), ${decisions.length} recorded decision(s)${queued.length ? `, ${queued.length} queued task(s) left for the user's go-ahead` : ''}. A reviewer in 'join --after' stops now.`);
 }
@@ -3007,6 +4173,8 @@ ${B}FOR YOU (the human)${R}
   ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
   ${C}lessons${R} [add "…" | rm N]    Project lessons put into every new brief (agents add them too)
   ${C}phone${R} [set T|test|send]     Where --phone tasks push to (ntfy topic or URL); test; send (hooks)
+  ${C}sound${R} [setup|test|set|pack…] Sounds and spoken updates per event, to follow a task by ear
+                              (status by default; 'collab sound events' lists the events)
   ${C}snooze${R} [MIN]                Keep waiting on a slow agent (no idle prompt for MIN, default 30)
   ${C}clean${R} [--older-than D] [-n] Delete finished tasks and old drafts (asks first; -n dry run, -y no prompt)
   ${C}path${R}                        Folder holding the current task's files
@@ -3021,6 +4189,9 @@ ${B}TASK OPTIONS${R} ${D}(for queue add, init, or /collab implement …)${R}
   --commit                    Commit when DONE (never pushes)
   --confirm                   Ask you before this queued task starts
   --phone                     Push to your phone when you're needed (see 'collab phone')
+  --sound[=tones|full|elevenlabs]
+                              A sound and a short spoken update at every step (tones: no voice;
+                              full: full sentences; elevenlabs: spoken by ElevenLabs)
   --max-rounds N · --first    Round limit · put it at the front of the queue
 
 ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
@@ -3063,7 +4234,7 @@ const COMMANDS = {
   init: cmdInit, join: cmdJoin, wait: cmdWait, submit: cmdSubmit, note: cmdNote,
   snooze: cmdSnooze, progress: cmdProgress, queue: cmdQueue, check: cmdCheck, clean: cmdClean, watch: cmdWatch, diff: cmdDiff, verify: cmdVerify, status: cmdStatus,
   show: cmdShow, list: cmdList, abort: cmdAbort, end: cmdEnd, answer: cmdAnswer, scratch: cmdScratch,
-  lessons: cmdLessons, phone: cmdPhone,
+  lessons: cmdLessons, phone: cmdPhone, sound: cmdSound,
   log: () => process.stdout.write(fs.readFileSync(path.join(taskDir(), 'log.md'), 'utf8')),
   path: () => out(taskDir()),
 };
