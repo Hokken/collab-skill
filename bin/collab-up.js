@@ -37,8 +37,23 @@ Run it from a VS Code integrated terminal. Setup: docs/vscode.md`;
 const codeMissing = (r, platform = process.platform) =>
   !!(r.error && r.error.code === 'ENOENT') || (platform === 'win32' && r.status === 9009);
 
+// On Windows, whether `code` (code.cmd, code.exe, …) is on PATH. cmd.exe's exit status for an
+// unknown command isn't reliable (9009 usually, but 1 on some setups), so look before running it.
+function codeOnPath(env = process.env) {
+  const key = Object.keys(env).find((k) => k.toLowerCase() === 'path');
+  const exts = (env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  for (const dir of String((key && env[key]) || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const e of exts) {
+      try { if (fs.statSync(path.join(dir.replace(/^"|"$/g, ''), `code${e}`)).isFile()) return true; } catch { /* not here */ }
+    }
+  }
+  return false;
+}
+
 // Windows needs a shell to find code.cmd; elsewhere run it directly.
 function code(args) {
+  if (process.platform === 'win32' && !codeOnPath()) return 127;
   const r = process.platform === 'win32'
     ? spawnSync(['code', ...args.map((a) => `"${a}"`)].join(' '), { shell: true, stdio: 'inherit' })
     : spawnSync('code', args, { stdio: 'inherit' });

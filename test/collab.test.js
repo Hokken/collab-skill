@@ -3138,8 +3138,14 @@ test('sound: a dead drainer is taken over only after the sound it started has fi
   const recs = s.records();
   const second = recs.filter((r) => r.phase === 'start')[1];
   const firstEnd = recs.find((r) => r.phase === 'end' && r.pid === first.pid);
-  assert.ok(second && firstEnd, 'both tones played');
-  assert.ok(second.at >= firstEnd.at, 'the takeover waited for the dead drainer\'s tone');
+  assert.ok(second, 'the second tone played');
+  // On Windows a process's (non-detached) children die with it, so the first tone stops when its
+  // drainer is killed and nothing is left to overlap. Elsewhere it plays on, and the takeover waits.
+  if (process.platform === 'win32') assert.ok(!firstEnd || second.at >= firstEnd.at);
+  else {
+    assert.ok(firstEnd, 'the first tone played to its end');
+    assert.ok(second.at >= firstEnd.at, 'the takeover waited for the dead drainer\'s tone');
+  }
 });
 
 test('sound: idle, stall, confirm-first and agent waits sound once per episode', async () => {
