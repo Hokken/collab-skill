@@ -228,15 +228,19 @@ const SOUND_EVENTS = {
   'note-reviewer': ['you added a note for the reviewer', (c) => `${c.t}: your note for the reviewer was added.`, (c) => `${c.t}: note for the reviewer`],
   'peer-note-implementer': ['the reviewer sent the implementer a note', (c) => `${c.t}: the reviewer sent the implementer a note.`, (c) => `${c.t}: note from the reviewer`],
   'peer-note-reviewer': ['the implementer sent the reviewer a note', (c) => `${c.t}: the implementer sent the reviewer a note.`, (c) => `${c.t}: note from the implementer`],
+  'sound-change': ["a task's sound settings were changed ('collab sound use')", (c) => `${c.t}: sound set to ${c.text}`, (c) => `${c.t}: ${c.text}`],
   end: ['the implementer ended the run: all work is done', (c) => `${c.t}: work complete, ${plural(c.n, 'task')}. Run collab show for the final report.`, (c) => `${c.t}: work complete`],
 };
-const SOUND_MODES = ['voice', 'tones', 'elevenlabs', 'full'];
+const SOUND_MODES = ['voice', 'tones', 'off', 'elevenlabs', 'full'];
 const SOUND_STYLES = ['short', 'full'];
 // The agent that went quiet: the one holding the turn in 'wait', the implementer after DONE ('join --after').
 const quietAgent = (c) => (ROLES.includes(c.st.turn) ? c.st.turn : 'implementer');
-// Sentence style: --sound=full, else sound.voice.style ('short' unless it is 'full').
-const soundStyle = (cfg, mode) => (mode === 'full' || (cfg.voice && cfg.voice.style === 'full') ? 'full' : 'short');
-const sentence = (event, c, style) => clipSpeech(SOUND_EVENTS[event][style === 'full' ? 1 : 2](c), Infinity);
+// Without the task name (the default: one collab at a time needs none), "dark mode: plan ready"
+// becomes "Plan ready".
+function sentence(event, c, style, name = true) {
+  const text = clipSpeech(SOUND_EVENTS[event][style === 'full' ? 1 : 2](name ? c : { ...c, t: '' }), Infinity);
+  return name ? text : text.replace(/^:\s*/, '').replace(/^\p{Ll}/u, (x) => x.toUpperCase());
+}
 
 const startLine = (st) => (st.phase === 'plan' ? 'The implementer is writing a plan.' : 'The implementer is working.');
 const spokenTask = (id) => String(id || '').replace(/-\d{8}-\d{6}(-\d+)?$/, '').replace(/[-_]+/g, ' ').trim();
@@ -412,7 +416,7 @@ const SYSTEM_SOUNDS = {
       'plan-changes': 'Tink', changes: 'Tink', 'plan-approve': 'Glass', approve: 'Hero', 'part-done': 'Morse', end: 'Purr',
       decide: 'Sosumi', confirm: 'Sosumi', 'agent-waiting': 'Sosumi', idle: 'Basso', escalate: 'Basso', stall: 'Basso',
       abort: 'Funk', 'check-fail': 'Funk', 'note-all': 'Ping', 'note-implementer': 'Ping', 'note-reviewer': 'Ping',
-      'peer-note-implementer': 'Frog', 'peer-note-reviewer': 'Frog',
+      'peer-note-implementer': 'Frog', 'peer-note-reviewer': 'Frog', 'sound-change': 'Pop',
     },
   },
   win32: {
@@ -424,7 +428,7 @@ const SYSTEM_SOUNDS = {
       decide: 'Windows Exclamation', confirm: 'Windows Exclamation', 'agent-waiting': 'Windows Exclamation', idle: 'Windows Critical Stop',
       escalate: 'Windows Critical Stop', stall: 'Windows Critical Stop', abort: 'Windows Background', 'check-fail': 'Windows Background',
       'note-all': 'Windows Notify Messaging', 'note-implementer': 'Windows Notify Messaging', 'note-reviewer': 'Windows Notify Messaging',
-      'peer-note-implementer': 'Windows Notify Email', 'peer-note-reviewer': 'Windows Notify Email',
+      'peer-note-implementer': 'Windows Notify Email', 'peer-note-reviewer': 'Windows Notify Email', 'sound-change': 'Windows Notify System Generic',
     },
   },
   linux: {
@@ -435,7 +439,7 @@ const SYSTEM_SOUNDS = {
       decide: 'window-attention', confirm: 'window-attention', 'agent-waiting': 'window-attention', idle: 'dialog-warning', escalate: 'suspend-error',
       stall: 'suspend-error', abort: 'device-removed', 'check-fail': 'dialog-warning', 'note-all': 'message-new-instant',
       'note-implementer': 'message-new-instant', 'note-reviewer': 'message-new-instant', 'peer-note-implementer': 'message-new-instant',
-      'peer-note-reviewer': 'message-new-instant',
+      'peer-note-reviewer': 'message-new-instant', 'sound-change': 'message',
     },
   },
 };
@@ -536,28 +540,55 @@ function resolveSound(event, cfg = soundConfig()) {
   return { file, fileFrom, say: say === undefined ? true : say };
 }
 
-// Whether an event sounds, and how: null (silent), 'tones', 'voice' or 'elevenlabs' (a voice mode). COLLAB_SOUND=0 and
-// 'collab sound off' mute everything; a task's --sound turns it on for that task; 'collab
-// sound on' turns it on for every task.
-function soundMode(st, cfg = soundConfig()) {
-  if (process.env.COLLAB_SOUND === '0' || cfg.on === false) return null;
-  const opt = st && st.options && st.options.sound;
-  if (opt) return SOUND_MODES.includes(opt) ? opt : 'voice';
-  if (cfg.on === true) return cfg.voice && cfg.voice.on === true ? 'voice' : 'tones';
-  return null;
+// A task's own sound settings, each optional (absent = follow config.json): sound (voice | tones |
+// off), sound_engine (system | elevenlabs), sound_style (short | full). The older single values
+// sound: 'full' / 'elevenlabs' (from --sound=full|elevenlabs) mean voice + that style / engine.
+function taskSound(st) {
+  const o = (st && st.options) || {};
+  const t = {};
+  if (o.sound === 'full') { t.sound = 'voice'; t.style = 'full'; } else if (o.sound === 'elevenlabs') { t.sound = 'voice'; t.engine = 'elevenlabs'; } else if (['voice', 'tones', 'off'].includes(o.sound)) t.sound = o.sound;
+  if (['system', 'elevenlabs'].includes(o.sound_engine)) t.engine = o.sound_engine;
+  if (SOUND_STYLES.includes(o.sound_style)) t.style = o.sound_style;
+  return t;
 }
+
+// The same as option fields (sound, sound_engine, sound_style), only those that are set.
+const SOUND_KEYS = ['sound', 'sound_engine', 'sound_style'];
+function soundFields(o) {
+  const t = taskSound({ options: o });
+  const f = {};
+  if (t.sound) f.sound = t.sound;
+  if (t.engine) f.sound_engine = t.engine;
+  if (t.style) f.sound_style = t.style;
+  return f;
+}
+
+// How an event of this task sounds: null (silent) or { mode: 'voice' | 'tones', engine, style }.
+// On by default. COLLAB_SOUND=0 and 'collab sound off' mute everything, even a task's own
+// settings; then the task's settings; then config.json (voice.on: false = tones only).
+function soundPrefs(st, cfg = soundConfig(), { ignoreMute = false } = {}) {
+  if (!ignoreMute && (process.env.COLLAB_SOUND === '0' || cfg.on === false)) return null;
+  const t = taskSound(st);
+  if (t.sound === 'off') return null;
+  const v = cfg.voice && typeof cfg.voice === 'object' ? cfg.voice : {};
+  const mode = t.sound === 'tones' ? 'tones' : t.sound === 'voice' ? 'voice' : v.on === false ? 'tones' : 'voice';
+  return { mode, engine: t.engine || (v.engine === 'elevenlabs' ? 'elevenlabs' : 'system'), style: t.style || (v.style === 'full' ? 'full' : 'short'), name: v.name === true };
+}
+const soundMode = (st, cfg) => { const p = soundPrefs(st, cfg); return p ? p.mode : null; };
+const describePrefs = (p) => (!p ? 'silent' : p.mode === 'tones' ? 'tones only'
+  : `tones + ${p.style} sentences, ${p.engine === 'elevenlabs' ? 'ElevenLabs voice' : 'system voice'}`);
 
 const soundVolume = (cfg) => (Number.isFinite(Number(cfg.volume)) ? clamp(Number(cfg.volume), 0, 100) : 100);
 
 // The steps (tone, then sentence) that an event plays, or [] for none.
-function soundSteps(event, c, mode, cfg = soundConfig()) {
+function soundSteps(event, c, prefs, cfg = soundConfig()) {
   const r = resolveSound(event, cfg);
   const steps = [];
   if (r.file) steps.push({ event, tone: r.file });
-  if (mode !== 'tones' && r.say !== false) {
+  if (prefs.mode !== 'tones' && r.say !== false) {
     // Each part of a default sentence is clipped on its own, so the whole is never cut: a decision
     // keeps every option number and the answering instruction.
-    const text = typeof r.say === 'string' ? fillSay(r.say, c) : sentence(event, c, soundStyle(cfg, mode));
+    const text = typeof r.say === 'string' ? fillSay(r.say, c) : sentence(event, c, prefs.style, prefs.name);
     if (text) steps.push({ event, say: text });
   }
   return steps;
@@ -575,22 +606,43 @@ let audioSeq = 0;
 
 // Queue the events' sounds for a task (st may be null: a run-wide event). Returns whether anything
 // was queued. Never throws: sounds are best effort. Callers that change a task call it while they
-// still hold the task's lock, so the jobs of one task are queued in the order of its transitions
-// (a later transition's job never sorts before an earlier one's: same or later millisecond, and
-// within a millisecond the task's seq decides).
+// still hold the task's lock, so the jobs of one task are queued in the order of its transitions,
+// and the job names keep that order (see below).
 function queueSound(st, events) {
   try {
     const cfg = soundConfig();
-    const mode = soundMode(st, cfg);
-    if (!mode) return false;
-    const steps = events.flatMap(({ event, c }) => soundSteps(event, c, mode, cfg));
+    const prefs = soundPrefs(st, cfg);
+    if (!prefs) return false;
+    const steps = events.flatMap(({ event, c }) => soundSteps(event, c, prefs, cfg));
     if (!steps.length) return false;
     const q = audioQueueDir();
     fs.mkdirSync(q, { recursive: true });
-    const name = `${String(Date.now()).padStart(15, '0')}-${String(st && Number.isInteger(st.seq) ? st.seq : 0).padStart(6, '0')}-${process.pid}-${audioSeq++}.json`;
-    const job = { at: Date.now(), task: st ? st.id : '', steps, volume: soundVolume(cfg), voice: jobVoice(cfg, mode) };
-    fs.writeFileSync(path.join(q, `${name}.tmp`), JSON.stringify(job));
-    retry(() => fs.renameSync(path.join(q, `${name}.tmp`), path.join(q, name)));
+    const job = { at: Date.now(), task: st ? st.id : '', steps, volume: soundVolume(cfg), voice: jobVoice(cfg, prefs.engine) };
+    const put = (ms, n) => {
+      const name = `${String(ms).padStart(15, '0')}-${String(n).padStart(9, '0')}-${process.pid}-${audioSeq++}.json`;
+      fs.writeFileSync(path.join(q, `${name}.tmp`), JSON.stringify(job));
+      retry(() => fs.renameSync(path.join(q, `${name}.tmp`), path.join(q, name)));
+    };
+    // A task's jobs are named in the order they are queued, under a lock of their own: the time,
+    // never earlier than the task's previous job, then a counter. So events that don't advance the
+    // task's seq (a 'sound use', an idle claim) and processes in the same millisecond keep their
+    // order, whatever their PIDs.
+    const d = st && st.id ? path.join(TASKS, st.id) : '';
+    if (d && fs.existsSync(d)) {
+      const od = path.join(d, 'audio-order');
+      fs.mkdirSync(od, { recursive: true });
+      withLock(od, () => {
+        const f = path.join(od, 'last.json');
+        let last = { ms: 0, n: 0 };
+        try { last = { ...last, ...JSON.parse(fs.readFileSync(f, 'utf8')) }; } catch { /* first job */ }
+        const next = { ms: Math.max(Date.now(), last.ms), n: last.n + 1 };
+        put(next.ms, next.n);
+        fs.writeFileSync(`${f}.${process.pid}.tmp`, JSON.stringify(next));
+        retry(() => fs.renameSync(`${f}.${process.pid}.tmp`, f));
+      });
+    } else {
+      put(Date.now(), 0);
+    }
     const child = spawn(process.execPath, [__filename, 'sound', 'drain'], { detached: true, stdio: 'ignore', windowsHide: true });
     child.on('error', () => {});
     child.unref();
@@ -757,9 +809,9 @@ const ttsDir = () => path.join(audioDir(), 'tts');
 const ttsStatusFile = () => path.join(audioDir(), 'tts-status.json');
 
 // The voice options a job carries: an allowlist, so nothing else in config (e.g. api_key) is copied.
-function jobVoice(cfg, mode) {
+function jobVoice(cfg, eng) {
   const v = cfg.voice && typeof cfg.voice === 'object' && !Array.isArray(cfg.voice) ? cfg.voice : {};
-  const engine = mode === 'elevenlabs' || v.engine === 'elevenlabs' ? 'elevenlabs' : 'system';
+  const engine = eng === 'elevenlabs' ? 'elevenlabs' : 'system';
   const res = { engine };
   if (Number(v.rate) > 0) res.rate = Math.round(Number(v.rate));
   if (engine === 'elevenlabs') {
@@ -974,7 +1026,7 @@ const SOUND_EXAMPLE = {
   text: 'the database credentials are missing', why: 'the reviewer has not handed off for 30 min', waiter: 'implementer',
   item: { id: 4 }, answer: 'option 1', mins: 120,
 };
-const exampleSentence = (event, style) => sentence(event, SOUND_EXAMPLE, style);
+const exampleSentence = (event, style, name) => sentence(event, SOUND_EXAMPLE, style, name);
 
 function withSoundConfig(fn) {
   return withHomeFile(configPath(), readConfig, (c) => {
@@ -1023,18 +1075,17 @@ function soundStatus() {
   let state;
   if (process.env.COLLAB_SOUND === '0') state = 'off (COLLAB_SOUND=0)';
   else if (cfg.on === false) state = "off: muted ('collab sound on' for every task, or remove the mute with 'collab sound unmute')";
-  else if (cfg.on === true) state = 'on for every task';
-  else state = "only for tasks started with --sound ('collab sound on' turns it on for every task)";
+  else state = `on for every task: ${describePrefs(soundPrefs(null, cfg))} ('collab sound off' mutes)`;
   out(`sound:   ${state}`);
-  out(`voice:   ${cfg.voice && cfg.voice.on === true ? 'on' : 'off'} for 'collab sound on' (a task's --sound speaks unless it is --sound=tones)${cfg.voice && cfg.voice.engine ? `, engine ${cfg.voice.engine}` : ''}${cfg.voice && cfg.voice.rate ? `, ${cfg.voice.rate} words/min` : ''}`);
-  out(`style:   ${soundStyle(cfg)} sentences${cfg.voice && cfg.voice.style === 'full' ? '' : " ('collab sound voice style full' for full ones, or --sound=full for one task)"}`);
+  out(`voice:   ${cfg.voice && cfg.voice.on === false ? "off by default: tones only ('collab sound voice on' to speak)" : "on ('collab sound voice off' for tones only)"}${cfg.voice && cfg.voice.rate ? `, ${cfg.voice.rate} words/min` : ''}`);
+  out(`style:   ${cfg.voice && cfg.voice.style === 'full' ? 'full' : 'short'} sentences ('collab sound voice style short|full'), task name ${cfg.voice && cfg.voice.name === true ? 'said' : "left out ('collab sound voice name on' to say it)"}`);
   out(`volume:  ${soundVolume(cfg)}`);
   const players = [...new Set(TONE_PLAYERS[os].map((p) => p.bin))].filter((b) => soundBin(b));
   out(`players: ${players.length ? `${players.join(', ')} (${OS_NAME[os]} plays ${toneExts(os).join(', ')})` : `none found: ${INSTALL_HINT.tone[os]}`}`);
   const sp = speechCommand('test', cfg.voice || {});
   out(`speech:  ${sp.why ? sp.why : path.basename(sp.bin)}${sp.note ? ` (${sp.note})` : ''}`);
-  const jv = jobVoice(cfg, 'voice');
-  out(`engine:  ${jv.engine === 'elevenlabs' ? 'ElevenLabs' : 'system voice'} (--sound=elevenlabs uses ElevenLabs for that task)`);
+  const jv = jobVoice(cfg, cfg.voice && cfg.voice.engine);
+  out(`engine:  ${jv.engine === 'elevenlabs' ? "ElevenLabs ('collab sound voice system' for the system voice)" : "system voice ('collab sound voice elevenlabs' for ElevenLabs)"}`);
   const k = elevenLabsKey();
   const el = jobVoice(cfg, 'elevenlabs');
   const cache = ttsCacheSize();
@@ -1058,9 +1109,69 @@ function soundStatus() {
   if (problems.length) { out('problems:'); for (const p of problems) out(`  ✗ ${p}`); }
 }
 
+// collab [-t ID] sound use <word>...: change the sound of the running task (and so the rest of its
+// run), for the user or for an agent the user asked. Never global, never agent activity.
+const SOUND_USE = { sound: ['voice', 'tones', 'off'], engine: ['system', 'elevenlabs'], style: ['short', 'full'] };
+function soundUse(words) {
+  const usage = 'usage: collab [-t ID] sound use <voice | tones | off> [system | elevenlabs] [short | full], or: collab sound use default';
+  if (!words.length) die(usage);
+  const set = {};
+  let reset = false;
+  for (const w of words.map((x) => x.toLowerCase())) {
+    if (w === 'default') { reset = true; continue; }
+    const g = Object.keys(SOUND_USE).find((k) => SOUND_USE[k].includes(w));
+    if (!g) die(`unknown sound setting '${w}'. ${usage}`);
+    if (set[g] && set[g] !== w) die(`'${set[g]}' and '${w}' contradict each other: pick one`);
+    set[g] = w;
+  }
+  if (reset && Object.keys(set).length) die("'default' clears this task's sound settings: use it on its own");
+  // Asking for a voice or a sentence style means wanting to hear it.
+  if ((set.engine || set.style) && set.sound && set.sound !== 'voice') die(`'${set.sound}' has no voice, so '${set.engine || set.style}' would change nothing: pick one`);
+  if (set.engine || set.style) set.sound = 'voice';
+  const d = taskDir();
+  const st = withLock(d, () => {
+    const s0 = readState(d);
+    if (isTerminal(s0.status) && !(s0.status === 'DONE' && !s0.ended)) die(`task already finished (${s0.status}${s0.ended ? ', run ended' : ''})`);
+    const ns = update(d, (s) => {
+      const o = { ...(s.options || {}) };
+      const t = taskSound(s);
+      if (reset) {
+        delete o.sound; delete o.sound_engine; delete o.sound_style;
+      } else {
+        // An older combined value becomes the separate fields, so a partial change keeps the rest.
+        if (o.sound === 'full' || o.sound === 'elevenlabs') {
+          o.sound = t.sound;
+          if (t.style) o.sound_style = t.style;
+          if (t.engine) o.sound_engine = t.engine;
+        }
+        if (set.sound) o.sound = set.sound;
+        if (set.engine) o.sound_engine = set.engine;
+        if (set.style) o.sound_style = set.style;
+      }
+      s.options = o;
+      s.sound_changes = [...(s.sound_changes || []), { what: reset ? 'default' : words.join(' '), by: agentShell() ? 'agent' : 'user', at: nowIso() }].slice(-20);
+    }, { touch: false });
+    // A short confirmation in the new settings (so mute, off and tones apply to it as to any event).
+    queueSound(ns, [{ event: 'sound-change', c: soundCtx(ns, { text: describePrefs(soundPrefs(ns, soundConfig(), { ignoreMute: true })) }) }]);
+    return ns;
+  });
+  const cfg = soundConfig();
+  const wanted = soundPrefs(st, cfg, { ignoreMute: true });
+  out(`${st.id}: ${describePrefs(wanted)} (from the next event; the rest of the run keeps it)`);
+  if (wanted && !soundPrefs(st, cfg)) {
+    out(process.env.COLLAB_SOUND === '0'
+      ? 'but COLLAB_SOUND=0 is set in this shell, so nothing plays from processes started with it: unset it (or set it to 1) where the agents run'
+      : "but sound is muted ('collab sound off'), so nothing plays until you run 'collab sound on'");
+  }
+  if (wanted && wanted.mode === 'voice' && wanted.engine === 'elevenlabs' && !elevenLabsKey().key) {
+    out("note: no ElevenLabs API key (ELEVENLABS_API_KEY, or 'collab sound voice key'), so the system voice speaks until one is set");
+  }
+}
+
 async function cmdSound(args) {
   const [sub = 'status', ...rest] = args;
   if (sub === 'drain') { await soundDrain(); return; }
+  if (sub === 'use') { soundUse(rest); return; }
   if (sub === 'voices') {
     const voices = await listVoices();
     if (!voices.length) { out('no voices on this account'); return; }
@@ -1079,18 +1190,18 @@ async function cmdSound(args) {
   if (sub === 'status' || sub === 'show') { soundStatus(); return; }
   if (sub === 'events') {
     const w = Math.max(...Object.keys(SOUND_EVENTS).map((e) => e.length));
+    const named = !!(soundConfig().voice && soundConfig().voice.name === true);
     for (const [e, [desc]] of Object.entries(SOUND_EVENTS)) {
       out(`${e.padEnd(w)}  ${desc}`);
-      out(`${' '.repeat(w)}  short: "${exampleSentence(e, 'short')}"`);
-      out(`${' '.repeat(w)}  full:  "${exampleSentence(e, 'full')}"`);
+      out(`${' '.repeat(w)}  short: "${exampleSentence(e, 'short', named)}"`);
+      out(`${' '.repeat(w)}  full:  "${exampleSentence(e, 'full', named)}"`);
     }
     out("Map one with 'collab sound set <event|glob> <file>'; globs such as 'note-*' or '*' work too.");
     return;
   }
   if (sub === 'on' || sub === 'off' || sub === 'unmute') {
-    withSoundConfig((s) => { if (sub === 'unmute') delete s.on; else s.on = sub === 'on'; });
-    out(sub === 'on' ? "sound: on for every task ('collab sound voice on' adds the spoken sentences)"
-      : sub === 'off' ? 'sound: off (muted, even for tasks started with --sound)' : 'sound: only for tasks started with --sound');
+    withSoundConfig((s) => { if (sub === 'off') s.on = false; else delete s.on; });
+    out(sub === 'off' ? "sound: off (muted for every task, whatever it asks; 'collab sound on' to unmute)" : `sound: on for every task: ${describePrefs(soundPrefs(null))}`);
     return;
   }
   if (sub === 'volume') {
@@ -1103,7 +1214,7 @@ async function cmdSound(args) {
     const [v, ...more] = rest;
     if (v === 'on' || v === 'off') {
       withSoundConfig((s) => { s.voice = { ...(s.voice || {}), on: v === 'on' }; });
-      out(`voice: ${v}${v === 'on' && soundConfig().on !== true ? " (used by 'collab sound on'; a task's --sound speaks anyway)" : ''}`);
+      out(v === 'on' ? 'voice: on (tones + spoken sentences)' : "voice: off by default (tones only; a task can still ask for a voice: --sound=voice, or 'collab sound use voice')");
       return;
     }
     if (v === 'rate' && more[0] === 'default') {
@@ -1115,6 +1226,12 @@ async function cmdSound(args) {
       if (!/^\d+$/.test(more[0] || '') || +more[0] < 80 || +more[0] > 500) die('usage: collab sound voice rate <80-500> (words per minute), or: collab sound voice rate default');
       withSoundConfig((s) => { s.voice = { ...(s.voice || {}), rate: +more[0] }; });
       out(`voice rate: ${+more[0]} words per minute`);
+      return;
+    }
+    if (v === 'name') {
+      if (!['on', 'off'].includes(more[0])) die('usage: collab sound voice name <on | off>');
+      withSoundConfig((s) => { s.voice = { ...(s.voice || {}), name: more[0] === 'on' }; });
+      out(more[0] === 'on' ? 'task name: said at the start of each sentence ("dark mode: plan ready")' : 'task name: left out ("Plan ready")');
       return;
     }
     if (v === 'style') {
@@ -1157,7 +1274,7 @@ async function cmdSound(args) {
       out('ELEVENLABS_API_KEY, when set, is used instead. Remove it with: collab sound voice key --clear');
       return;
     }
-    die('usage: collab sound voice <on | off | style short|full | rate WPM | rate default | system | elevenlabs [--voice ID] [--model ID] | key [--clear]>');
+    die('usage: collab sound voice <on | off | name on|off | style short|full | rate WPM | rate default | system | elevenlabs [--voice ID] [--model ID] | key [--clear]>');
   }
   if (sub === 'set') {
     const key = soundKey(rest[0]);
@@ -1171,7 +1288,7 @@ async function cmdSound(args) {
     withSoundConfig((s) => { s.events = { ...(s.events && typeof s.events === 'object' ? s.events : {}), [key]: value }; });
     out(value ? `${key}: ${value}` : `${key}: silent (no tone, no speech)`);
     if (value && fileWarning(value)) out(fileWarning(value));
-    if (soundMode(null) === null) out("note: sounds only play for tasks started with --sound, or after 'collab sound on'.");
+    if (soundMode(null) === null) out("note: sound is muted ('collab sound on' to unmute).");
     return;
   }
   if (sub === 'unset') {
@@ -1249,14 +1366,16 @@ async function cmdSound(args) {
     const what = rest.filter((a) => !['--dry-run', '--elevenlabs', '--full'].includes(a)).join(' ') || 'approve';
     const cfg = soundConfig();
     let steps;
-    if (SOUND_EVENTS[what]) steps = soundSteps(what, SOUND_EXAMPLE, rest.includes('--full') ? 'full' : 'voice', cfg);
+    const cv = cfg.voice && typeof cfg.voice === 'object' ? cfg.voice : {};
+    const prefs = { mode: 'voice', engine: rest.includes('--elevenlabs') || cv.engine === 'elevenlabs' ? 'elevenlabs' : 'system', style: rest.includes('--full') || cv.style === 'full' ? 'full' : 'short', name: cv.name === true };
+    if (SOUND_EVENTS[what]) steps = soundSteps(what, SOUND_EXAMPLE, prefs, cfg);
     else {
       const f = soundPath(what, process.cwd());
       if (!fs.existsSync(f)) die(`not an event or a file: ${what} ('collab sound events' lists the events)`);
       steps = [{ tone: f }];
     }
     if (!steps.length) { out(`${what}: silent (no tone, no speech)`); return; }
-    const job = { steps, volume: soundVolume(cfg), voice: jobVoice(cfg, rest.includes('--elevenlabs') ? 'elevenlabs' : 'voice') };
+    const job = { steps, volume: soundVolume(cfg), voice: jobVoice(cfg, prefs.engine) };
     let failed = false;
     for (const step of steps) {
       if (step.say && job.voice.engine === 'elevenlabs') {
@@ -1279,11 +1398,11 @@ async function cmdSound(args) {
       const res = await runStep(cmd, step.tone ? 30000 : 60000, null);
       if (!res.ok) { out(`  failed: ${res.why}`); failed = true; }
     }
-    if (!dry && soundMode(null, cfg) === null) out("note: sounds only play for tasks started with --sound, or after 'collab sound on'.");
+    if (!dry && soundMode(null, cfg) === null) out("note: sound is muted, so tasks stay silent ('collab sound on' to unmute).");
     if (failed) exit(1);
     return;
   }
-  die('usage: collab sound [status | events | setup [--force] | test [event|file] [--dry-run] [--elevenlabs] [--full] | set <event|glob> <file|none> | unset <event|glob> | on | off | unmute | volume N | voice on|off|style short|full|rate WPM|system|elevenlabs|key | voices | cache clear | pack <folder|none> | pack --init <folder>]');
+  die('usage: collab sound [status | events | setup [--force] | use <voice|tones|off|system|elevenlabs|short|full|default>... | test [event|file] [--dry-run] [--elevenlabs] [--full] | set <event|glob> <file|none> | unset <event|glob> | on | off | unmute | volume N | voice on|off|name on|off|style short|full|rate WPM|system|elevenlabs|key | voices | cache clear | pack <folder|none> | pack --init <folder>]');
 }
 
 // The short sentence of an event as a template with {placeholders}, for a new pack's manifest
@@ -1850,7 +1969,11 @@ function describeOpts(o = {}) {
   if (o.commit) bits.push('commit on DONE');
   if (o.confirm) bits.push('confirm before starting');
   if (o.phone) bits.push('phone notifications');
-  if (o.sound) bits.push(o.sound === 'tones' ? 'sounds' : o.sound === 'elevenlabs' ? 'sounds and ElevenLabs voice' : o.sound === 'full' ? 'sounds and full sentences' : 'sounds and voice');
+  if (o.sound || o.sound_engine || o.sound_style) {
+    const t = taskSound({ options: o });
+    bits.push(t.sound === 'off' ? 'silent' : t.sound === 'tones' ? 'tones only'
+      : ['sounds', ...(t.style ? [`${t.style} sentences`] : []), ...(t.engine ? [t.engine === 'elevenlabs' ? 'ElevenLabs voice' : 'system voice'] : [])].join(', '));
+  }
   return bits;
 }
 
@@ -2356,8 +2479,16 @@ function cmdInit(args) {
   const prevId = latestTask(dir);
   const prev = prevId && readState(path.join(TASKS, prevId));
   if (!options.phone && prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) options.phone = true;
-  // --sound carries on the same way.
-  if (!options.sound && prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.sound) options.sound = prev.options.sound;
+  // Sound settings, field by field (sound, engine, style): what this init asks for (--sound=…) first;
+  // then, for a queued part, the run's latest settings only (a 'sound use' after the split counts, and
+  // a field it cleared with 'sound use default' stays cleared), or the part's snapshot when no run is
+  // open; for any other queued task its own --sound before the run's; then the config.
+  const runOpen = prev && prev.status === 'DONE' && !prev.ended;
+  const layers = [normTaskOpts(opts), ...(item && item.part ? [runOpen ? prev.options : item.options] : [item && item.options, runOpen && prev.options])];
+  for (const k of SOUND_KEYS) delete options[k];
+  for (const layer of layers.map((o) => soundFields(o || {}))) {
+    for (const k of SOUND_KEYS) if (options[k] === undefined && layer[k] !== undefined) options[k] = layer[k];
+  }
   const phone = options.phone ? ensurePhoneUrl() : null;
   const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
   brief += optionsSection(options);
@@ -3156,7 +3287,7 @@ function cmdQueue(args) {
       if (prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.phone) pushPhone(prev, msg, { priority: 'high' });
       else if (it.options && it.options.phone) pushPhone({ id: `queued task #${it.id}`, options: it.options }, msg, { priority: 'high' });
       // The same for sounds, once per queued item however often 'queue next' shows it.
-      const sst = prev && prev.status === 'DONE' && !prev.ended && prev.options && prev.options.sound ? prev : { id: '', options: it.options || {} };
+      const sst = prev && prev.status === 'DONE' && !prev.ended ? prev : { id: '', options: it.options || {} };
       if (soundMode(sst) && claimHomeEvent(`confirm:${it.id}`)) sound(sst, 'confirm', { item: it, text: headline(it.text) });
     }
     out('----- task -----');
@@ -3624,6 +3755,7 @@ function cmdStatus() {
   out(`updated: ${st.updated_at} by ${st.updated_by}`);
   out(`latest:  ${latestEntry(d)}`);
   if (describeOpts(st.options).length) out(`options: ${describeOpts(st.options).join(' · ')}`);
+  out(`sound:   ${describePrefs(soundPrefs(st))}`);
   out(`queue:   ${queueCount(st.project_dir)} waiting for this project`);
   out(`folder:  ${d}`);
 }
@@ -4173,8 +4305,8 @@ ${B}FOR YOU (the human)${R}
   ${C}queue rm${R}|${C}move${R}|${C}clear${R}         Edit the queue: rm N, move N M, clear [--all]
   ${C}lessons${R} [add "…" | rm N]    Project lessons put into every new brief (agents add them too)
   ${C}phone${R} [set T|test|send]     Where --phone tasks push to (ntfy topic or URL); test; send (hooks)
-  ${C}sound${R} [setup|test|set|pack…] Sounds and spoken updates per event, to follow a task by ear
-                              (status by default; 'collab sound events' lists the events)
+  ${C}sound${R} [setup|test|set|pack…] Sounds and spoken updates at every step (on by default; 'collab
+                              sound off' mutes; 'collab sound use …' changes the running task)
   ${C}snooze${R} [MIN]                Keep waiting on a slow agent (no idle prompt for MIN, default 30)
   ${C}clean${R} [--older-than D] [-n] Delete finished tasks and old drafts (asks first; -n dry run, -y no prompt)
   ${C}path${R}                        Folder holding the current task's files
@@ -4189,9 +4321,9 @@ ${B}TASK OPTIONS${R} ${D}(for queue add, init, or /collab implement …)${R}
   --commit                    Commit when DONE (never pushes)
   --confirm                   Ask you before this queued task starts
   --phone                     Push to your phone when you're needed (see 'collab phone')
-  --sound[=tones|full|elevenlabs]
-                              A sound and a short spoken update at every step (tones: no voice;
-                              full: full sentences; elevenlabs: spoken by ElevenLabs)
+  --sound[=tones|off|full|elevenlabs]
+                              Sound for this run (on by default): tones only, silent, full
+                              sentences, or spoken by ElevenLabs
   --max-rounds N · --first    Round limit · put it at the front of the queue
 
 ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}

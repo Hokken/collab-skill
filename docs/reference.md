@@ -95,8 +95,10 @@ review/approval · `1` error. What each one asks an agent to do is in
 ## Sounds and speech
 
 Made so you can tell where a session is without looking at the screen. With sound on, every step
-plays a **tone** (to recognise it quickly) and then says a **short sentence**: the task and what
-happened, e.g. "dark mode: changes, round 2" or "dark mode: decision needed".
+plays a **tone** (to recognise it quickly) and then says a **short sentence**: what happened, e.g.
+"Changes, round 2" or "Decision needed". With several collabs at once, `collab sound voice name on`
+starts each sentence with the task's name ("dark mode: changes, round 2"); custom sentences can
+always use `{task}`.
 
 **Full sentences** say everything needed to follow a session by ear alone: whose turn it is, what
 you need to do, and for a decision the question, every option and where to answer ("dark mode: the
@@ -104,16 +106,27 @@ reviewer requested 3 changes. The implementer's turn, round 2."). Use them for o
 `--sound=full`, or always with `collab sound voice style full` (`style short` goes back).
 `collab sound events` shows both sentences of every event.
 
-### Turning it on
+### On by default, and how to change it
 
-- **Per request:** add `--sound` to the task (`/collab implement --sound add dark mode`),
-  `--sound=tones` for tones without the voice, or `--sound=full` for full sentences. It works with no setup at all (your system's own
-  sounds and voice) and stays on for the rest of the run, like `--phone`.
-- **Always:** `collab sound on` (tones) and `collab sound voice on` (sentences too), or
-  `collab sound setup`, which does both and writes the built-in sounds into your config so you
-  can see and change them.
-- **Mute:** `collab sound off` silences everything, even `--sound` tasks; `collab sound unmute`
-  goes back to "only `--sound` tasks". `COLLAB_SOUND=0` always wins.
+Sound is on for every task, with no setup: your system's own sounds and voice, short sentences.
+
+- **Permanent** (`~/.collab/config.json`): `collab sound off` mutes everything, whatever a task asks
+  (`collab sound on`, or `unmute`, undoes it); `collab sound voice off|on` (tones only, or tones and
+  voice); `collab sound voice style short|full`; `collab sound voice system|elevenlabs`.
+  `collab sound setup` also writes the built-in sounds into your config so you can see and edit them.
+- **This run only:** `--sound=voice|tones|off|full|elevenlabs` on the request, or
+  `collab [-t ID] sound use <words>` on the running task, which takes effect at the next event and
+  stays for the rest of the run. Words: `voice` · `tones` · `off` (whether and how it sounds),
+  `system` · `elevenlabs` (which voice), `short` · `full` (which sentences), or `default` alone (back
+  to the permanent settings). Combine one of each (`sound use elevenlabs full`); contradicting words
+  (`tones full`, `system elevenlabs`) are refused without changing anything, and a voice or style
+  word turns the voice on. A short confirmation is spoken in the new settings. It never changes the
+  task's turn, status or timers, and agents run it when you ask them in words. The rest of the run,
+  including later parts of a split task, keeps it; a `--sound=…` given when a task starts wins for
+  what it names (`--sound=elevenlabs` sets the voice and keeps the run's sentence style).
+- **Order:** `COLLAB_SOUND=0` and `collab sound off` win, then the run's own settings, then the
+  permanent ones (`voice.on: false` = tones only). Before this version sound was off unless a task
+  had `--sound`; a config with `"on": true` and no `voice.on` now speaks too.
 
 `collab sound` shows the state, the player and voice found on this machine, and what each event
 plays. `collab sound test <event | file>` plays it now and prints the exact command
@@ -137,6 +150,7 @@ plays. `collab sound test <event | file>` plays it now and prints the exact comm
 | `note-all` · `note-implementer` · `note-reviewer` | your note was added |
 | `peer-note-implementer` · `peer-note-reviewer` | one agent sent the other a note |
 | `end` | the run is over: all work is done |
+| `sound-change` | the run's sound settings were changed (`collab sound use`): a confirmation in the new settings |
 
 `collab progress` updates stay silent. Each event sounds once, from the command that caused it,
 and sounds never overlap: they wait in a queue and play one after the other, while the command
@@ -218,9 +232,12 @@ For voices that sound less generic, the sentences can be spoken by [ElevenLabs](
   | `note-all` · `note-implementer` · `note-reviewer` | 21 · 35 · 32 | 46 · 50 · 47 |
   | `peer-note-implementer` · `peer-note-reviewer` | 33 · 36 | 51 · 51 |
 
+  These include the task name ("dark mode: ", 11 characters), which is only said with
+  `collab sound voice name on`; by default every sentence is that much shorter.
+
   A task with a plan and two review rounds (brief, plan, plan approved, ready ×2, changes, approved,
   end) is about 184 characters short versus 462 full, about 2.5× fewer; with one decision, 210
-  versus 688 or more (about 3.3×). Over all 25 events, short is 662 characters and full 1716
+  versus 688 or more (about 3.3×). Over the 25 task events (not counting the `sound-change` confirmation), short is 662 characters and full 1716
   (about 2.6×); per event it ranges from the same (`split`) to about 8.7× fewer (`decide`), so the
   saving depends on the mix of events and the length of the task name. Repeated sentences come
   from the cache and cost nothing, and short sentences repeat far more often.

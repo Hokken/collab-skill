@@ -226,8 +226,15 @@ task needs the flag again. Queued items carry it like any other option.
 
 ## Sounds
 
-Off unless a task has `--sound[=voice|tones]` (carried on through a run exactly like `--phone`) or
-`config.json` has `sound.on: true`; `sound.on: false` and `COLLAB_SOUND=0` mute everything.
+On by default. A task's own settings are three optional fields in `options`: `sound` (voice |
+tones | off), `sound_engine` (system | elevenlabs), `sound_style` (short | full), set by
+`--sound=…` (older `sound: full|elevenlabs` values mean voice + that style/engine) or changed on a
+running task by `collab sound use` (under the lock, `touch: false`: never activity; recorded in
+`sound_changes`). At `init` each field comes from, in order: that `init`'s own `--sound`; for a
+queued part, the run's latest settings when the run is open (so a `sound use` after the split
+counts, and fields cleared by `sound use default` stay cleared), else the part's snapshot; for any other queued task, its own `--sound`, then the run's (the previous task, if DONE
+and the run not ended); then config. `COLLAB_SOUND=0` and `sound.on: false` mute everything; otherwise task fields win over
+`config.json` (`voice.on`, `voice.engine`, `voice.style`) (`soundPrefs`).
 Reference and config format: [reference.md](reference.md#sounds-and-speech).
 
 - **Who sounds:** the command that makes a transition (`init`, `submit`, `answer`, `abort`, `end`,
@@ -238,6 +245,9 @@ Reference and config format: [reference.md](reference.md#sounds-and-speech).
   turn the newest project file change, in `state.json` `audio_claims`, written without counting as
   activity), `stall` only by the process that writes `STALLED`, `confirm` once per queue item and
   `agent-waiting` (only for the project's running task) once a minute per task and message (in `audio/claims.json`).
+- **Order:** a task's jobs are named `<ms>-<counter>-…` under a lock of their own (`tasks/<id>/audio-order/`),
+  the time never earlier than the task's previous job, so they play in the order they were queued even
+  within one millisecond or for events that don't advance the task's seq.
 - **How:** the command writes a job (tone and sentence) to `~/.collab/audio/queue/` and starts a
   detached `collab sound drain`. One drainer at a time holds `audio/.lock` and plays the jobs
   oldest first, each step to the end (tone 30 s, sentence 60 s at most); others exit and leave it

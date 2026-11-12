@@ -202,7 +202,7 @@ Add these to `/collab implement …` or to `collab queue add`:
 | `--commit` | Commit the changes when the task is done (never pushes) |
 | `--confirm` | Queued tasks only: ask you before this one starts |
 | `--phone` | Push to your phone when you're needed (see [Phone notifications](#phone-notifications)); stays on for the rest of the run |
-| `--sound[=tones\|full\|elevenlabs]` | A sound and a short spoken update at every step (see [Sounds](#sounds)); `full`: full sentences, `elevenlabs`: ElevenLabs voices; stays on for the rest of the run |
+| `--sound=tones\|off\|full\|elevenlabs` | Sound is on by default (a tone and a few words at every step); this picks another setting for this run: tones only, silent, full sentences or ElevenLabs (see [Sounds](#sounds)); stays for the rest of the run |
 | `--max-rounds N` | Review rounds before you are asked: more rounds, approve, or stop (default 4) |
 | `--first` | Queued tasks only: put it at the front of the queue |
 
@@ -285,19 +285,31 @@ or say *keep waiting* or *stop*, from the Claude app, and the pair carries on. F
 
 ### Sounds
 
-Add `--sound` to a request and you know where the run is without looking: every step plays a tone
-and says a few words ("dark mode: changes, round 2", "dark mode: decision needed", "dark mode:
-approved"). It uses your system's own sounds and voice, so there is nothing to set up;
-`--sound=tones` skips the voice, and `--sound=full` says everything needed to follow the run by
-ear alone (whose turn it is, what you need to do, the options of a decision). Sounds never overlap
-and never slow the agents down.
+Collab tells you out loud where a run is, so you can do something else and still know when it
+needs you. Each step plays a short tone, then a voice says a few words:
 
-`collab sound` shows what each event plays, `collab sound test decide` plays one, and
-`collab sound setup` turns sound on for every task. Bring your own sounds with
-`collab sound set approve ~/Sounds/done.mp3`, or make a whole pack with
-`collab sound pack --init <folder>`. For more natural voices, `--sound=elevenlabs` speaks the
-sentences with [ElevenLabs](https://elevenlabs.io) (your own API key in `ELEVENLABS_API_KEY`;
-your system voice takes over offline or on any error). Details:
+> "Plan ready" · "Changes, round 2" · "Decision needed" · "Approved"
+
+It's on by default and uses your computer's own voice: nothing to install or set up.
+
+| I want… | Every run (permanent) | This run only |
+|---|---|---|
+| silence | `collab sound off` (`collab sound on` to undo) | `--sound=off`, or `collab sound use off` |
+| tones only, no voice | `collab sound voice off` | `--sound=tones`, or `collab sound use tones` |
+| longer sentences (whose turn, what to do, the options of a decision) | `collab sound voice style full` | `--sound=full`, or `collab sound use full` |
+| [ElevenLabs](https://elevenlabs.io) voices | set `ELEVENLABS_API_KEY`, then `collab sound voice elevenlabs --voice <id>` | `--sound=elevenlabs`, or `collab sound use elevenlabs` |
+| my computer's voice again | `collab sound voice system` | `collab sound use system` |
+| the task name in each sentence ("dark mode: plan ready"), handy with several collabs at once | `collab sound voice name on` | |
+| this run back to my permanent settings | | `collab sound use default` |
+
+"This run only" settings also work by asking the agent mid-run ("use the ElevenLabs voice", "only
+tones", "mute this run"): it runs `collab sound use …` for you and never changes your permanent
+settings unless you ask. A permanent `collab sound off` always wins.
+
+To hear it now: `collab sound test decide`. `collab sound` shows your settings and what each event
+plays. Your own sounds: `collab sound set approve ~/Sounds/done.mp3`, or a whole pack with
+`collab sound pack --init <folder>`. Sounds never overlap and never slow the agents down. With
+ElevenLabs, your computer's voice takes over when you're offline or anything fails. Details:
 [docs/reference.md](docs/reference.md#sounds-and-speech).
 
 ## Command reference

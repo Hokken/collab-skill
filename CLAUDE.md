@@ -112,9 +112,10 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
 - **Phone**: task option `--phone`; `pushPhone(st, msg)` is a no-op without it, otherwise a detached
   `node -e` child POSTs to `COLLAB_PHONE_URL` or `config.json`'s `phone_url` (ntfy). `cmdInit`
   carries `phone` on from a DONE, not-ended previous task and creates a topic on first use (`ensurePhoneUrl`).
-- **Sound**: task option `--sound[=voice|tones]` (an `optional` value in `takeOpts`, carried on like
-  `phone`), or `config.json` `sound.on`; `soundMode` decides (`COLLAB_SOUND=0` and `sound.on: false`
-  mute). Events are `SOUND_EVENTS` (name → description, full sentence, short sentence); `soundStyle` picks short
+- **Sound**: on by default. Task fields `options.sound` / `sound_engine` / `sound_style` (`--sound=…`, an
+  `optional` value in `takeOpts`; `collab sound use` changes them on a running task; carried on like
+  `phone`), over `config.json` `sound.voice`; `soundPrefs` decides (`COLLAB_SOUND=0` and `sound.on: false`
+  mute first). Events are `SOUND_EVENTS` (name → description, full sentence, short sentence); `soundStyle` picks short
   (default) or full (`--sound=full`, `sound.voice.style`). `style_exaggeration` is ElevenLabs' numeric style. Commands call
   `sound(st, event, ctx)` / `queueSound(st, [...])` after a transition (`handoffSounds`, `doneSounds`);
   observed events (idle, stall, confirm, agent-waiting) first win a claim (`claimTaskEvent` in

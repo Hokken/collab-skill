@@ -2871,7 +2871,9 @@ setTimeout(() => { rec('end'); process.exit(parseInt(process.env.STUB_EXIT || '0
 const ALL_PLAYERS = ['afplay', 'say', 'powershell', 'pw-play', 'paplay', 'aplay', 'mpg123', 'ogg123', 'play', 'ffplay', 'spd-say', 'espeak-ng', 'espeak'];
 const MAC_SOUNDS = ['Blow', 'Submarine', 'Bottle', 'Pop', 'Tink', 'Glass', 'Hero', 'Morse', 'Sosumi', 'Basso', 'Funk', 'Ping', 'Frog', 'Purr'];
 
-function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {} } = {}) {
+// named: the sentences start with the task name ('collab sound voice name on'), which most of these
+// tests assert; the default (no name) has its own test.
+function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {}, named = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'collab-sound-'));
   const bin = path.join(root, 'bin');
   const sys = path.join(root, 'system');
@@ -2881,6 +2883,10 @@ function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {} } = {})
   for (const n of MAC_SOUNDS) fs.writeFileSync(path.join(sys, `${n}.aiff`), '');
   const log = path.join(root, 'stub.log');
   const s = sandbox({ COLLAB_SOUND: '', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env });
+  if (named) {
+    fs.mkdirSync(s.home, { recursive: true });
+    fs.writeFileSync(path.join(s.home, 'config.json'), JSON.stringify({ sound: { voice: { name: true } } }));
+  }
   const records = () => { try { return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
   const started = () => records().filter((r) => r.phase === 'start');
   const queueDir = path.join(s.home, 'audio', 'queue');
@@ -2911,21 +2917,49 @@ function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {} } = {})
   return { ...s, bin, sys, log, records, started, settle, events, tones, runAsync, root };
 }
 
-test('sound: silent unless a task has --sound or sound is on; COLLAB_SOUND=0 always wins', async () => {
+test('sound: on by default with the system voice; mute, tones-only and COLLAB_SOUND=0 still work', async () => {
   const s = soundBox();
-  s.run(['init', 'quiet'], { input: 'b' });
+  s.run(['init', 'plain'], { input: 'b' });
+  await s.settle();
+  assert.deepEqual(s.events(), ['brief:tone', 'brief:say'], 'no flag, no config: a tone and a short sentence');
+  assert.equal(s.started()[1].argv.slice(-1)[0], 'plain: new task');
+  s.run(['abort']);
+  // An old config.json without a 'sound' key (and one with on: true) still loads, and means on.
+  fs.writeFileSync(path.join(s.home, 'config.json'), '{"phone_url":"https://ntfy.sh/x","sound":{"on":true}}\n');
+  assert.match(s.run(['sound']).out, /sound: +on for every task: tones \+ short sentences, system voice/);
+  assert.match(s.run(['sound', 'voice', 'off']).out, /tones only/);
+  s.run(['init', 'tonesonly'], { input: 'b' });
+  await s.settle();
+  assert.deepEqual(s.events().filter((e) => e.startsWith('brief')), ['brief:tone', 'brief:say', 'brief:tone'], 'voice off: tones only by default');
+  s.run(['abort']);
+  s.run(['sound', 'voice', 'on']);
+  assert.match(s.run(['sound', 'off']).out, /muted for every task/);
+  s.run(['init', 'muted', '--sound=full'], { input: 'b' });
   s.run(['note', '--as-user', 'hi']);
   await pause(800);
-  assert.equal(fs.existsSync(path.join(s.home, 'audio', 'queue')), false, 'nothing queued without --sound');
-  s.run(['abort']);
-  const r = s.run(['init', 'loud', '--sound'], { input: 'b', env: { COLLAB_SOUND: '0' } });
-  assert.equal(r.code, 0, r.err);
-  s.run(['note', '--as-user', 'hi'], { env: { COLLAB_SOUND: '0' } });
+  await s.settle();
+  const before = s.started().length;
+  s.run(['note', '--as-user', 'again']);
   await pause(800);
-  assert.deepEqual(s.started(), []);
-  // An old config.json without a 'sound' key still works.
-  fs.writeFileSync(path.join(s.home, 'config.json'), '{"phone_url":"https://ntfy.sh/x"}\n');
-  assert.match(s.run(['sound']).out, /only for tasks started with --sound/);
+  await s.settle();
+  assert.equal(s.started().length, before, 'a global mute silences even a task that asks for sound');
+  s.run(['abort']);
+  s.run(['sound', 'on']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.on, undefined);
+  await s.settle();
+  const m0 = s.started().length;
+  s.run(['init', 'envmute', '--sound'], { input: 'b', env: { COLLAB_SOUND: '0' } });
+  s.run(['note', '--as-user', 'hi'], { env: { COLLAB_SOUND: '0' } });
+  s.run(['abort'], { env: { COLLAB_SOUND: '0' } });
+  await pause(800);
+  await s.settle();
+  assert.equal(s.started().length, m0, 'COLLAB_SOUND=0 wins');
+  const n0 = s.started().length;
+  s.run(['init', 'quiet', '--sound=off'], { input: 'b' });
+  await pause(800);
+  await s.settle();
+  assert.equal(s.started().length, n0, 'COLLAB_SOUND=0 and --sound=off are silent');
+  assert.match(s.run(['status']).out, /sound: +silent/);
 });
 
 test('sound: --sound parsing, queue options and carrying on through a run', async () => {
@@ -2937,7 +2971,7 @@ test('sound: --sound parsing, queue options and carrying on through a run', asyn
   s.run(['abort']);
   r = s.run(['init', 'second', '--sound', 'tones'], { input: 'b' });
   assert.equal(s.state().options.sound, 'tones');
-  assert.match(r.out, /options: sounds\n/);
+  assert.match(r.out, /options: tones only\n/);
   s.run(['abort']);
   r = s.run(['init', 'third', '--sound=loud'], { input: 'b' });
   assert.equal(r.code, 1);
@@ -3176,7 +3210,7 @@ test('sound: config overrides, packs, explicit silence and custom sentences', as
   r = s.run(['sound', 'pack', pack]);
   assert.equal(r.code, 1, 'a missing file refuses the pack');
   assert.match(r.err, /note-\*: file not found/);
-  assert.equal(fs.existsSync(path.join(s.home, 'config.json')), false, 'nothing written');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.pack, undefined, 'nothing written');
   fs.writeFileSync(path.join(pack, 'missing.wav'), '');
   fs.writeFileSync(path.join(pack, 'x.wav'), '');
   r = s.run(['sound', 'pack', pack]);
@@ -3241,7 +3275,7 @@ test('sound: setup, on/off and the player and speech commands per platform', () 
   assert.match(s.run(['sound', 'off']).out, /muted/);
   assert.match(s.run(['sound']).out, /sound: +off: muted/);
   s.run(['sound', 'unmute']);
-  assert.match(s.run(['sound']).out, /only for tasks started with --sound/);
+  assert.match(s.run(['sound']).out, /on for every task/);
 
   // A real file name valid on every OS (no double quotes on Windows); quotes are tested in speech text.
   const odd = path.join(s.root, `it's odd ü 日本.mp3`);
@@ -3368,8 +3402,8 @@ test('elevenlabs: --sound=elevenlabs speaks through the API, caches, and never l
     const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY, STUB_SLEEP_MS: '300' } });
     let r = s.run(['init', 'Voice', '--sound', 'elevenlabs'], { input: 'b' });
     assert.equal(r.code, 0, r.err);
-    assert.equal(s.state().options.sound, 'elevenlabs');
-    assert.match(r.out, /options: sounds and ElevenLabs voice/);
+    assert.deepEqual([s.state().options.sound, s.state().options.sound_engine], ['voice', 'elevenlabs']);
+    assert.match(r.out, /options: sounds, ElevenLabs voice/);
     // Jobs waiting in the queue carry no key.
     s.run(['note', '--as-user', 'one']);
     s.run(['note', '--as-user', 'one']);
@@ -3513,7 +3547,7 @@ test('elevenlabs: setup commands, config key, voices, dry run and cache', async 
     s.run(['abort']);
     s.run(['queue', 'add', '--sound=elevenlabs', 'later']);
     s.run(['init', 'q', '--from-queue'], { input: 'b' });
-    assert.equal(s.state().options.sound, 'elevenlabs');
+    assert.deepEqual([s.state().options.sound, s.state().options.sound_engine], ['voice', 'elevenlabs']);
   } finally { api.close(); }
 });
 
@@ -3563,12 +3597,12 @@ test('sound: short sentences by default, full ones on request, custom sentences 
   assert.equal(s.state().options.sound, 'voice', 'the split part keeps the task option');
   s.run(['abort']);
   let r = s.run(['init', 'wordy', '--sound', 'full'], { input: 'b' });
-  assert.equal(s.state().options.sound, 'full');
-  assert.match(r.out, /options: sounds and full sentences/);
+  assert.deepEqual([s.state().options.sound, s.state().options.sound_style], ['voice', 'full']);
+  assert.match(r.out, /options: sounds, full sentences/);
   s.run(['submit', 'implementer', 'ready'], { input: 's' });
   s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   s.run(['init', 'carried'], { input: 'b' });
-  assert.equal(s.state().options.sound, 'full');
+  assert.deepEqual([s.state().options.sound, s.state().options.sound_style], ['voice', 'full']);
   await s.settle();
   const last = s.started().filter((x) => x.name === 'say').pop().argv.slice(-1)[0];
   assert.equal(last, 'carried: new task started. The implementer is working');
@@ -3611,7 +3645,7 @@ test('elevenlabs: style_exaggeration is separate from the sentence style; old nu
     const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
     const cfgFile = path.join(s.home, 'config.json');
     fs.mkdirSync(s.home, { recursive: true });
-    const write = (voice) => fs.writeFileSync(cfgFile, JSON.stringify({ sound: { voice } }));
+    const write = (voice) => fs.writeFileSync(cfgFile, JSON.stringify({ sound: { voice: { name: true, ...voice } } }));
     const settingsOf = async (what) => { await s.runAsync(['sound', 'test', what, '--elevenlabs']); return api.reqs[api.reqs.length - 1].body; };
     write({ engine: 'elevenlabs', style: 0 });
     let b = await settingsOf('approve');
@@ -3650,4 +3684,222 @@ test('sound: a generated pack keeps the quiet agent of idle at run time', async 
   await s.settle();
   const said = s.started().filter((r) => r.name === 'say' && r.event === 'idle').map((r) => r.argv[r.argv.length - 1]);
   assert.deepEqual(said, ['gen: the reviewer is quiet', 'gen: the implementer is quiet'], 'the pack sentence wins even over --sound=full');
+});
+
+test('sound use: switches the running task over the global engine and style, and back', async () => {
+  const api = await fakeElevenLabs(() => ({}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
+    fs.mkdirSync(s.home, { recursive: true });
+    fs.writeFileSync(path.join(s.home, 'config.json'), JSON.stringify({ sound: { voice: { name: true, engine: 'elevenlabs', style: 'full' } } }));
+    s.run(['init', 'Mix'], { input: 'b' });
+    await s.settle();
+    assert.equal(api.reqs.length, 1);
+    assert.equal(api.reqs[0].body.text, 'mix: new task started. The implementer is working', 'global ElevenLabs + full');
+    // This task only: the system voice and short sentences. Nothing global changes.
+    let r = s.run(['sound', 'use', 'system', 'short']);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /tones \+ short sentences, system voice \(from the next event/);
+    s.run(['note', '--as-user', 'x']);
+    await s.settle();
+    assert.equal(api.reqs.length, 1, 'no request for the system voice');
+    const said = s.started().filter((x) => x.name === 'say').map((x) => `${x.event}: ${x.argv.slice(-1)[0]}`);
+    assert.deepEqual(said, ['sound-change: mix: tones + short sentences, system voice', 'note-all: mix: note added']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8')).sound.voice, { name: true, engine: 'elevenlabs', style: 'full' });
+    // Back to ElevenLabs with full sentences, then to the user's settings.
+    s.run(['sound', 'use', 'elevenlabs', 'full']);
+    s.run(['note', '--as-user', 'y']);
+    await s.settle();
+    assert.equal(api.reqs[api.reqs.length - 1].body.text, 'mix: your note for both agents was added');
+    r = s.run(['sound', 'use', 'default']);
+    assert.equal(r.code, 0);
+    const o = s.state().options;
+    assert.equal(o.sound, undefined);
+    assert.equal(o.sound_engine, undefined);
+    assert.equal(o.sound_style, undefined);
+    assert.equal(s.state().sound_changes.length, 3);
+    // tones / off for this task; a voice word turns the voice back on even over voice.on: false.
+    fs.writeFileSync(path.join(s.home, 'config.json'), JSON.stringify({ sound: { voice: { name: true, on: false } } }));
+    s.run(['sound', 'use', 'off']);
+    const n0 = s.started().length;
+    s.run(['note', '--as-user', 'z']);
+    await pause(600);
+    await s.settle();
+    assert.equal(s.started().length, n0, 'off: silent, no confirmation either');
+    s.run(['sound', 'use', 'short']);
+    await s.settle();
+    assert.equal(s.started().filter((x) => x.name === 'say').pop().argv.slice(-1)[0], 'mix: tones + short sentences, system voice');
+    assert.equal(s.state().options.sound, 'voice');
+  } finally { api.close(); }
+});
+
+test('sound use: never touches the protocol, carries on through the run, refuses bad input', async () => {
+  const s = soundBox();
+  s.run(['init', 'proto'], { input: 'b' });
+  s.run(['progress', 'working on it']);
+  const strip = (st) => { const c = { ...st, options: undefined, sound_changes: undefined, audio_claims: undefined }; return JSON.stringify(c); };
+  let before = strip(s.state());
+  assert.equal(s.run(['sound', 'use', 'tones'], { env: { CLAUDECODE: '1' } }).code, 0, 'from an agent shell too');
+  assert.equal(strip(s.state()), before, 'implementer turn: only the sound fields change');
+  assert.equal(s.state().sound_changes[0].by, 'agent');
+  s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Q?\n1. a\n2. b\n' });
+  before = strip(s.state());
+  assert.equal(s.run(['sound', 'use', 'voice', 'full']).code, 0);
+  assert.equal(strip(s.state()), before, 'pending decision kept');
+  assert.equal(s.state().status, 'DECISION');
+  s.run(['answer', '1']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  before = strip(s.state());
+  assert.equal(s.run(['sound', 'use', 'elevenlabs']).code, 0, "on the reviewer's turn");
+  assert.equal(strip(s.state()), before);
+  // Contradictions and unknown words change nothing.
+  const opts = JSON.stringify(s.state().options);
+  for (const bad of [['tones', 'full'], ['system', 'elevenlabs'], ['short', 'full'], ['loud'], ['default', 'tones'], []]) {
+    const r = s.run(['sound', 'use', ...bad]);
+    assert.equal(r.code, 1, bad.join(' '));
+    assert.equal(JSON.stringify(s.state().options), opts);
+  }
+  assert.match(s.run(['sound', 'use', 'elevenlabs']).out, /no ElevenLabs API key/);
+  // The rest of the run keeps it.
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  assert.equal(s.run(['sound', 'use', 'system']).code, 0, 'a DONE task whose run goes on');
+  s.run(['init', 'next'], { input: 'b' });
+  assert.deepEqual([s.state().options.sound, s.state().options.sound_engine, s.state().options.sound_style], ['voice', 'system', 'full']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['end'], { input: '## Final report\nok\n' });
+  assert.equal(s.run(['sound', 'use', 'tones']).code, 1, 'refused after the run ended');
+  s.run(['init', 'fresh'], { input: 'b' });
+  assert.equal(s.state().options.sound_engine, undefined, 'a new run starts from the config');
+  s.run(['abort']);
+  assert.equal(s.run(['sound', 'use', 'tones']).code, 1, 'refused on an aborted task');
+  // A legacy combined value (older state) is split into fields when changed in part.
+  s.run(['init', 'legacy', '--force'], { input: 'b' });
+  const sf = path.join(s.taskDir(), 'state.json');
+  const old = JSON.parse(fs.readFileSync(sf, 'utf8'));
+  old.options = { sound: 'full' };
+  fs.writeFileSync(sf, JSON.stringify(old));
+  assert.match(s.run(['status']).out, /sound: +tones \+ full sentences, system voice/);
+  s.run(['sound', 'use', 'elevenlabs']);
+  assert.deepEqual([s.state().options.sound, s.state().options.sound_engine, s.state().options.sound_style], ['voice', 'elevenlabs', 'full']);
+  // Mute wins over a task switch, and the command says so.
+  s.run(['sound', 'off']);
+  assert.match(s.run(['sound', 'use', 'voice']).out, /but sound is muted/);
+  assert.match(s.run(['sound', 'use', 'voice']).out, /muted \('collab sound off'\), so nothing plays until you run 'collab sound on'/);
+  s.run(['sound', 'on']);
+  const env0 = s.run(['sound', 'use', 'voice'], { env: { COLLAB_SOUND: '0' } }).out;
+  assert.match(env0, /COLLAB_SOUND=0 is set in this shell.*unset it/);
+  assert.ok(!/collab sound on/.test(env0), "'collab sound on' can't override the environment");
+  await s.settle();
+});
+
+test('sound use: an explicit --sound beats the run, and later split parts get the latest switch', async () => {
+  const s = soundBox({ env: { COLLAB_SOUND: '0' } });
+  const fields = () => { const o = s.state().options; return [o.sound, o.sound_engine, o.sound_style]; };
+  s.run(['init', 'one'], { input: 'b' });
+  s.run(['sound', 'use', 'system', 'short']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'two', '--sound=elevenlabs'], { input: 'b' });
+  assert.deepEqual(fields(), ['voice', 'elevenlabs', 'short'], 'the flag beats the inherited engine; the style carries on');
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'three', '--sound', 'full'], { input: 'b' });
+  assert.deepEqual(fields(), ['voice', 'elevenlabs', 'full'], 'the flag beats the inherited style');
+  s.run(['abort']);
+  // Split first, switch after: the next part follows the switch, not the split's snapshot.
+  s.run(['init', 'big'], { input: 'b' });
+  s.run(['sound', 'use', 'system', 'full']);
+  s.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n=== part ===\nthree\n' });
+  s.run(['sound', 'use', 'elevenlabs', 'short']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'big-2', '--from-queue'], { input: 'b' });
+  assert.deepEqual(fields(), ['voice', 'elevenlabs', 'short']);
+  // An explicit flag on the part's init still wins.
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'big-3', '--from-queue', '--sound=tones'], { input: 'b' });
+  assert.deepEqual(fields(), ['tones', 'elevenlabs', 'short']);
+  s.run(['abort']);
+  // A reset after the split also reaches the next part: cleared fields stay cleared.
+  s.run(['init', 'reset'], { input: 'b' });
+  s.run(['sound', 'use', 'system', 'full']);
+  s.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n' });
+  s.run(['sound', 'use', 'default']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'reset-2', '--from-queue'], { input: 'b' });
+  assert.deepEqual(fields(), [undefined, undefined, undefined], 'follows the config again');
+  s.run(['abort']);
+  // A queued task's own --sound beats the run it starts in.
+  s.run(['init', 'host'], { input: 'b' });
+  s.run(['sound', 'use', 'system']);
+  s.run(['queue', 'add', '--sound=elevenlabs', 'later']);
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['init', 'later', '--from-queue'], { input: 'b' });
+  assert.deepEqual(fields(), ['voice', 'elevenlabs', undefined]);
+});
+
+test('sound: the task name is left out by default; voice name on brings it back', async () => {
+  const s = soundBox({ named: false });
+  s.run(['init', 'dark mode'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  await s.settle();
+  const said = () => s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
+  assert.deepEqual(said(), ['New task', 'Ready, round 1', 'Changes, round 2']);
+  assert.match(s.run(['sound']).out, /task name left out/);
+  assert.match(s.run(['sound', 'test', 'decide', '--full', '--dry-run']).out, /speech "Your decision is needed\. Which theme/);
+  assert.match(s.run(['sound', 'events']).out, /short: "Plan ready"/);
+  assert.equal(s.run(['sound', 'voice', 'name', 'on']).code, 0);
+  s.run(['note', '--as-user', 'n']);
+  await s.settle();
+  assert.equal(said().pop(), 'dark mode: note added');
+  assert.equal(s.run(['sound', 'voice', 'name', 'maybe']).code, 1);
+  // A custom sentence keeps {task} either way.
+  s.run(['sound', 'voice', 'name', 'off']);
+  const cfgFile = path.join(s.home, 'config.json');
+  const conf = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+  conf.sound.events = { approve: { say: '{task} is done' } };
+  fs.writeFileSync(cfgFile, JSON.stringify(conf));
+  assert.match(s.run(['sound', 'test', 'approve', '--dry-run']).out, /speech "dark mode is done"/);
+});
+
+test('sound: jobs of a task keep their order in the same millisecond, whatever the PIDs', async () => {
+  const s = soundBox();
+  s.run(['init', 'order'], { input: 'b' });
+  await s.settle();
+  // Hold the queue: a live lock owner (this test process) makes every drainer leave the jobs alone.
+  const lock = path.join(s.home, 'audio', '.lock');
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} test`);
+  const frozen = path.join(s.root, 'clock.js');
+  fs.writeFileSync(frozen, `Date.now = () => ${Date.now()};\n`);
+  const runFrozen = (args) => spawnSync(process.execPath, ['-r', frozen, CLI, ...args], {
+    cwd: s.project, encoding: 'utf8', env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0', COLLAB_TASK: '', ...NO_AGENT, ...NO_ELEVENLABS,
+      COLLAB_SOUND: '', COLLAB_SOUND_BIN: s.bin, COLLAB_SOUND_SYSTEM_DIR: s.sys, COLLAB_SOUND_PLATFORM: 'darwin', STUB_LOG: s.log },
+  });
+  // A note (advances seq), then a 'sound use' (keeps seq), then another note: one millisecond.
+  runFrozen(['note', '--as-user', 'one']);
+  runFrozen(['sound', 'use', 'full']);
+  runFrozen(['note', '--as-user', 'two']);
+  const q = path.join(s.home, 'audio', 'queue');
+  let jobs = fs.readdirSync(q).filter((f) => f.endsWith('.json')).sort();
+  assert.equal(jobs.length, 3);
+  assert.equal(new Set(jobs.map((f) => f.split('-')[0])).size, 1, 'all in one millisecond');
+  const counters = jobs.map((f) => parseInt(f.split('-')[1], 10));
+  assert.ok(counters.every((n, k) => k === 0 || n > counters[k - 1]), `strictly increasing counters: ${counters}`);
+  // Reverse the PID tokens (the earliest job gets the highest PID): the order must not change.
+  const pids = jobs.map((f) => f.split('-')[2]).reverse();
+  jobs.forEach((f, k) => { const p = f.split('-'); p[2] = pids[k]; fs.renameSync(path.join(q, f), path.join(q, p.join('-'))); });
+  jobs = fs.readdirSync(q).filter((f) => f.endsWith('.json')).sort();
+  assert.deepEqual(jobs.map((f) => JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')).steps[0].event), ['note-all', 'sound-change', 'note-all']);
+  // And it plays in that order.
+  fs.rmSync(lock, { recursive: true, force: true });
+  const n0 = s.started().length;
+  await s.runAsync(['sound', 'drain']);
+  await s.settle();
+  assert.deepEqual(s.started().slice(n0).map((r) => r.event), ['note-all', 'note-all', 'sound-change', 'sound-change', 'note-all', 'note-all']);
 });

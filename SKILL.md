@@ -53,7 +53,7 @@ dark mode`. Pass them straight to `collab init`:
 | `--branch NAME` | work on this branch |
 | `--commit` | commit the task's changes when it's DONE (never push) |
 | `--phone` | push the moments that need the user to their phone; later tasks of the run keep it |
-| `--sound[=tones\|full\|elevenlabs]` | a sound and a short spoken update at every step, so the user knows where the run is by ear (`tones`: no voice; `full`: full sentences; `elevenlabs`: spoken by ElevenLabs, system voice as fallback); later tasks of the run keep it |
+| `--sound=tones\|off\|full\|elevenlabs` | sound is on by default (a tone and a few words per step); this sets it for this run: tones only, silent, full sentences, or spoken by ElevenLabs; later tasks of the run keep it |
 
 `collab init` adds a *Task options* section to the brief, so the reviewer sees them too.
 
@@ -512,6 +512,25 @@ scope is broken, access or credentials are missing, or the next step is destruct
 irreversible and the user hasn't approved it. Give a clear question. After escalating, stop and
 report to the user.
 
+## Sound on request (either role)
+
+Collab plays a tone and says a few words at every step (on by default). When the user asks you, in
+words, to change that during a run, change it **for this run** with
+`collab -t <id> sound use <words>`, tell them its one-line result (including any mute or missing key
+it reports), and carry on:
+
+| The user asks… | Run |
+|---|---|
+| mute / no sound for this run | `sound use off` |
+| sound back on | `sound use voice` |
+| only tones, no voice | `sound use tones` |
+| the ElevenLabs voice / my computer's voice | `sound use elevenlabs` / `sound use system` |
+| more detail / shorter | `sound use full` / `sound use short` |
+| back to my usual settings | `sound use default` |
+
+Change the permanent settings (`collab sound off`, `collab sound voice …`) only when the user
+explicitly asks for a permanent change. Never change sound on your own initiative.
+
 ## Human controls
 
 - `collab watch`: interactive dashboard: ↑↓ steps in full, ←→ earlier tasks, live progress, timers
@@ -524,5 +543,5 @@ report to the user.
 - `collab queue add [options] "…"`, `collab queue`, `collab queue rm N`: manage the task queue
 - `collab queue split [--reason TEXT]`: implementer only, split the current task (see *Splitting a task*)
 - `collab lessons [add "…" | rm N]`: the project's lessons; `collab phone [set … | test]`: where `--phone` pushes go
-- `collab sound [setup | test | set | pack …]`: the sounds and spoken sentences of `--sound` tasks
+- `collab sound [setup | test | set | pack | off | on …]`: the sounds and spoken updates (on by default)
 State lives in `~/.collab/tasks/<task-id>/` (`state.json`, `log.md`, `entries/`).
