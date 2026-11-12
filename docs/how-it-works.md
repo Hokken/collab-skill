@@ -23,6 +23,12 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
                                      DONE ◀─────────────── collab submit reviewer approve
 ```
 
+- **Starting early:** the implementer runs `init` with a brief written from the user's request,
+  then investigates the code (posting `progress`), so the user can start the reviewer at once. The
+  reviewer reads the brief and investigates read-only in parallel, between short
+  `wait reviewer --timeout 0` checks (they keep its claim fresh and catch the handoff), and sends a
+  note only for a finding that would change the approach. A reviewer never posts `progress` before
+  it holds the turn: progress is recorded for the turn holder.
 - **Waiting** is `collab wait <role>`: it polls the state file every few seconds and returns
   when it's your turn or the task ends. It uses no model tokens.
 - **Plan mode** (`init --plan`) adds a first phase: `PLANNING → PLAN_REVIEW → (PLAN_CHANGES …)`.

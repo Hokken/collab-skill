@@ -174,7 +174,10 @@ collab -t <id> progress "fixing item 2: missing null check in parser.ts"
 ```
 
 - Post one when your turn starts, before anything long (tests, builds, large reads), and when you
-  move to the next item. Typically 3–8 per turn. **Never on a timer**, and never in a loop.
+  move to the next item, including during the implementer's investigation after `init`. Typically
+  3–8 per turn. **Never on a timer**, and never in a loop.
+- Only while **you** hold the turn: a progress update is recorded for the turn holder, so a reviewer
+  investigating early (before the first handoff) never posts one.
 - Keep it short and concrete (under ~80 characters): *what* you're doing, not how you feel.
 - It isn't a handoff: it doesn't pass the turn or add a timeline entry. It does count as a sign
   of life, so a long but active turn won't be flagged as unresponsive.
@@ -214,7 +217,12 @@ you to stop, they will interrupt you.
 
 ## Implementer loop
 
-1. **Start the task.** Turn the user's request into a brief, then run
+1. **Start the task, then investigate.** Start it as soon as the goal and acceptance criteria are
+   clear from the user's request, so the user gets the reviewer command at once and both agents
+   investigate in parallel. Before `init`, only take a quick look (the project's CLAUDE.md /
+   AGENTS.md, the top-level layout); the code investigation comes after it. Write the brief from
+   the request: what the user wants, not the solution you have in mind. `## Scope` can say what is
+   still to be confirmed, and anything unclear goes under `## Open questions`. Then run
    `collab init <short-slug> [--plan] [--max-rounds N]` from the project directory:
    ```
    collab init dark-mode <<'EOF'
@@ -226,6 +234,8 @@ you to stop, they will interrupt you.
    - …
    ## Constraints
    (project rules, things not to touch)
+   ## Open questions          (optional)
+   what the investigation must settle
    ## Deliverables
    (only if the task produces documents) where they go: the project's convention if it has one
    (CLAUDE.md / AGENTS.md, or an existing folder such as `.agents/plans/<slug>/`), otherwise
@@ -243,9 +253,16 @@ you to stop, they will interrupt you.
    project folder, or to use the pinned commands `/collab review <task-id>` and
    `collab -t <task-id> watch`.
    If `init` printed a `phone:` line, pass it on too (a `NEW` one means they must subscribe first).
-   If the request has several stages (a staged plan, a list of deliverables) or is too big for
-   one review, split it now into **all** its parts (see *Splitting a task*), not just the first
-   few. Leave stages out only if the user explicitly asked for a subset.
+   If the request already shows several stages (a staged plan, a list of deliverables) or is too
+   big for one review, split it now into **all** its parts (see *Splitting a task*), not just the
+   first few, then investigate. Leave stages out only if the user explicitly asked for a subset.
+   **Then investigate** the code the task touches, posting a `collab progress` update at each real
+   step (see *Progress updates*), so a long investigation is never mistaken for an unresponsive
+   agent. If it shows that the task should be split after all, split before your first `plan` or
+   `ready` (the CLI refuses later). If it changes what the user asked for (an acceptance criterion
+   can't hold, the request rests on a wrong assumption), ask them with `decide`. Everything else it
+   finds (scope corrections, risks) goes in your plan (`## Risks / open questions`) or, without a
+   plan phase, in your summary; the brief itself stays as it is.
    In plan mode, go through the *Plan phase* first, then continue at step 2.
 2. **Implement.** Follow the project's own rules (CLAUDE.md / AGENTS.md: commits, dev servers
    and so on). If the task has a `--branch`, create or switch to it before changing anything.
@@ -329,8 +346,9 @@ or a plan with stages. Split it into every part the request covers, so the pair 
 all of them. Don't split small tasks. Each part must be something the reviewer can approve on its own, and
 it must leave the project working.
 
-Split **right after `collab init`**, before your first `plan` or `ready`. The CLI refuses later
-on, refuses to split twice, and refuses to split a task that is already a part. Always use
+Split **right after `collab init`** when the request already shows the parts, otherwise as soon as
+your investigation shows the need, and in any case before your first `plan` or `ready`. The CLI
+refuses later on, refuses to split twice, and refuses to split a task that is already a part. Always use
 `queue split`, never a series of `queue add` calls: it keeps the parts in order, at the front of
 the queue, with the task's options (`--check`, `--scope`, `--branch`, `--commit`, …).
 
@@ -356,8 +374,8 @@ EOF
 
 ## Plan phase (only for tasks started with `--plan`)
 
-- **Implementer:** explore the code without changing any project files, then run
-  `collab submit implementer plan`:
+- **Implementer:** your investigation after `init` (step 1) is the exploration for the plan: don't
+  change any project files during it. Then run `collab submit implementer plan`:
   ```
   ## Approach
   the chosen design and why; alternatives considered
@@ -382,16 +400,31 @@ EOF
 
 1. **Join** with `collab -t <task-id> join` if you were given a task id, else `collab join` (it
    only looks at the project of the folder you're in). It blocks until an active task exists,
-   then prints the brief. The implementer may take several minutes to write the brief. On exit 11,
-   run the same `join` again, as many times as it takes (see *How to wait*). Never end your turn
-   with "no active task".
+   then prints the brief. The implementer usually starts the task within minutes of the request,
+   but it can take longer. On exit 11, run the same `join` again, as many times as it takes (see
+   *How to wait*). Never end your turn with "no active task".
    **Exit 1 with "already has a reviewer"** means another reviewer is working on that task (often
    another pair's), and **"several projects"** means your folder matches more than one active
    task. Don't pick one yourself: stop, show the user the message, and let them restart you with
    the right task id or folder. Use `join --force` only when the user says the earlier reviewer
    of that task is gone.
-2. **Wait** with `collab wait reviewer`.
-3. **Review** (on exit 0):
+2. **Investigate early** (each new task, once, right after `join`): while the implementer
+   investigates and plans, read the brief and study the code it touches, read-only, so your first
+   review starts informed and independent of the implementer's plan. Keep your notes in the scratch
+   folder, never in the project.
+   - Work in short chunks, and between them run `collab -t <id> wait reviewer --timeout 0` (OpenCode:
+     with the next `--attempt`). It keeps your claim on the task fresh and tells you whether the
+     handoff has arrived: on exit 0, stop investigating and go straight to step 4 with that output;
+     on exit 11, carry on; exit 10, 13 or 16, handle them as for any `wait` (step 6, *The other agent
+     looks unresponsive*, *Decisions for the user*).
+   - **Don't post `collab progress` before you have the turn**: it is recorded for whoever holds the
+     turn, so it would count as the implementer's activity.
+   - Send a note (`collab -t <id> note --from reviewer "…"`) only for a finding that would change the
+     approach: a missed constraint, a wrong assumption in the brief, a part the request needs but the
+     brief lacks. Everything else waits for your review.
+   - When there is nothing more worth reading, go to step 3.
+3. **Wait** with `collab wait reviewer`.
+4. **Review** (on exit 0):
    - Treat the implementer's summary as a guide, not proof. Run `collab diff --stat`, then
      `collab diff` (or read the files) to see the real changes. From round 2 on, start with
      `collab diff --since-review` (only what changed since your last review) and open the full
@@ -425,7 +458,7 @@ EOF
      split itself is wrong (a part can't stand on its own, or leaves the project broken), say
      so as a blocking item.
    - If the status is `PLAN_REVIEW`, follow the *Plan phase* rules instead.
-4. **Decide:**
+5. **Decide:**
    - Blocking issues found → `collab submit reviewer changes`:
      ```
      ## Verdict: changes requested
@@ -434,7 +467,7 @@ EOF
      ## Nits (optional, non-blocking)
      ## Decisions taken (only for judgment calls you made yourself, see *Escalation*)
      ```
-     Then go back to step 2.
+     Then go back to step 3 (wait; the early investigation is only for a new task).
    - Nothing blocking → `collab submit reviewer approve` with a short verdict and any nits.
      In the build phase, this ends the task for both agents. There, add a short `## For the user`
      section: the riskiest changes, invariants worth protecting, and what to try to break by hand.
@@ -446,11 +479,11 @@ EOF
      run `collab -t <id> submit reviewer approve --rereviewed` (it covers the files as they were
      when the approve was refused); if the changes matter, submit `changes`. Your own test runs
      can cause this when they leave files behind that git doesn't ignore.
-5. On **exit 10** (from `wait`, or from your own `approve`):
+6. On **exit 10** (from `wait`, or from your own `approve`):
    - If the status is **DONE**, the implementer may have more tasks to do. Run
      `collab join --after <id>` (without `-t`; `<id>` is the task that just finished) and wait as
      in *How to wait*:
-     - **exit 0:** a new task started. Pin its new id and go to step 2.
+     - **exit 0:** a new task started. Pin its new id and go to step 2 (investigate it early).
      - **exit 10:** with `WORK COMPLETE`, the implementer ended the run; with `TASK FINISHED`, a
        later task ended without approval. Either way, stop and give the user a short final report.
      - **exit 13:** the implementer hasn't started anything new for a long time. Handle it as in
