@@ -271,6 +271,10 @@ Reference and config format: [reference.md](reference.md#sounds-and-speech).
   detached `collab sound drain`. One drainer at a time holds `audio/.lock` and plays the jobs
   oldest first, each step to the end (tone 30 s, sentence 60 s at most); others exit and leave it
   their jobs. A drainer whose owner died is taken over only after the player it started is gone.
+  While it plays a job, the drainer keeps the steps still to come in `audio/playing.json`; a
+  drainer that finds one (its predecessor was stopped mid-job) plays those steps first, unless
+  they are stale. A step that fails or is cut off is recorded in `audio/problems.json` (the last
+  20, with the shell the drainer was started from), which `collab sound` lists.
   Jobs older than `COLLAB_SOUND_STALE_SECS` (120) are dropped.
 - **ElevenLabs** (`--sound=elevenlabs`, or `sound.voice.engine: "elevenlabs"`): the drainer, never the
   command, turns each sentence into an mp3 (`POST /v1/text-to-speech/<voice_id>`, cached in
@@ -387,7 +391,7 @@ work go where the brief's `## Deliverables` line says.
   current                          id of the most recent task
   queue.json                       queued tasks, each with its project folder and options
   config.json                      settings: phone_url (where --phone tasks push to), sound
-  audio/                           queue/ of sounds waiting to play, .lock of the drainer, claims.json
+  audio/                           queue/ of sounds waiting to play, .lock of the drainer, claims.json, playing.json, problems.json
   drafts/                          agents' drafts written before a task exists (e.g. a brief)
   tasks/<slug>-<YYYYMMDD-HHMMSS>/
     state.json                     status, turn, rounds, repos, progress, …

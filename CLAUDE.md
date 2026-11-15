@@ -125,7 +125,9 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   `state.json` `audio_claims`, `claimHomeEvent` in `audio/claims.json`). `resolveSound`: config
   `sound.events` > pack (`collab-sounds.json`, `readPack`) > `SYSTEM_SOUNDS`, most specific key first.
   Jobs go to `$COLLAB_HOME/audio/queue/`; a detached `collab sound drain` plays them one at a
-  time under `audio/.lock` (`tryAudioLock` waits for a dead drainer's `child` before taking over).
+  time under `audio/.lock` (`tryAudioLock` waits for a dead drainer's `child` before taking over; `playJob` keeps the steps to come in
+  `audio/playing.json`, which the next drainer finishes; failed or cut-off steps go to `audio/problems.json`
+  via `soundProblem`, listed by `collab sound`).
   `toneCommand`/`speechCommand` build per-platform commands; tests use `COLLAB_SOUND_PLATFORM`,
   `COLLAB_SOUND_BIN` (stub `<name>.js` players) and `COLLAB_SOUND_SYSTEM_DIR`.
   ElevenLabs (`--sound=elevenlabs` / `sound.voice.engine`): `jobVoice` is the allowlist a job carries (never the

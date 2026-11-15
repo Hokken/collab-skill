@@ -720,13 +720,50 @@ function stepCommand(step, job) {
   return cmd.why ? cmd : { ...cmd, env: { ...cmd.env, COLLAB_SOUND_EVENT: step.event || '' } };
 }
 
+// A tone or sentence that did not play leaves a line in audio/problems.json (the last 20), with
+// the shell the drainer was started from: an agent's sandbox can allow the tone player and not the
+// speech service. 'collab sound' lists them.
+const playingFile = () => path.join(audioDir(), 'playing.json');
+const problemsFile = () => path.join(audioDir(), 'problems.json');
+const readAudioJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+function writeAudioJson(f, v) {
+  try {
+    fs.mkdirSync(audioDir(), { recursive: true });
+    fs.writeFileSync(`${f}.${process.pid}.tmp`, JSON.stringify(v));
+    retry(() => fs.renameSync(`${f}.${process.pid}.tmp`, f));
+  } catch { /* best effort */ }
+}
+function shellName() {
+  const e = process.env;
+  if (e.CLAUDECODE === '1') return "Claude Code's shell";
+  if (e.CODEX_THREAD_ID || e.CODEX_SESSION_ID || e.CODEX_SANDBOX || e.CODEX_SANDBOX_NETWORK_DISABLED) return "Codex's shell";
+  if (e.OPENCODE === '1') return "OpenCode's shell";
+  return e.COLLAB_AGENT ? "an agent's shell" : 'your own terminal';
+}
+function soundProblem(p) {
+  const list = readAudioJson(problemsFile());
+  writeAudioJson(problemsFile(), [...(Array.isArray(list) ? list : []), { at: Date.now(), from: shellName(), ...p }].slice(-20));
+}
+
+// The drainer notes which step it is on and what is still to come (audio/playing.json), so one
+// that is stopped half-way (its shell or sandbox ended, a crash) doesn't lose the sentence after a
+// tone: the next drainer finds the note and plays the rest (see soundDrain).
 async function playJob(job, lock) {
-  for (const step of job.steps || []) {
-    if (step.say) { await speakStep(step, job, lock); continue; }
+  const steps = job.steps || [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    writeAudioJson(playingFile(), { at: job.at, task: job.task, volume: job.volume, voice: job.voice, event: step.event, say: !!step.say, from: shellName(), steps: steps.slice(i + 1) });
+    if (step.say) {
+      const r = await speakStep(step, job, lock);
+      if (r.none || r.failed) soundProblem({ event: step.event, step: 'sentence', why: r.none || r.failed });
+      continue;
+    }
     const cmd = stepCommand(step, job);
     if (cmd.why) continue;
-    await runStep(cmd, 30000, lock);
+    const res = await runStep(cmd, 30000, lock);
+    if (!res.ok) soundProblem({ event: step.event, step: 'tone', why: res.why });
   }
+  try { fs.rmSync(playingFile(), { force: true }); } catch { /* best effort */ }
 }
 
 async function soundDrain() {
@@ -734,6 +771,16 @@ async function soundDrain() {
     const lock = await tryAudioLock();
     if (!lock) return;
     try {
+      // Left by a drainer that was stopped in the middle of a job: finish what it had not started.
+      const cut = readAudioJson(playingFile());
+      if (cut) {
+        try { fs.rmSync(playingFile(), { force: true }); } catch { /* best effort */ }
+        const rest = Array.isArray(cut.steps) ? cut.steps : [];
+        const fresh = Date.now() - cut.at <= SOUND_STALE_MS;
+        soundProblem({ event: cut.event, step: cut.say ? 'sentence' : 'tone', from: cut.from,
+          why: `the process playing it was stopped${rest.length ? (fresh ? '; the rest was played late' : '; the rest was dropped as too old') : ''}` });
+        if (rest.length && fresh) await playJob({ ...cut, steps: rest }, lock);
+      }
       for (;;) {
         const jobs = pendingJobs();
         if (!jobs.length) break;
@@ -1107,6 +1154,13 @@ function soundStatus() {
   }
   const problems = soundProblems(cfg);
   if (problems.length) { out('problems:'); for (const p of problems) out(`  ✗ ${p}`); }
+  const recent = (readAudioJson(problemsFile()) || []).slice(-5).reverse();
+  if (recent.length) {
+    out('not played lately (newest first):');
+    for (const p of recent) {
+      out(`  ${fmtDur(Math.max(0, Math.floor((Date.now() - p.at) / 1000)))} ago  '${p.event}' ${p.step}: ${p.why} (played from ${p.from})`);
+    }
+  }
 }
 
 // collab [-t ID] sound use <word>...: change the sound of the running task (and so the rest of its

@@ -3247,6 +3247,30 @@ test('sound: a dead drainer is taken over only after the sound it started has fi
   }
 });
 
+test('sound: a drainer stopped after the tone does not lose the sentence, and collab sound says what was not played', async () => {
+  const s = soundBox({ env: { STUB_SLEEP_MS: '1500' } });
+  s.run(['init', 'cut'], { input: 'b' });
+  let first;
+  for (let i = 0; i < 100 && !first; i++) { await pause(100); first = s.started()[0]; }
+  assert.ok(first && first.name === 'afplay', 'the tone started');
+  process.kill(parseInt(fs.readFileSync(path.join(s.home, 'audio', '.lock', 'owner'), 'utf8'), 10), 'SIGKILL');
+  await pause(200);
+  assert.equal(s.started().length, 1, 'the sentence was lost with its drainer');
+  s.run(['note', '--as-user', 'after the crash']);
+  await s.settle();
+  const said = s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
+  assert.deepEqual(said, ['cut: new task', 'cut: note added'], 'the next drainer says it first, then its own');
+  let out = s.run(['sound']).out;
+  assert.match(out, /not played lately \(newest first\):\n +\S+ ago {2}'brief' tone: the process playing it was stopped; the rest was played late \(played from your own terminal\)/);
+
+  const bad = soundBox({ env: { STUB_EXIT: '3' } });
+  bad.run(['init', 'fail'], { input: 'b' });
+  await bad.settle();
+  out = bad.run(['sound'], { env: { CLAUDECODE: '1' } }).out;
+  assert.match(out, /'brief' sentence: exit code 3 \(played from your own terminal\)\n +\S+ ago {2}'brief' tone: exit code 3/);
+  assert.doesNotMatch(soundBox().run(['sound']).out, /not played lately/);
+});
+
 test('sound: idle, stall, confirm-first and agent waits sound once per episode', async () => {
   const s = soundBox({ env: { COLLAB_IDLE_SECS: '1' } });
   s.run(['init', 'idle', '--sound=tones'], { input: 'b' });

@@ -156,6 +156,11 @@ plays. `collab sound test <event | file>` plays it now and prints the exact comm
 and sounds never overlap: they wait in a queue and play one after the other, while the command
 itself returns at once. A sound never changes a command's result.
 
+Heard a tone without its sentence? `collab sound` ends with a *not played lately* list: which
+event, tone or sentence, why (the player's exit code, or its process was stopped), and whose shell
+it was played from. A sentence cut off because the playing process was stopped is said by the
+next event's player, if it is less than two minutes old.
+
 ### Your own sounds
 
 `~/.collab/config.json` (edit it, or use the commands):
