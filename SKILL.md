@@ -91,7 +91,8 @@ contains this SKILL.md; its name may be `Collab` or `collab`). Run `collab help`
   `14` = submit refused because the task's `--check` failed, `15` = the queue is empty,
   `16` = the user has to choose and you present it: the other agent asked, or (implementer only)
   the round limit was reached (see *Decisions for the user*), `17` = the project files changed
-  since the review (a refused `approve`) or since the approval (`collab verify`), `1` = error.
+  since the implementer's handoff (a refused `approve` or `changes`) or since the approval
+  (`collab verify`), `1` = error.
   For `join --after`, `10` also means the implementer ended the run.
 - **Start both agents from the same project folder** when you can. A folder and the folders
   inside it count as one project (e.g. a repo root and a module in it), so tasks and the queue
@@ -226,11 +227,17 @@ you to stop, they will interrupt you.
    clear from the user's request, so the user gets the reviewer command at once and both agents
    investigate in parallel. Before `init`, only take a quick look (the project's CLAUDE.md /
    AGENTS.md, the top-level layout); the code investigation comes after it. Write the brief from
-   the request: what the user wants, not the solution you have in mind. `## Scope` can say what is
-   still to be confirmed, and anything unclear goes under `## Open questions`. Then run
+   the request: what the user wants, not the solution you have in mind. Start it with
+   `## Request`: the user's own words for this task, copied word for word (for one stage of a
+   larger request, the part of their message that covers it; never a paraphrase). The reviewer
+   judges your work against it, so a requirement you misread doesn't pass through both of you.
+   `## Scope` can say what is still to be confirmed, and anything unclear goes under
+   `## Open questions`. Then run
    `collab init <short-slug> [--plan] [--max-rounds N]` from the project directory:
    ```
    collab init dark-mode <<'EOF'
+   ## Request
+   > the user's message for this task, word for word
    ## Goal
    …
    ## Scope / files likely involved
@@ -248,7 +255,8 @@ you to stop, they will interrupt you.
    EOF
    ```
    The CLI snapshots every git repo under the project (nested ones too), so `collab diff` later
-   shows only what changed during this task. Tell the user the task id and the `reviewer:` command
+   shows only what changed during this task. If `init` prints a `request:` line, the brief had no
+   `## Request` section: send the user's words to the reviewer with the command it gives. Tell the user the task id and the `reviewer:` command
    `init` printed (e.g. `/collab review <task-id>`, Codex: `$collab review <task-id>`, OpenCode:
    "use the collab skill to review task <task-id>"), which pairs
    the reviewer with this task even if another pair is running, and that they can watch live with
@@ -337,7 +345,8 @@ folder, with its options.
    task under *Left in the queue*), then stop.
 2. Turn the task text into a brief as usual, then start it with
    `collab init <short-slug> --from-queue` (brief on stdin or `--file`). This removes the task
-   from the queue and applies its options. Pin the new task id with `-t`. For a CONFIRM FIRST
+   from the queue and applies its options. The CLI adds the queued text itself to the brief, so
+   leave `## Request` out. Pin the new task id with `-t`. For a CONFIRM FIRST
    task, add `--confirmed "<the user's answer>"`. The CLI refuses without it, and records the
    answer in the task's timeline.
 3. Tell the user which queued task you started and how many are left, then continue the
@@ -447,9 +456,15 @@ EOF
      `## Divergence from plan` is blocking; a declared one is judged on its merits.
    - Check them against the brief's acceptance criteria. Look for correctness, edge cases,
      regressions, security, and consistency with the surrounding code and project conventions.
+   - Check the brief itself against the user's own words (`## Request`, or `## Queued task, as it
+     was queued`): a goal or acceptance criterion that narrows, widens or misreads what was asked
+     is a blocking item, even when the build matches the brief. If the user must say which reading
+     is right, ask with `decide`.
    - You can run read-only checks (lint, type-check, tests; never mute the task's own commands, see
-     *The CLI*). **Don't edit project files**;
-     your only output is the review.
+     *The CLI*). **Don't edit project files**; your only output is the review. The CLI enforces
+     it: a `changes` or `approve` is refused (exit 17) when a project file changed since the
+     implementer's handoff. Never fix a finding yourself, and delete what your test runs leave
+     behind.
    - Stay within the brief's scope. Don't ask for unrelated refactors.
    - A new document outside the brief's `## Deliverables` location, or a handoff draft (brief,
      summary, review copy) written into the project, is a blocking item: it belongs in the
@@ -474,7 +489,19 @@ EOF
      ## Decisions taken (only for judgment calls you made yourself, see *Escalation*)
      ```
      Then go back to step 3 (wait; the early investigation is only for a new task).
-   - Nothing blocking → `collab submit reviewer approve` with a short verdict and any nits.
+     `[blocking]` is for what must change before the work can count as done: a bug, a missed
+     acceptance criterion, a false `Verified`, a broken project rule or lesson. `[should-fix]` is
+     worth doing while the implementer is there but would not stop an approval on its own.
+     The CLI refuses (exit 1) a build `changes` without a numbered `[blocking]` item, so a round
+     is never spent on should-fix items and nits alone. Don't promote an item to get a round:
+     if it really must change, it was blocking.
+     **Exit 17** from `changes`: project files changed during your review. Undo your own edits
+     and delete your test leftovers, then submit again. Only for a change that isn't yours to
+     undo (the user edited a file), check it against your review and submit with
+     `changes --rereviewed`; the CLI tells the implementer which files changed.
+   - Nothing blocking → `collab submit reviewer approve` with a short verdict, any remaining
+     `[should-fix]` items and nits. Put the should-fix items the user should still know about
+     under `## For the user`, so they reach the final report.
      In the build phase, this ends the task for both agents. There, add a short `## For the user`
      section: the riskiest changes, invariants worth protecting, and what to try to break by hand.
      `collab end` passes it on to the user.

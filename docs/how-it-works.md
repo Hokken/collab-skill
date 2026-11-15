@@ -36,7 +36,14 @@ follow `SKILL.md` as instructions) and run shell commands can take either role.
 - **Verdicts must match their items:** `submit reviewer approve` is refused (exit 1, nothing
   written) when it contains a numbered `[blocking]` item (`1. [blocking] …`), and
   `submit reviewer changes` is refused when it has no numbered item for the implementer to
-  address. This applies in both phases.
+  address. This applies in both phases. In the build phase a `changes` also needs at least one
+  numbered `[blocking]` item: `[should-fix]` items and nits alone don't cost a round, they go
+  into the `approve` (plan feedback stays untagged).
+- **The request, word for word:** the brief starts with a `## Request` section holding the
+  user's own words, so the reviewer judges the work against what was asked and not only against
+  the implementer's reading of it. `init` prints a `request:` line when the section is missing.
+  For a task from the queue, `init --from-queue` adds the queued text itself to the brief
+  (`## Queued task, as it was queued`), except for a split part, whose text the implementer wrote.
 - **Closeout:** a build-phase `submit implementer ready` is refused (exit 1, nothing written)
   without a `## Closeout` section that has the labels `Verified:`, `Attempted, blocked:`,
   `Deferred:` and `Not claimed:` (content may be `none`; list markers and bold are fine). Each
@@ -140,7 +147,13 @@ previous `end` in that project.
   checked-out commit; a nested repo's own files are covered by its own entry). `submit reviewer
   approve` recomputes it. If it differs, the approve is refused with exit 17, lists the changed
   paths, and records the new digest as pending. `approve --rereviewed` then succeeds only if the
-  files still match that pending digest. `collab diff` never changes a digest. A successful
+  files still match that pending digest. `collab diff` never changes a digest.
+  `submit reviewer changes` checks the same digest, which is how the reviewer's read-only role
+  is enforced: if a project file changed during the review (the reviewer fixed something itself,
+  or a test run left files behind), the `changes` is refused with exit 17 and no round is spent.
+  The reviewer undoes its edits and submits again. For a change that isn't its to undo,
+  `changes --rereviewed` goes through for the refused tree and collab appends the changed paths
+  to the review, so the implementer knows what moved under it. A successful
   approve (or the user's *approve as it is* at the round limit) records the approved digest,
   which `collab verify` compares against (exit 0 or 17; exit 1 when none was recorded).
   Computing it is read-only: `git diff` runs on a temporary copy of the index, and nothing is
@@ -297,7 +310,7 @@ Agents branch on these, so they are part of the protocol:
 | `14` | submit refused: the task's `--check` command failed |
 | `15` | the queue has no task for this project |
 | `16` | the user has to decide (the other agent asked, or the round limit for the implementer) and you present it; show them the options, record the answer with `collab answer` |
-| `17` | the project files changed since the review (`approve` refused; inspect, then `approve --rereviewed`) or since the approval (`collab verify`; don't commit) |
+| `17` | the project files changed since the implementer's handoff (`approve` refused: inspect, then `approve --rereviewed`; `changes` refused: undo your own edits and submit again, or `changes --rereviewed` for changes that aren't yours) or since the approval (`collab verify`; don't commit) |
 
 ## Notes
 

@@ -9,7 +9,7 @@
 // 13 the other agent looks unresponsive — ask the user whether to stop or keep waiting,
 // 14 submit refused because the task's --check command failed, 15 the queue is empty,
 // 16 the user has to decide (the other agent asked, or the round limit for the implementer) — show them the options,
-// 17 the tree changed since the review (refused approve) or since the approval ('verify').
+// 17 the tree changed since the implementer's handoff (refused approve or changes) or since the approval ('verify').
 //
 // Zero dependencies; runs on macOS, Linux and Windows (Node >= 18).
 'use strict';
@@ -2491,6 +2491,13 @@ function cmdInit(args) {
   }
   const phone = options.phone ? ensurePhoneUrl() : null;
   const max = options.max_rounds || DEFAULT_MAX_ROUNDS;
+  // The reviewer judges the work against what was asked, not only against the implementer's
+  // reading of it: a queued task's own text goes into the brief as it was queued (a split part's
+  // text is the implementer's, and its brief already says so).
+  const hasRequest = !!(section(brief, 'Request') || '').trim();
+  if (item && !item.part && (item.text || '').trim()) {
+    brief = `${brief.replace(/\s*$/, '')}\n\n## Queued task, as it was queued (set by collab)\n${item.text.trim().split('\n').map((l) => `> ${l}`.trimEnd()).join('\n')}\n`;
+  }
   brief += optionsSection(options);
   const lessons = lessonsBrief(dir);
   brief += lessons.section;
@@ -2567,6 +2574,7 @@ function cmdInit(args) {
     out(`lessons: ${lessons.tooLong.map((it) => `#${it.n}`).join(', ')} over ${LESSON_MAX} characters, left out of the brief: shorten them in ${lessons.file}`);
   }
   if (phone) out(`phone:   ${phone.created ? 'NEW, tell the user: ' : ''}${phoneHelp(phone.url)}`);
+  if (!hasRequest && !item) out("request: the brief has no '## Request' section (the user's own words). Send them to the reviewer now: collab -t " + id + ' note --from implementer "<the request, word for word>"');
   if (item) out(`from queue: #${item.id}${part ? ` (${partLabel(part)})` : ''} (${queueCount(dir)} more waiting for this project)`);
   out(`state:   ${d}`);
   out(`scratch: ${scratchDir(d)}  (message drafts, notes, logs: never in the project)`);
@@ -2987,6 +2995,13 @@ async function cmdSubmit(args) {
   }
 
   const pre = readState(d);
+  // A build review only costs a round for something that must change: should-fix items and nits
+  // alone go into an approve instead (plan feedback stays untagged).
+  if (role === 'reviewer' && kind === 'changes' && (pre.phase || 'build') === 'build' && !isTerminal(pre.status)
+      && !/^\s*\d+[.)]\s*\[blocking\]/im.test(body)) {
+    die("a build 'changes' needs at least one numbered [blocking] item ('1. [blocking] path:line — problem → what to do'). "
+      + "With only [should-fix] items or nits, submit 'approve' and list them there (what the user should still know goes under '## For the user')");
+  }
   // A plan or build handoff identical to the previous one is a stale file (e.g. a failed write),
   // never a revision: refuse it before the check runs, so it can't spend a review round.
   if (role === 'implementer' && (kind === 'plan' || kind === 'ready') && pre.turn === role && !isTerminal(pre.status)) {
@@ -3031,11 +3046,14 @@ async function cmdSubmit(args) {
   }
 
   // Build-phase handoffs bind the review to the tree: 'ready' records what the reviewer is shown
-  // (after the check, so its artefacts are included), 'approve' must still match it.
-  if (opts.rereviewed && !(role === 'reviewer' && kind === 'approve')) die('--rereviewed only goes with \'submit reviewer approve\'');
+  // (after the check, so its artefacts are included), and the reviewer's verdict must still match
+  // it: an 'approve' covers exactly that tree, and a 'changes' shows that the reviewer (who never
+  // edits project files) left it as it was.
+  const verdict = role === 'reviewer' && (kind === 'approve' || kind === 'changes');
+  if (opts.rereviewed && !verdict) die("--rereviewed only goes with 'submit reviewer approve' or 'submit reviewer changes'");
   let tree = null;
   if ((pre.phase || 'build') === 'build' && pre.turn === role && !isTerminal(pre.status) && pre.repos && pre.repos.length
-      && ((role === 'implementer' && kind === 'ready') || (role === 'reviewer' && kind === 'approve' && pre.review_digest))) {
+      && ((role === 'implementer' && kind === 'ready') || (verdict && pre.review_digest))) {
     tree = treeMap(pre, d);
   }
   // What the reviewer is shown at this handoff, so the next round can diff only what changed since
@@ -3068,13 +3086,19 @@ async function cmdSubmit(args) {
     const t = transition(st, role, kind);
     // The tree changed since the review: refuse, and remember the tree as it is now, so an
     // approve --rereviewed after inspecting the listed files covers exactly that tree.
-    const binding = tree && st.review_digest && kind === 'approve';
-    if (binding && tree.id !== st.review_digest && !(opts.rereviewed && tree.id === st.pending_digest)) {
+    const bound = tree && st.review_digest && verdict;
+    const binding = bound && kind === 'approve';
+    if (bound && tree.id !== st.review_digest && !(opts.rereviewed && tree.id === st.pending_digest)) {
       const since = opts.rereviewed && st.pending_digest ? 'pending' : 'review';
       const changes = mapChanges(loadMap(d, since), tree);
       saveMap(d, 'pending', tree);
       update(d, (s) => { s.pending_digest = tree.id; }, { touch: false });
       return { stale: { since, changes } };
+    }
+    // A 'changes --rereviewed' over a changed tree tells the implementer which files moved under it.
+    if (bound && kind === 'changes' && tree.id !== st.review_digest) {
+      body += `\n\n> collab: project files changed during this review, after your handoff (not reverted; the reviewer looked at them):\n${
+        mapChanges(loadMap(d, 'review'), tree).map((l) => `> ${l}`).join('\n')}\n`;
     }
     if (tree && kind === 'ready') saveMap(d, 'review', tree);
     if (binding) saveMap(d, 'approved', tree);
@@ -3099,11 +3123,19 @@ async function cmdSubmit(args) {
 
   if (result.pending) refuseUnacked(d, result.pending);
   if (result.stale) {
-    out(`NOT APPROVED: the tree changed since ${result.stale.since === 'pending' ? 'your approve was refused' : "the implementer's handoff"}`
-      + ' (+ newly changed, ~ changed again, - back to its base content):');
-    for (const l of result.stale.changes) out(l);
-    out("Look at these files (collab diff, or read them). If the review still holds, approve again with "
-      + `'collab -t ${pre.id} submit reviewer approve --rereviewed'; if they matter, submit 'changes'.`);
+    const again = result.stale.since === 'pending';
+    const marks = ' (+ newly changed, ~ changed again, - back to its base content):';
+    if (kind === 'approve') {
+      out(`NOT APPROVED: the tree changed since ${again ? 'your approve was refused' : "the implementer's handoff"}${marks}`);
+      for (const l of result.stale.changes) out(l);
+      out("Look at these files (collab diff, or read them). If the review still holds, approve again with "
+        + `'collab -t ${pre.id} submit reviewer approve --rereviewed'; if they matter, submit 'changes'.`);
+    } else {
+      out(`NOT SUBMITTED: project files changed during your review, since ${again ? 'your changes was refused' : "the implementer's handoff"}${marks}`);
+      for (const l of result.stale.changes) out(l);
+      out("The reviewer never edits project files. Undo your own edits and delete what your test runs left behind, then submit again.");
+      out(`If a change isn't yours to undo (the user's edit, the implementer still writing), check it against your review, then run 'collab -t ${pre.id} submit reviewer changes --rereviewed'.`);
+    }
     exit(EXIT_TREE);
   }
   const st = result.st;
@@ -4347,7 +4379,7 @@ ${B}USED BY THE AGENTS${R} ${D}(the skill runs these for you)${R}
                               (no effect; agents raise it on each retry so loop guards don't fire)
   ${C}progress${R} "text"             Post what you're doing now (shown to the other side)
   ${C}submit${R} implementer <plan|ready|decide|escalate>
-  ${C}submit${R} reviewer <changes|approve [--rereviewed]|decide|escalate>
+  ${C}submit${R} reviewer <changes|approve|decide|escalate> [--rereviewed]
                               Hand off the turn (message on stdin or --file PATH); decide asks
                               the user to pick a numbered option (--self: I ask them myself)
 

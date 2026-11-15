@@ -89,7 +89,7 @@ has a running `--phone` task, and does nothing otherwise:
 
 `0` ok · `10` finished · `11` wait timed out · `12` note not acknowledged · `13` other agent idle ·
 `14` check failed · `15` queue empty · `16` decision for the user · `17` files changed since
-review/approval · `1` error. What each one asks an agent to do is in
+the handoff (review) or the approval · `1` error. What each one asks an agent to do is in
 [how-it-works.md](how-it-works.md#exit-codes).
 
 ## Sounds and speech

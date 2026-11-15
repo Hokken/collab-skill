@@ -79,12 +79,12 @@ test('happy path: init, join, turns, changes, approve', () => {
   assert.match(r.out, /summary v1/);
   assert.match(r.out, /000-implementer-brief/, 'first reviewer turn shows the brief too');
 
-  r = s.run(['submit', 'reviewer', 'changes'], { input: '1. fix X' });
+  r = s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix X' });
   assert.equal(r.code, 0);
   assert.equal(s.state().round, 2);
 
   r = s.run(['wait', 'implementer', '--timeout', '1']);
-  assert.match(r.out, /1\. fix X/);
+  assert.match(r.out, /1\. \[blocking\] fix X/);
   assert.doesNotMatch(r.out, /summary v1/);
 
   s.run(['submit', 'implementer', 'ready'], { input: 'fixed' });
@@ -179,9 +179,9 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
   const toLimit = (slug) => {
     s.run(['init', slug, '--max-rounds', '2'], { input: 'b' });
     s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-    s.run(['submit', 'reviewer', 'changes'], { input: '1. c1' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] c1' });
     s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
-    return s.run(['submit', 'reviewer', 'changes'], { input: '1. still broken' });
+    return s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] still broken' });
   };
   let r = toLimit('a-more');
   assert.equal(r.code, 0, r.err);
@@ -193,12 +193,12 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
   assert.match(r.out, /the implementer presents the round-limit question to the user; don't ask the user about it yourself/);
   r = s.run(['wait', 'implementer', '--timeout', '1']);
   assert.equal(r.code, 16, 'the implementer shows the menu');
-  assert.match(r.out, /round limit is reached[\s\S]*1\. still broken[\s\S]*1\. Give them 2 more rounds[\s\S]*3\. Stop the task/);
+  assert.match(r.out, /round limit is reached[\s\S]*1\. \[blocking\] still broken[\s\S]*1\. Give them 2 more rounds[\s\S]*3\. Stop the task/);
   assert.match(s.run(['answer', '1.']).out, /back to the implementer \(status: CHANGES_REQUESTED\)/);
   assert.equal(s.state().round, 3);
   assert.equal(s.state().max_rounds, 4);
   r = s.run(['wait', 'implementer', '--timeout', '1']);
-  assert.match(r.out, /1\. still broken[\s\S]*Option 1: Give them 2 more rounds/);
+  assert.match(r.out, /1\. \[blocking\] still broken[\s\S]*Option 1: Give them 2 more rounds/);
   s.run(['abort']);
 
   toLimit('b-approve');
@@ -217,7 +217,7 @@ test('the round limit asks the user: more rounds, approve, or stop', () => {
 
   s.run(['init', 'e-plan', '--plan', '--max-rounds', '1'], { input: 'b' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] rethink' });
   assert.match(s.state().decision.question, /1 plan rounds/);
   s.run(['answer', '1']);
   assert.equal(s.state().status, 'PLAN_CHANGES');
@@ -755,7 +755,7 @@ test('unacknowledged notes refuse a handoff before the check runs, and a note se
   r = s.run(['submit', 'implementer', 'ready'], { input: `v1\nNote #${n} — done` });
   assert.equal(runs(), 1);
   assert.equal(r.code, 0, r.out + r.err);
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix' });
   r = s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
   assert.equal(runs(), 2, 'the check ran and sent its note');
   assert.equal(r.code, 12, 'the locked re-check catches the note sent while the check ran');
@@ -785,7 +785,7 @@ test('notes: gate, routing and finished tasks', () => {
   r = s.run(['wait', 'reviewer', '--timeout', '1']);
   assert.match(r.out, /check perf/);
   assert.doesNotMatch(r.out, /impl only/);
-  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: `1. fix\nnote #${nr}: checked; Note #${n1}: seen` }).code, 0, 'implementer-only note does not gate the reviewer (a note for all does)');
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: `1. [blocking] fix\nnote #${nr}: checked; Note #${n1}: seen` }).code, 0, 'implementer-only note does not gate the reviewer (a note for all does)');
 
   const nrr = noteNum(s.run(['note', '--to', 'reviewer', 'reviewer note during impl turn']));
   r = s.run(['wait', 'implementer', '--timeout', '1']);
@@ -942,7 +942,7 @@ test('plan mode', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /submit your plan/);
   assert.match(s.run(['submit', 'implementer', 'plan'], { input: 'p1' }).out, /PLAN_REVIEW/);
-  assert.match(s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' }).out, /PLAN_CHANGES/);
+  assert.match(s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] rethink' }).out, /PLAN_CHANGES/);
   assert.match(s.run(['wait', 'implementer', '--timeout', '1']).out, /rethink/);
   s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
   r = s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' });
@@ -1238,6 +1238,8 @@ test('init --from-queue pops the task and applies its options', () => {
   const brief = s.run(['show', '0']).out;
   assert.match(brief, /## Task options \(set by collab\)/);
   assert.match(brief, /\*\*Branch:\*\* work on `feat\/x`/);
+  assert.match(brief, /queued job, as a brief\n\n## Queued task, as it was queued \(set by collab\)\n> queued job\n\n## Task options/, 'the reviewer sees the queued text itself');
+  assert.doesNotMatch(r.out, /^request:/m, 'a queued task carries its own request');
   assert.match(s.run(['queue', 'next']).out, /later job/);
   s.run(['abort']);
   s.run(['queue', 'clear']);
@@ -1379,7 +1381,7 @@ test('queue split is refused after the first handoff and on the reviewer\'s turn
   s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
   const parts = 'a\n=== part ===\nb\n';
   assert.match(s.run(['queue', 'split'], { input: parts }).err, /not your turn \(implementer\)/);
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix' });
   assert.match(s.run(['queue', 'split'], { input: parts }).err, /too late to split/);
   assert.match(s.run(['queue']).out, /the queue is empty/);
 });
@@ -1622,7 +1624,7 @@ test('decide: the user picks an option, the turn returns to the asker, and the e
   assert.match(r.out, /Option 1: Strip the snapshot \(Recommended\)\n\nand document it/);
   assert.equal(s.state().max_rounds, 4, 'an ordinary decision leaves the rounds alone');
 
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. strip it' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] strip it' });
   approveCurrent(s, 'ok', 'v2');
   r = s.run(['end'], { input: 'done' });
   assert.equal(r.code, 0, r.err);
@@ -1755,6 +1757,76 @@ test('approve is refused when the tree changed since ready; --rereviewed covers 
   g('commit', '-qm', 'approved work');
   assert.equal(s.run(['verify']).code, 0, 'committing the approved tree keeps it verified');
   assert.equal(s.run(['submit', 'implementer', 'ready', '--rereviewed'], { input: 'x' }).code, 1);
+});
+
+test('a build changes is refused when project files changed during the review; --rereviewed tells the implementer', () => {
+  const s = sandbox();
+  gitRepo(s.project);
+  const f = path.join(s.project, 'f.txt');
+  s.run(['init', 'hands-off'], { input: 'b' });
+  fs.appendFileSync(f, 'two\n');
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+
+  // The reviewer "fixes" something itself and leaves a file behind.
+  fs.appendFileSync(f, 'reviewer edit\n');
+  fs.writeFileSync(path.join(s.project, 'left.txt'), 'x\n');
+  let r = s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix f' });
+  assert.equal(r.code, 17, r.out + r.err);
+  assert.match(r.out, /NOT SUBMITTED: project files changed during your review, since the implementer's handoff[\s\S]*~ f\.txt[\s\S]*\+ left\.txt[\s\S]*never edits project files/);
+  assert.equal(s.state().status, 'READY_FOR_REVIEW', 'nothing submitted, no round spent');
+  assert.equal(s.state().round, 1);
+
+  // Undoing the edits is the normal way out: a plain changes goes through again.
+  fs.writeFileSync(f, 'one\ntwo\n');
+  fs.rmSync(path.join(s.project, 'left.txt'));
+  r = s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix f' });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.doesNotMatch(s.run(['show']).out, /project files changed during this review/);
+
+  // A change that isn't the reviewer's to undo: --rereviewed covers only the tree that was refused.
+  fs.appendFileSync(f, 'three\n');
+  s.run(['submit', 'implementer', 'ready'], { input: 'v2' });
+  fs.writeFileSync(path.join(s.project, 'user.txt'), 'by the user\n');
+  assert.equal(s.run(['submit', 'reviewer', 'changes', '--rereviewed'], { input: '1. [blocking] again' }).code, 17, 'never refused yet: nothing to cover');
+  fs.appendFileSync(path.join(s.project, 'user.txt'), 'more\n');
+  r = s.run(['submit', 'reviewer', 'changes', '--rereviewed'], { input: '1. [blocking] again' });
+  assert.equal(r.code, 17, 'changed again after the refusal');
+  assert.match(r.out, /since your changes was refused[\s\S]*~ user\.txt/);
+  r = s.run(['submit', 'reviewer', 'changes', '--rereviewed'], { input: '1. [blocking] again' });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(s.run(['show']).out, /1\. \[blocking\] again[\s\S]*> collab: project files changed during this review[\s\S]*>   \+ user\.txt/);
+  assert.equal(s.state().status, 'CHANGES_REQUESTED');
+
+  // The next handoff records the tree afresh, so a clean review goes through without the flag.
+  s.run(['submit', 'implementer', 'ready'], { input: 'v3' });
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'ok' }).code, 10);
+});
+
+test('a build changes needs a [blocking] item; should-fix items and nits go into an approve; plan feedback stays untagged', () => {
+  const s = sandbox();
+  s.run(['init', 'sev', '--plan'], { input: 'b' });
+  s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink step 2' }).code, 0, 'plan phase: untagged items');
+  s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
+  s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
+  s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
+
+  let r = s.run(['submit', 'reviewer', 'changes'], { input: '## Verdict\n1. [should-fix] rename b\n## Nits\n- spacing\n' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /needs at least one numbered \[blocking\] item[\s\S]*submit 'approve'/);
+  assert.equal(s.state().status, 'READY_FOR_REVIEW');
+  assert.equal(s.state().round, 1, 'no round spent on should-fix items alone');
+  assert.equal(s.run(['submit', 'reviewer', 'changes'], { input: 'prose about [blocking] things\n1. [should-fix] rename b\n' }).code, 1, 'the tag must be on a numbered item');
+  assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'Approved.\n1. [should-fix] rename b\n## Nits\n- spacing\n' }).code, 10);
+});
+
+test('init asks for the user\'s own words when the brief has no ## Request section', () => {
+  const s = sandbox();
+  let r = s.run(['init', 'no-req'], { input: '## Goal\nx\n' });
+  assert.match(r.out, /^request: the brief has no '## Request' section[\s\S]*note --from implementer/m);
+  s.run(['abort']);
+  r = s.run(['init', 'req'], { input: '## Request\n> add dark mode\n## Goal\nx\n' });
+  assert.doesNotMatch(r.out, /^request:/m);
 });
 
 test('the digest covers untracked files, new ignored docs and assume-unchanged / skip-worktree paths', () => {
@@ -1928,14 +2000,14 @@ test('the reviewer gets its notes since its last review, each with the implement
   assert.match(out, new RegExp(`----- your notes since your last review \\(from collab\\)[^\\n]*\\nNote #${a}: close\\(\\) skips the amount check\\n {3}→ #\\d{3}: Note #${a} — fixed, amount checked in close\\(\\)\\nNote #${b}: batch order starves new rows x+…\\n {3}→ #\\d{3}: Note #${b} — declined: batch is fair\\n----- end -----`));
   assert.doesNotMatch(out, /From: the reviewer/, 'the recap leaves out the note header');
 
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. more' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] more' });
   const c = note('one more thing');
   s.run(['submit', 'implementer', 'ready'], { input: `v2 (Note #${c} handled)` });
   out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
   assert.match(out, new RegExp(`Note #${c}: one more thing\\n {3}→ #\\d{3}: v2 \\(Note #${c} handled\\)`));
   assert.doesNotMatch(out, new RegExp(`Note #${a}:`), 'notes covered by an earlier review are not repeated');
   // A decision the reviewer asks is not a review: the notes it has not verified yet stay listed.
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. once more' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] once more' });
   const f = note('decide keeps me');
   s.run(['submit', 'implementer', 'ready'], { input: `v2b Note #${f} fixed` });
   assert.equal(s.run(['submit', 'reviewer', 'decide', '--self'], { input: 'Which?\n1. a\n2. b\n' }).code, 0);
@@ -1944,7 +2016,7 @@ test('the reviewer gets its notes since its last review, each with the implement
   assert.match(out, new RegExp(`Note #${f}: decide keeps me\\n {3}→ #\\d{3}: v2b Note #${f} fixed`));
 
   // The user's notes are not the reviewer's: no recap without a note of its own.
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. again' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] again' });
   const user = noteNum(s.run(['note', '--implementer', 'from the user']));
   s.run(['submit', 'implementer', 'ready'], { input: `v3 Note #${user} done` });
   out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
@@ -1956,7 +2028,7 @@ test('a plan or ready identical to the previous one is refused before the check 
   const marker = path.join(s.project, 'check-ran');
   s.run(['init', 'same', '--plan', '--check', `node -e "require('fs').appendFileSync('check-ran', 'x')"`], { input: 'b' });
   assert.equal(s.run(['submit', 'implementer', 'plan'], { input: 'plan A\n' }).code, 0);
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. add step 3' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] add step 3' });
   let r = s.run(['submit', 'implementer', 'plan'], { input: 'plan A  \n\n' });
   assert.equal(r.code, 1);
   assert.match(r.err, /this plan is identical to your previous one \(#001\), so nothing was submitted/);
@@ -1966,7 +2038,7 @@ test('a plan or ready identical to the previous one is refused before the check 
 
   assert.equal(s.run(['submit', 'implementer', 'ready'], { input: 'built' }).code, 0);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'x');
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix X' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix X' });
   const seq = s.state().seq;
   r = s.run(['submit', 'implementer', 'ready'], { input: 'built' });
   assert.equal(r.code, 1, 'the appended check line does not make the stored entry differ');
@@ -1983,7 +2055,7 @@ test('a revised plan reaches the reviewer as the changes since the previous plan
   s.run(['submit', 'implementer', 'plan'], { input: plan() });
   let out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
   assert.match(out, /----- 001-implementer-plan\.md -----\n## Approach/, 'the first plan is shown whole');
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. add a step' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] add a step' });
   s.run(['submit', 'implementer', 'plan'], { input: plan('2. b.ts — new step') });
   out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
   const id = s.state().id;
@@ -1993,7 +2065,7 @@ test('a revised plan reaches the reviewer as the changes since the previous plan
   assert.match(s.run(['show', '3']).out, /point 5[\s\S]*b\.ts — new step/, 'show still prints the whole plan');
 
   // A rewrite is shown whole: the diff would be most of it.
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. rethink' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] rethink' });
   s.run(['submit', 'implementer', 'plan'], { input: '## Approach\nsomething else entirely\n' });
   out = s.run(['wait', 'reviewer', '--timeout', '1']).out;
   assert.doesNotMatch(out, /REVISED PLAN/);
@@ -2151,7 +2223,7 @@ test('tasks without a recorded digest, plan approvals, no repos and the round-li
   fs.appendFileSync(path.join(s.project, 'f.txt'), 'during plan review\n');
   assert.equal(s.run(['submit', 'reviewer', 'approve'], { input: 'plan ok' }).code, 0, 'plan approvals are not bound');
   s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix it' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix it' });
   assert.equal(s.state().status, 'DECISION');
   r = s.run(['answer', '2']);
   assert.match(r.out, /the task is DONE/);
@@ -2239,7 +2311,7 @@ test("lessons: agents record them from handoffs, briefs carry them, end lists th
   assert.match(r.out, /lessons recorded: #2 in .*lessons\.md/);
   assert.match(r.out, /already known, not added again: 1/);
   assert.match(r.out, /lesson not recorded \(over 300 characters\): y{60}…/);
-  r = s.run(['submit', 'reviewer', 'changes'], { input: `1. fix\n## Lessons\n${[1, 2, 3, 4, 5, 6].map((n) => `${n}. lesson ${n}`).join('\n')}\n` });
+  r = s.run(['submit', 'reviewer', 'changes'], { input: `1. [blocking] fix\n## Lessons\n${[1, 2, 3, 4, 5, 6].map((n) => `${n}. lesson ${n}`).join('\n')}\n` });
   assert.match(r.out, /lessons recorded: #3, #4, #5, #6, #7 [\s\S]*at most 5 per message\): 1/);
   r = s.run(['lessons']);
   assert.match(r.out, /#2 +Tests on Windows need forward slashes in globs +\(implementer, first-/);
@@ -2328,7 +2400,7 @@ test('phone: only --phone tasks push, ordinary handoffs never do, end does', asy
     assert.ok(r.out.includes(`pushes go to ${p.url}`), r.out);
     assert.match(r.out, /options: .*phone notifications/);
     s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-    s.run(['submit', 'reviewer', 'changes'], { input: '1. fix' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix' });
     s.run(['progress', 'fixing']);
     approveCurrent(s, 'ok', 'v2');
     assert.equal(s.state().status, 'DONE');
@@ -2356,7 +2428,7 @@ test('phone: decisions, the round limit, escalations and a confirm-first queued 
 
     s.run(['init', 'limit', '--phone', '--max-rounds', '1'], { input: 'b' });
     s.run(['submit', 'implementer', 'ready'], { input: 'v1' });
-    s.run(['submit', 'reviewer', 'changes'], { input: '1. still broken' });
+    s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] still broken' });
     assert.equal(s.state().status, 'DECISION');
     got = await p.until(2);
     assert.match(got[1].body, /^Decision needed: Round limit reached/);
@@ -3004,11 +3076,11 @@ test('sound: every handoff of a plan task sounds once, tone then sentence, in or
   const s = soundBox();
   s.run(['init', 'Dark Mode', '--plan', '--sound=full'], { input: 'b' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. a\n2. b\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] a\n2. b\n' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
   s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   s.run(['submit', 'implementer', 'ready'], { input: 's1' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. fix\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] fix\n' });
   s.run(['submit', 'implementer', 'ready'], { input: 's2' });
   s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   s.run(['end'], { input: '## Final report\ndone\n' });
@@ -3049,15 +3121,15 @@ test('sound: round-limit answers sound as their outcome, split parts sound when 
   const s = soundBox({ env: { COLLAB_SOUND_PLATFORM: 'darwin' } });
   s.run(['init', 'limit', '--plan', '--max-rounds', '1', '--sound=tones'], { input: 'b' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
   s.run(['answer', '2']);
   s.run(['submit', 'implementer', 'ready'], { input: 's' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
   s.run(['answer', '1']);
   s.run(['submit', 'implementer', 'ready'], { input: 's2' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. y\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] y\n' });
   s.run(['submit', 'implementer', 'ready'], { input: 's3' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. z\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] z\n' });
   s.run(['answer', '3']);
   await s.settle();
   assert.deepEqual(s.tones(), ['brief', 'plan', 'decide', 'plan-approve', 'ready', 'decide', 'answer', 'ready', 'changes', 'ready', 'decide', 'escalate']);
@@ -3066,9 +3138,9 @@ test('sound: round-limit answers sound as their outcome, split parts sound when 
   p.run(['init', 'big', '--sound=full'], { input: 'b' });
   p.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n' });
   p.run(['submit', 'implementer', 'ready'], { input: 's' });
-  p.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  p.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
   p.run(['submit', 'implementer', 'ready'], { input: 's' + '2' });
-  p.run(['submit', 'reviewer', 'changes'], { input: '1. y\n' });
+  p.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] y\n' });
   p.run(['submit', 'implementer', 'ready'], { input: 's3' });
   p.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   p.run(['init', 'big-2', '--from-queue'], { input: 'b' });
@@ -3581,13 +3653,13 @@ test('sound: short sentences by default, full ones on request, custom sentences 
   s.run(['init', 'Dark Mode', '--plan', '--sound'], { input: 'b' });
   s.run(['queue', 'split'], { input: 'one\n=== part ===\ntwo\n' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. a\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] a\n' });
   s.run(['submit', 'implementer', 'plan'], { input: 'p2' });
   s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Which?\n1. A\n2. B\n' });
   s.run(['answer', '1']);
   s.run(['submit', 'implementer', 'ready'], { input: 's' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
   s.run(['submit', 'implementer', 'ready'], { input: 's2' });
   s.run(['submit', 'reviewer', 'approve'], { input: 'ok' });
   await s.settle();
@@ -3852,7 +3924,7 @@ test('sound: the task name is left out by default; voice name on brings it back'
   const s = soundBox({ named: false });
   s.run(['init', 'dark mode'], { input: 'b' });
   s.run(['submit', 'implementer', 'ready'], { input: 's' });
-  s.run(['submit', 'reviewer', 'changes'], { input: '1. x\n' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
   await s.settle();
   const said = () => s.started().filter((r) => r.name === 'say').map((r) => r.argv[r.argv.length - 1]);
   assert.deepEqual(said(), ['New task', 'Ready, round 1', 'Changes, round 2']);

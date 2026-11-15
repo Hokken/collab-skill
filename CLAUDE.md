@@ -63,6 +63,8 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   IMPLEMENTING → READY_FOR_REVIEW ⇄ CHANGES_REQUESTED → DONE, plus ESCALATED/ABORTED/STALLED terminals).
   `cmdSubmit` validates the turn, enforces note acknowledgements (exit 12: every note for the role since its last handoff must be named as `Note #N`; checked before the check runs and again under the lock; `decide`/`escalate` are exempt and don't advance `acked`) and `--check` (exit 14, via `runCheck`),
   refuses an implementer `plan`/`ready` identical to its previous one (`handoffText`),
+  refuses a build `changes` without a numbered `[blocking]` item, binds the reviewer's verdict to the tree recorded at `ready`
+  (`treeMap`/`review_digest`: exit 17 for an `approve` or `changes` over changed files, `--rereviewed` covers the refused tree),
   writes an entry to `entries/NNN-<role>-<kind>.md`, and appends to `log.md`. On the reviewer's turn,
   `wait` prints a revised plan as a line diff (`printPlanDelta`/`lineDiff`) and `reviewRecap` adds its
   notes since its last review with the implementer's acknowledgements (`noteReplies`).
@@ -95,6 +97,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   `cmdClean` deletes drafts older than a day.
 - **Queue**: `$COLLAB_HOME/queue.json`, edited via `withQueue`; items are filtered by project folder
   (`realDir`). `init --from-queue` pops an item and applies its options (`TASK_OPTS`/`normTaskOpts`).
+  It also quotes the item's text in the brief (not for a split part); other briefs carry the user's words in `## Request` (`init` prints a `request:` hint without it).
   `queue split` lets the implementer split its current task: parts 2..N are queued with a `part`
   marker (`index`/`total`/`parent`) that `init --from-queue` copies into `state.part`. A task with a
   `part` can't be split again. When a part ends without approval, `holdParts` marks its later parts

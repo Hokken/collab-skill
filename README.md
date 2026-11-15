@@ -5,7 +5,7 @@
 <h1 align="center">Collab</h1>
 
 <p align="center">
-  <b>Pair programming for AI coding agents: one builds, the other reviews the real changes and steers it.</b><br>
+  <b>Have a different model review every change: Claude Code builds, Codex reviews the real diff (or the reverse), by themselves.</b><br>
   You watch, step in whenever you like, and only get asked when a choice is yours.
 </p>
 
@@ -28,16 +28,17 @@
 
 ## What you get
 
-Collab brings **pair programming** to coding agents. The idea is the same as with two human
-developers: one *drives* (writes the code), the other *navigates* (reads it critically). Two
-perspectives catch what one misses. The navigator questions implementation choices, brings
-insights from another angle, and the pair settles on an implementation both agree on before it
-counts as done. Using two different agents (say **Claude Code** and **Codex CLI**) makes those
-perspectives genuinely different.
+Collab puts **another vendor's model in the reviewer's chair**. One agent (say **Claude Code**)
+writes the code. A different one (say **Codex CLI**) reviews it. Models from different vendors are
+trained differently and have different blind spots, so the reviewer is less likely to share the
+implementer's mistakes than a second copy of the same model would be.
 
-**Collab turns that into a loop that runs by itself**: you give a task to one agent, start the
-other as the reviewer, and they work it through together until the reviewer approves, then move
-on to the next task.
+It is pair programming for coding agents: one *drives*, the other *navigates*, and the work only
+counts as done when the navigator approves it. The reviewer judges the real git diff and the
+result of your check command, not the implementer's account of its own work.
+
+**The loop runs by itself**: you give a task to one agent, start the other as the reviewer, and
+they work it through until the reviewer approves, then move on to the next task.
 
 It's more than taking turns:
 
@@ -63,6 +64,19 @@ It's more than taking turns:
 - **You stay in charge without babysitting.** When a choice is really yours (product behaviour,
   an ambiguous requirement), the pair asks with a short list of options and carries on once you
   pick one.
+
+### Collab or subagents?
+
+Subagents and agent teams inside one CLI are good at splitting work up. Collab is for reviewing it.
+
+| | Subagents / agent teams in one CLI | Collab |
+|---|---|---|
+| Who reviews | That CLI's own models | Any second agent CLI, usually another vendor's model |
+| What the reviewer starts from | What the lead agent hands it | Your request word for word, its own reading of the code, and the git diff since the task began |
+| Shape of the work | Parallel workers | One implement ⇄ review loop per task, tasks in a queue |
+| What "approved" means | Whatever the prompt says | Your check passed, no blocking item is open, and the files are exactly the ones reviewed |
+
+The two combine well: either agent can still use its own subagents inside its turn.
 
 ## Quick start
 
@@ -170,8 +184,15 @@ what was delivered, what was verified, every decision taken and what to check by
 
 ## Why it works
 
+- **An independent second opinion.** The reviewer is a separate agent, ideally another vendor's
+  model. It reads your request in your own words and studies the code before it sees the
+  implementer's work, so a misread requirement doesn't pass through both.
 - **Reviews the real changes.** Diffs come from a git snapshot taken at the start of the task,
   nested repos included. Files outside a task's `--scope` are flagged.
+- **The reviewer only reviews.** If a project file changes during a review (the reviewer "fixed"
+  something itself), its verdict is refused until that is undone.
+- **Rounds are for real problems.** Findings are `[blocking]`, `[should-fix]` or nits. Only a
+  blocking one sends the work back; the rest ride along with the approval and reach your report.
 - **Approval means what it says.** An approval covers the exact files the reviewer saw. If they
   change afterwards, the approval is refused, and `collab verify` checks again before a commit.
 - **Honest handoffs.** Each handoff states what was verified, what was attempted, what was
@@ -367,11 +388,11 @@ also run themselves. Add `-t <task-id>` to any command to target a task other th
 | `collab progress "text"` | Post what it's doing now (shown to the other side and in `watch`) |
 | `collab note --from <role> "text"` | Send a note to the other agent mid-turn (labelled as the agent's, never as yours) |
 | `collab submit implementer <plan\|ready\|decide\|escalate>` | Hand off the turn (message on stdin or `--file PATH`) |
-| `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself). `approve` is refused (exit 17) if the files changed since the implementer's handoff; `approve --rereviewed` after checking them |
+| `collab submit reviewer <changes\|approve\|decide\|escalate>` | Hand off the turn. `decide` asks you to pick a numbered option (`--self`: the asking agent shows the choice itself). A build `changes` needs a `[blocking]` item. `approve` and `changes` are refused (exit 17) if the files changed since the implementer's handoff; `--rereviewed` after checking them |
 
 Exit codes: `0` ok · `10` finished · `11` wait timed out · `12` note not acknowledged · `13` other
 agent idle · `14` check failed · `15` queue empty · `16` decision for the user · `17` files changed
-since review/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md#exit-codes).
+since the handoff/approval · `1` error. See [docs/how-it-works.md](docs/how-it-works.md#exit-codes).
 
 
 ## FAQ
@@ -383,6 +404,21 @@ effort is usually worth it: reviews are short and missed bugs are expensive.
 **Does it cost a lot of tokens?**
 Not for the coordination. Waiting is a plain shell command, so an agent spends nothing while the
 other works. You pay for the actual implementing and reviewing, as you would by hand.
+
+**Won't an AI reviewer always find something?**
+It may, but only a `[blocking]` finding costs a round: something that must change before the work
+can count as done. Should-fix items and nits come with the approval instead, and the ones worth
+your attention are in the final report.
+
+**How is this different from subagents or agent teams?**
+Those run inside one CLI, on that vendor's models. Collab lets a different vendor's agent do the
+review, in its own session, from the real diff. See [Collab or subagents?](#collab-or-subagents)
+
+**My agent's shell commands time out after a few minutes. Does waiting still work?**
+Yes. `collab wait` returns by itself before the limit (`--timeout`, exit 11: "not yet") and the
+agent runs it again: Codex and OpenCode wait 9 minutes at a time in the foreground, Claude Code
+up to 55 minutes in the background. If the CLI kills the command anyway, the agent just reruns
+it with a shorter timeout. Nothing is lost either way, because the task's state is on disk.
 
 **What if they disagree forever?**
 They can't. After the round limit (default 4, `--max-rounds N`) you pick: 2 more rounds, approve
