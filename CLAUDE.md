@@ -56,7 +56,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   their task id with `-t`.
 - **State**: `$COLLAB_HOME/tasks/<slug>-<stamp>/state.json` (`-2`, `-3`… when that folder already exists). All mutations go through
   `withLock(d, () => update(d, fn))`: the lock is an exclusive `.lock` directory with an `owner` file
-  (broken only when held past `COLLAB_LOCK_SECS` and its owner pid is gone),
+  (broken only when held past `COLLAB_LOCK_SECS` and its owner pid is gone; on Linux a zombie owner counts as gone, `isZombie`),
   and writes are temp-file + rename. `update(..., { touch: false })` is for changes that must not count
   as agent activity (e.g. snooze).
 - **Turns**: `transition(st, role, kind)` is the state machine (PLANNING/PLAN_REVIEW/PLAN_CHANGES →

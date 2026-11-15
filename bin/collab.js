@@ -1487,10 +1487,22 @@ function update(d, fn, { touch = true } = {}) {
 // milliseconds, so one still there after LOCK_WAIT is stale only if its owner process is gone.
 const lockOwner = (l) => { try { return fs.readFileSync(path.join(l, 'owner'), 'utf8').trim(); } catch { return ''; } };
 
+// A process that has exited but that its parent hasn't collected yet (a zombie) still answers a
+// signal. A killed detached process stays one for as long as PID 1 takes to collect it, which in a
+// container without an init can be forever, so on Linux its state in /proc decides.
+function isZombie(pid) {
+  if (process.platform !== 'linux') return false;
+  try {
+    // 'pid (comm) state …': comm may contain spaces and parentheses, so read after the last ')'.
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return /^\s*[ZX]/.test(stat.slice(stat.lastIndexOf(')') + 1));
+  } catch { return false; }
+}
+
 function ownerAlive(owner) {
   const pid = parseInt(owner, 10);
   if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); return !isZombie(pid); } catch (e) { return e.code === 'EPERM'; }
 }
 
 function lockIsStale(l, owner) {

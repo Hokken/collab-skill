@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'collab.js');
 
@@ -1295,6 +1295,33 @@ test('a --check that times out is stopped with everything it started', async () 
   assert.match(r.out, /CHECK FAILED: .* timed out after 1s/);
   await pause(3500);
   assert.ok(!fs.existsSync(path.join(s.project, 'late.flag')), 'the grandchild was stopped too');
+});
+
+test('a lock whose owner is a zombie is broken (Linux)', { skip: process.platform !== 'linux' }, async () => {
+  const s = sandbox({ COLLAB_LOCK_SECS: '1' });
+  s.run(['init', 'zombie'], { input: 'b' });
+  // A child that exits at once under a parent that never collects it: a zombie for as long as the parent lives.
+  const parent = spawn('sh', ['-c', 'true & echo $!; exec sleep 60'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    const pid = parseInt(await new Promise((resolve) => parent.stdout.once('data', (b) => resolve(String(b)))), 10);
+    let state = '';
+    for (let i = 0; i < 50 && state !== 'Z'; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      state = stat.slice(stat.lastIndexOf(')') + 1).trim()[0];
+    }
+    assert.equal(state, 'Z', 'the test has its zombie');
+    assert.doesNotThrow(() => process.kill(pid, 0), 'which still answers a signal');
+    const lock = path.join(s.taskDir(), '.lock');
+    fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, 'owner'), `${pid} dead`);
+    const r = spawnSync(process.execPath, [CLI, 'progress', 'after the zombie'], {
+      cwd: s.project, encoding: 'utf8', timeout: 20000,
+      env: { ...process.env, COLLAB_HOME: s.home, COLLAB_NOTIFY: '0', COLLAB_SOUND: '0', COLLAB_TASK: '', COLLAB_LOCK_SECS: '1', ...NO_AGENT },
+    });
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}${r.error || ''}`);
+    assert.ok(!fs.existsSync(lock), 'the lock was taken over and released');
+  } finally { parent.kill('SIGKILL'); }
 });
 
 test('a stale lock is broken only when its owner is gone', () => {
