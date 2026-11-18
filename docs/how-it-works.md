@@ -263,7 +263,15 @@ Reference and config format: [reference.md](reference.md#sounds-and-speech).
   claim first: `idle` per quiet spell (turn, last activity, snooze, and on the implementer's
   turn the newest project file change, in `state.json` `audio_claims`, written without counting as
   activity), `stall` only by the process that writes `STALLED`, `confirm` once per queue item and
-  `agent-waiting` (only for the project's running task) once a minute per task and message (in `audio/claims.json`).
+  `agent-waiting` (only for the project's running task; during a `DECISION` not for the presenter's AskUserQuestion or Claude's idle prompt, a permission prompt still sounds) once a minute per task and message (in `audio/claims.json`).
+  A pending decision is sounded again by the agents' `wait` polls and by a detached `collab sound remind <id> <seq>`
+  that the submit starts with the decision (also while muted, so `sound on` / `sound use` brings them back; it exits
+  only once the decision is no longer pending, or the task is removed), so no agent has to be waiting: reminder *k* (`decide-repeat`) is due *k* ×
+  `COLLAB_DECIDE_REPEAT_SECS` (30) after `decision.at` (`turn_since` for older decisions) and claimed as
+  `decide-repeat:<seq>:<k>`, so it plays once per interval and a late wait plays only the current one. Its
+  job carries `decision: <seq>` and `expires` (when the next reminder is due): right before each player starts, the drainer checks
+  that it hasn't expired (a busy queue or a slow ElevenLabs request never plays a cluster) and that the decision is
+  still pending (after an ElevenLabs request too, and before the system-voice fallback; also when resuming).
 - **Order:** a task's jobs are named `<ms>-<counter>-…` under a lock of their own (`tasks/<id>/audio-order/`),
   the time never earlier than the task's previous job, so they play in the order they were queued even
   within one millisecond or for events that don't advance the task's seq.

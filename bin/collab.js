@@ -38,6 +38,7 @@ const QUIET_MINS = envInt('COLLAB_QUIET_MINS', 10);    // ...and no project file
 const DEFAULT_MAX_ROUNDS = envInt('COLLAB_MAX_ROUNDS', 4);
 const CHECK_TIMEOUT = envInt('COLLAB_CHECK_TIMEOUT', 1800); // --check commands time out after 30 min
 const LOCK_WAIT = envInt('COLLAB_LOCK_SECS', 10);      // wait this long before checking a lock's owner (tests lower it)
+const DECIDE_REPEAT = envInt('COLLAB_DECIDE_REPEAT_SECS', 30); // a pending decision is sounded again this often (0: never)
 
 const EXIT_TERMINAL = 10;
 const EXIT_TIMEOUT = 11;
@@ -215,6 +216,8 @@ const SOUND_EVENTS = {
   approve: ['the reviewer approved: the task is done', (c) => `${c.t}: approved. Task done.`, (c) => `${c.t}: approved`],
   'part-done': ['a part of a split task is done', (c) => `${c.t}: part ${c.part.index} of ${c.part.total} done.${c.part.total > c.part.index ? ` ${c.part.total - c.part.index} to go.` : ' All parts done.'}`, (c) => `${c.t}: part ${c.part.index} of ${c.part.total} done`],
   decide: ['you have to choose (an agent asks, or the round limit)', (c) => decideSpeech(c), (c) => `${c.t}: decision needed`],
+  // Short in both styles: the full menu was read out once with 'decide'.
+  'decide-repeat': ['a decision still waits for you (every 30 s until you answer)', (c) => `${c.t}: your decision is still needed. Answer in the ${c.presenter}'s terminal, or run collab answer.`, (c) => `${c.t}: decision needed`],
   answer: ['your answer to a decision was recorded', (c) => `${c.t}: decision recorded: ${clipSpeech(c.answer, 80)}. Back to the ${c.st.turn}.`, (c) => `${c.t}: answered`],
   escalate: ['the task was escalated: the loop stopped and needs you', (c) => `${c.t}: escalated by the ${c.role}: ${clipSpeech(c.text, 140)}. The loop has stopped and needs you.`, (c) => `${c.t}: escalated`],
   abort: ['the task was aborted', (c) => `${c.t}: aborted. Both agents stop.`, (c) => `${c.t}: aborted`],
@@ -414,7 +417,7 @@ const SYSTEM_SOUNDS = {
     map: {
       brief: 'Blow', 'part-start': 'Submarine', split: 'Bottle', plan: 'Pop', ready: 'Pop', answer: 'Pop',
       'plan-changes': 'Tink', changes: 'Tink', 'plan-approve': 'Glass', approve: 'Hero', 'part-done': 'Morse', end: 'Purr',
-      decide: 'Sosumi', confirm: 'Sosumi', 'agent-waiting': 'Sosumi', idle: 'Basso', escalate: 'Basso', stall: 'Basso',
+      decide: 'Sosumi', 'decide-repeat': 'Sosumi', confirm: 'Sosumi', 'agent-waiting': 'Sosumi', idle: 'Basso', escalate: 'Basso', stall: 'Basso',
       abort: 'Funk', 'check-fail': 'Funk', 'note-all': 'Ping', 'note-implementer': 'Ping', 'note-reviewer': 'Ping',
       'peer-note-implementer': 'Frog', 'peer-note-reviewer': 'Frog', 'sound-change': 'Pop',
     },
@@ -425,7 +428,7 @@ const SYSTEM_SOUNDS = {
       brief: 'Windows Unlock', 'part-start': 'Windows Proximity Notification', split: 'chord', plan: 'Windows Notify System Generic',
       ready: 'Windows Notify System Generic', answer: 'Windows Notify System Generic', 'plan-changes': 'Windows Ding', changes: 'Windows Ding',
       'plan-approve': 'chimes', approve: 'tada', 'part-done': 'Windows Notify Calendar', end: 'tada',
-      decide: 'Windows Exclamation', confirm: 'Windows Exclamation', 'agent-waiting': 'Windows Exclamation', idle: 'Windows Critical Stop',
+      decide: 'Windows Exclamation', 'decide-repeat': 'Windows Exclamation', confirm: 'Windows Exclamation', 'agent-waiting': 'Windows Exclamation', idle: 'Windows Critical Stop',
       escalate: 'Windows Critical Stop', stall: 'Windows Critical Stop', abort: 'Windows Background', 'check-fail': 'Windows Background',
       'note-all': 'Windows Notify Messaging', 'note-implementer': 'Windows Notify Messaging', 'note-reviewer': 'Windows Notify Messaging',
       'peer-note-implementer': 'Windows Notify Email', 'peer-note-reviewer': 'Windows Notify Email', 'sound-change': 'Windows Notify System Generic',
@@ -436,7 +439,7 @@ const SYSTEM_SOUNDS = {
     map: {
       brief: 'service-login', 'part-start': 'device-added', split: 'device-added', plan: 'message', ready: 'message', answer: 'message',
       'plan-changes': 'bell', changes: 'bell', 'plan-approve': 'dialog-information', approve: 'complete', 'part-done': 'complete', end: 'service-logout',
-      decide: 'window-attention', confirm: 'window-attention', 'agent-waiting': 'window-attention', idle: 'dialog-warning', escalate: 'suspend-error',
+      decide: 'window-attention', 'decide-repeat': 'window-attention', confirm: 'window-attention', 'agent-waiting': 'window-attention', idle: 'dialog-warning', escalate: 'suspend-error',
       stall: 'suspend-error', abort: 'device-removed', 'check-fail': 'dialog-warning', 'note-all': 'message-new-instant',
       'note-implementer': 'message-new-instant', 'note-reviewer': 'message-new-instant', 'peer-note-implementer': 'message-new-instant',
       'peer-note-reviewer': 'message-new-instant', 'sound-change': 'message',
@@ -607,8 +610,10 @@ let audioSeq = 0;
 // Queue the events' sounds for a task (st may be null: a run-wide event). Returns whether anything
 // was queued. Never throws: sounds are best effort. Callers that change a task call it while they
 // still hold the task's lock, so the jobs of one task are queued in the order of its transitions,
-// and the job names keep that order (see below).
-function queueSound(st, events) {
+// and the job names keep that order (see below). A job bound to a decision ({ decision: seq }) is
+// only played while that decision is still pending (see jobLive), and one with an expiry
+// ({ expires: ms }) is dropped if it hasn't started by then.
+function queueSound(st, events, { decision, expires } = {}) {
   try {
     const cfg = soundConfig();
     const prefs = soundPrefs(st, cfg);
@@ -617,7 +622,8 @@ function queueSound(st, events) {
     if (!steps.length) return false;
     const q = audioQueueDir();
     fs.mkdirSync(q, { recursive: true });
-    const job = { at: Date.now(), task: st ? st.id : '', steps, volume: soundVolume(cfg), voice: jobVoice(cfg, prefs.engine) };
+    const job = { at: Date.now(), task: st ? st.id : '', steps, volume: soundVolume(cfg), voice: jobVoice(cfg, prefs.engine),
+      ...(decision !== undefined ? { decision } : {}), ...(expires !== undefined ? { expires } : {}) };
     const put = (ms, n) => {
       const name = `${String(ms).padStart(15, '0')}-${String(n).padStart(9, '0')}-${process.pid}-${audioSeq++}.json`;
       fs.writeFileSync(path.join(q, `${name}.tmp`), JSON.stringify(job));
@@ -747,19 +753,29 @@ function soundProblem(p) {
 
 // The drainer notes which step it is on and what is still to come (audio/playing.json), so one
 // that is stopped half-way (its shell or sandbox ended, a crash) doesn't lose the sentence after a
-// tone: the next drainer finds the note and plays the rest (see soundDrain).
+// tone: the next drainer finds the note and plays the rest (see soundDrain). A decision reminder
+// plays only before its expiry (the next reminder is due by then: a busy queue or a slow ElevenLabs
+// request never plays a cluster of them) and while the decision is pending: both checked right
+// before each player starts (jobLive), so also after an ElevenLabs request and before a fallback.
+// A step already playing finishes.
+const jobLive = (job) => (job.expires === undefined || Date.now() <= job.expires)
+  && (job.decision === undefined || decisionPending(job.task, job.decision));
 async function playJob(job, lock) {
   const steps = job.steps || [];
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    writeAudioJson(playingFile(), { at: job.at, task: job.task, volume: job.volume, voice: job.voice, event: step.event, say: !!step.say, from: shellName(), steps: steps.slice(i + 1) });
+    if (!jobLive(job)) break;
+    writeAudioJson(playingFile(), { at: job.at, task: job.task, volume: job.volume, voice: job.voice, event: step.event, say: !!step.say, from: shellName(),
+      ...(job.decision !== undefined ? { decision: job.decision } : {}), ...(job.expires !== undefined ? { expires: job.expires } : {}), steps: steps.slice(i + 1) });
     if (step.say) {
       const r = await speakStep(step, job, lock);
+      if (r.skipped) break;
       if (r.none || r.failed) soundProblem({ event: step.event, step: 'sentence', why: r.none || r.failed });
       continue;
     }
     const cmd = stepCommand(step, job);
     if (cmd.why) continue;
+    if (!jobLive(job)) break;
     const res = await runStep(cmd, 30000, lock);
     if (!res.ok) soundProblem({ event: step.event, step: 'tone', why: res.why });
   }
@@ -817,6 +833,61 @@ function claimTask(d, key, onClaim) {
     }, { touch: false });
     return ok && onClaim(st);
   });
+}
+
+// Whether the decision with this seq still waits for the user (its reminders play only then).
+function decisionPending(id, seq) {
+  try {
+    const s = readState(path.join(TASKS, id));
+    return s.status === 'DECISION' && !!s.decision && s.decision.seq === seq;
+  } catch { return false; }
+}
+
+// A pending decision is sounded again every DECIDE_REPEAT seconds until the user answers ('decide'
+// itself plays at once, from the submit). Driven by the agents' 'wait' polls: reminder k is due k
+// intervals after the decision started, and only the process that claims it sounds it, so two
+// waiting agents never double it, and a wait started late plays the current reminder, not the
+// missed ones. Returns the ms until the next reminder is due (Infinity: none).
+function remindDecision(d, st) {
+  const dec = st.decision;
+  if (!DECIDE_REPEAT || DECIDE_REPEAT < 0 || !dec || dec.seq === undefined) return Infinity;
+  const every = DECIDE_REPEAT * 1000;
+  const from = Number.isFinite(dec.at) ? dec.at : (st.turn_since || epoch()) * 1000;
+  const k = Math.floor((Date.now() - from) / every);
+  if (k >= 1 && soundMode(st)) {
+    claimTaskEvent(d, `decide-repeat:${dec.seq}:${k}`, (cst) => cst.status === 'DECISION' && cst.decision && cst.decision.seq === dec.seq
+      && queueSound(cst, [{ event: 'decide-repeat', c: soundCtx(cst, { question: dec.question, options: dec.options, presenter: decisionPresenter(dec) }) }],
+        { decision: dec.seq, expires: from + (k + 1) * every }));
+  }
+  return from + (k + 1) * every - Date.now();
+}
+
+// The reminders must not depend on an agent being in 'wait' at that moment (the asker of a --self
+// decision is in its own prompt, the other agent may be between waits or gone): the submit that
+// starts a decision also starts a detached 'collab sound remind', which sounds the same claimed
+// reminders as the waits for as long as the decision is pending: it exits only once it isn't
+// (answer, abort, task removed by 'collab clean'). It starts even while the task is muted, so a
+// 'collab sound on' or 'sound use' meanwhile brings the reminders back; only the process-wide
+// COLLAB_SOUND=0 (test runs) starts none.
+function startReminder(st) {
+  try {
+    if (!DECIDE_REPEAT || DECIDE_REPEAT < 0 || !st.decision || process.env.COLLAB_SOUND === '0') return;
+    const child = spawn(process.execPath, [__filename, 'sound', 'remind', st.id, String(st.decision.seq)], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* best effort, like every sound */ }
+}
+async function soundRemind(id, seq) {
+  if (!id || !Number.isInteger(seq) || !/^[\w.-]+$/.test(id)) die('usage: collab sound remind <task-id> <decision-seq> (started by collab itself)');
+  const d = path.join(TASKS, id);
+  for (;;) {
+    let st;
+    try { st = readState(d); } catch { return; }
+    if (st.status !== 'DECISION' || !st.decision || st.decision.seq !== seq) return;
+    const next = remindDecision(d, st);
+    if (!Number.isFinite(next)) return;
+    await sleep(Math.max(200, next + 50));
+  }
 }
 
 function claimHomeEvent(key, windowSecs = Infinity) {
@@ -997,6 +1068,8 @@ async function elevenLabsAudio(text, voice) {
 async function speakStep(step, job, lock) {
   if ((job.voice || {}).engine === 'elevenlabs') {
     const r = await elevenLabsAudio(step.say, job.voice);
+    // The request takes time: a decision answered meanwhile is not announced after all.
+    if (!jobLive(job)) return { skipped: true };
     if (r.file) {
       const cmd = toneCommand(r.file, job.volume);
       if (!cmd.why) {
@@ -1011,6 +1084,7 @@ async function speakStep(step, job, lock) {
 }
 
 async function systemSpeak(step, job, lock) {
+  if (!jobLive(job)) return { engine: 'none', skipped: true };
   const cmd = speechCommand(step.say, { ...(job.voice || {}), engine: 'system' }, job.volume);
   if (cmd.why) return { engine: 'none', none: cmd.why };
   const res = await runStep({ ...cmd, env: { ...cmd.env, COLLAB_SOUND_EVENT: step.event || '' } }, 60000, lock);
@@ -1225,6 +1299,7 @@ function soundUse(words) {
 async function cmdSound(args) {
   const [sub = 'status', ...rest] = args;
   if (sub === 'drain') { await soundDrain(); return; }
+  if (sub === 'remind') { await soundRemind(rest[0], parseInt(rest[1], 10)); return; }
   if (sub === 'use') { soundUse(rest); return; }
   if (sub === 'voices') {
     const voices = await listVoices();
@@ -2919,12 +2994,14 @@ async function cmdWait(args) {
         printEntry(d, listEntries(d).find((f) => seqOf(f) === dec.seq));
         exit(EXIT_DECISION);
       }
+      // Every waiting agent can sound the reminder (one claim each); poll in time for the next one.
+      const next = remindDecision(d, st);
       if (epoch() - start >= timeout) {
         if (presenter === role) out(`still waiting — the user has not answered the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question yet ('collab answer <N | text>'). Run '${again(`collab wait ${role}`, opts)}' again.`);
         else out(`still waiting — the ${presenter} presents the ${dec.kind === 'limit' ? 'round-limit' : `${dec.role}'s`} question to the user; don't ask the user about it yourself. Run '${again(`collab wait ${role}`, opts)}' again.`);
         exit(EXIT_TIMEOUT);
       }
-      await sleep(POLL * 1000);
+      await sleep(Math.min(POLL * 1000, Math.max(200, next + 50)));
       continue;
     }
     const idle = idleReason(st);
@@ -3178,7 +3255,7 @@ async function cmdSubmit(args) {
         if (snap) s.review_trees = [...(s.review_trees || []), { seq: s.seq, repos: snap.repos }].slice(-2);
         if (binding) s.approved_digest = tree.id;
         if (s.decision && s.decision.seq === undefined) {
-          Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? limitOpts : options, self: !!opts.self && !t.limit, shown: {} });
+          Object.assign(s.decision, { seq: s.seq, question, options: t.limit ? limitOpts : options, self: !!opts.self && !t.limit, shown: {}, at: Date.now() });
         }
         freezeAcked(s);
         if (acks) s.acked = { ...s.acked, [role]: s.seq };
@@ -3229,6 +3306,7 @@ async function cmdSubmit(args) {
   if (st.status === 'DECISION') {
     const dec = st.decision;
     notify(`${st.id}: your decision is needed — ${dec.question}`, { silent: sounded });
+    startReminder(st);
     pushPhone(st, `Decision needed: ${dec.question}`, { priority: 'high' });
     if (dec.kind === 'limit') out(`${dec.question} The user decides; the implementer presents the options, don't ask the user yourself. Run 'collab -t ${st.id} wait ${role}': it returns with the outcome.`);
     else if (dec.self) out(`Ask the user now, then record their choice with 'collab -t ${st.id} answer <N | text>'; the turn comes back to you.`);
@@ -3579,7 +3657,12 @@ function phoneSend(args) {
   const running = st && (!isTerminal(st.status) || (st.status === 'DONE' && !st.ended));
   // Sounds don't need --phone: a running --sound task (or any running task after 'collab sound on')
   // hears it, once a minute at most per task and message. Outside a running task, nothing sounds.
-  if (running && soundMode(st) && claimHomeEvent(`agent-waiting:${st.id}:${text}`, 60)) sound(st, 'agent-waiting', { text });
+  // During a decision, the presenting agent's own question (AskUserQuestion) and Claude's "waiting
+  // for your input" stay silent: 'decide' and its reminders already say the user is needed. A
+  // permission prompt still sounds.
+  const asking = !!json && (json.tool_name === 'AskUserQuestion' || json.notification_type === 'idle_prompt'
+    || /waiting for your input/i.test(String(json.message || '')));
+  if (running && !(st.status === 'DECISION' && asking) && soundMode(st) && claimHomeEvent(`agent-waiting:${st.id}:${text}`, 60)) sound(st, 'agent-waiting', { text });
   if (!running) return skip('no collab task running in this project');
   if (!(st.options && st.options.phone)) return skip("this task wasn't started with --phone");
   if (!phoneUrl()) return skip("no destination: 'collab phone set <topic|url>'");

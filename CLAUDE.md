@@ -121,7 +121,7 @@ CI (`.github/workflows/test.yml`) runs `npm test` on ubuntu/macos/windows × Nod
   mute first). Events are `SOUND_EVENTS` (name → description, full sentence, short sentence); `soundStyle` picks short
   (default) or full (`--sound=full`, `sound.voice.style`). `style_exaggeration` is ElevenLabs' numeric style. Commands call
   `sound(st, event, ctx)` / `queueSound(st, [...])` after a transition (`handoffSounds`, `doneSounds`);
-  observed events (idle, stall, confirm, agent-waiting) first win a claim (`claimTaskEvent` in
+  observed events (idle, stall, confirm, agent-waiting, and `decide-repeat`, which `wait` and a detached `sound remind` (`startReminder`/`soundRemind`, started by the decide submit) sound every `COLLAB_DECIDE_REPEAT_SECS` during a decision via `remindDecision`; its jobs carry `decision: seq` + `expires`, and `jobLive` drops them before any player starts once `decisionPending` is false) first win a claim (`claimTaskEvent` in
   `state.json` `audio_claims`, `claimHomeEvent` in `audio/claims.json`). `resolveSound`: config
   `sound.events` > pack (`collab-sounds.json`, `readPack`) > `SYSTEM_SOUNDS`, most specific key first.
   Jobs go to `$COLLAB_HOME/audio/queue/`; a detached `collab sound drain` plays them one at a

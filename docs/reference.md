@@ -20,6 +20,7 @@ All optional, via environment variables:
 | `COLLAB_PHONE_URL` | | Where `--phone` pushes go, overriding `collab phone set` |
 | `COLLAB_SOUND` | | `0` turns off every sound and spoken sentence from the commands run with it, whatever the task or config says (agents never set it on a task's commands, only on their own test runs) |
 | `COLLAB_SOUND_STALE_SECS` | `120` | Sounds still waiting to play after this long are dropped |
+| `COLLAB_DECIDE_REPEAT_SECS` | `30` | A pending decision is sounded again this often until you answer (`0`: only once) |
 | `ELEVENLABS_API_KEY` | | Your ElevenLabs key, for `--sound=elevenlabs` |
 | `COLLAB_ELEVENLABS_TIMEOUT_SECS` | `15` | How long to wait for ElevenLabs before the system voice speaks instead |
 | `COLLAB_HOME` | `~/.collab` | Where task state, the queue and settings are kept (lessons live in the repo) |
@@ -142,11 +143,12 @@ plays. `collab sound test <event | file>` plays it now and prints the exact comm
 | `ready` · `changes` · `approve` | work handed in · changes asked · approved: the task is done |
 | `part-done` | a part of a split task is done (after `approve`) |
 | `decide` · `answer` | you have to choose (the full sentence reads the question, every option and where to answer) · your answer was recorded |
+| `decide-repeat` | the decision still waits for you: again every 30 s (`COLLAB_DECIDE_REPEAT_SECS`) until you answer, once per interval however many agents wait; a short reminder in both styles, also with no agent waiting, never played once the decision is answered, and dropped rather than played late when the queue is busy |
 | `escalate` · `abort` · `stall` | the loop stopped and needs you |
 | `idle` | an agent looks unresponsive: stop or keep waiting? (once per quiet spell) |
 | `check-fail` | the task's `--check` failed, nothing was handed off |
 | `confirm` | a queued task waits for your go-ahead (once per item) |
-| `agent-waiting` | an agent CLI waits for you during a running task, through the [hooks](#hooks-for-agent-permission-prompts) (no `--phone` needed; once a minute per task and message) |
+| `agent-waiting` | an agent CLI waits for you during a running task, through the [hooks](#hooks-for-agent-permission-prompts) (no `--phone` needed; once a minute per task and message; during a decision, the presenting agent's question and Claude's idle prompt stay silent, since `decide-repeat` already announces it; permission prompts still sound) |
 | `note-all` · `note-implementer` · `note-reviewer` | your note was added |
 | `peer-note-implementer` · `peer-note-reviewer` | one agent sent the other a note |
 | `end` | the run is over: all work is done |
@@ -231,7 +233,7 @@ For voices that sound less generic, the sentences can be spoken by [ElevenLabs](
   | `plan` · `plan-approve` | 21 · 24 | 60 · 56 |
   | `ready` · `changes` · `plan-changes` | 25 · 27 · 23 | 57 · 76 · 79 |
   | `approve` · `part-done` · `end` | 19 · 27 · 24 | 30 · 36 · 71 |
-  | `decide` | 26 | 226 (up to ~700 with a long question and 4 options) |
+  | `decide` · `decide-repeat` | 26 · 26 | 226 (up to ~700 with a long question and 4 options) · 100 (every 30 s while you decide) |
   | `answer` · `abort` · `stall` · `check-fail` | 19 · 18 · 18 · 23 | 63 · 36 · 68 · 81 |
   | `escalate` · `idle` · `confirm` · `agent-waiting` | 20 · 35 · 40 · 38 | 110 · 113 · 120 · 47 (more with long texts) |
   | `note-all` · `note-implementer` · `note-reviewer` | 21 · 35 · 32 | 46 · 50 · 47 |
@@ -242,7 +244,7 @@ For voices that sound less generic, the sentences can be spoken by [ElevenLabs](
 
   A task with a plan and two review rounds (brief, plan, plan approved, ready ×2, changes, approved,
   end) is about 184 characters short versus 462 full, about 2.5× fewer; with one decision, 210
-  versus 688 or more (about 3.3×). Over the 25 task events (not counting the `sound-change` confirmation), short is 662 characters and full 1716
+  versus 688 or more (about 3.3×). Over the 25 task events (not counting the `sound-change` confirmation or the `decide-repeat` reminders), short is 662 characters and full 1716
   (about 2.6×); per event it ranges from the same (`split`) to about 8.7× fewer (`decide`), so the
   saving depends on the mix of events and the length of the task name. Repeated sentences come
   from the cache and cost nothing, and short sentences repeat far more often.

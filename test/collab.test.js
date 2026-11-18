@@ -2981,7 +2981,8 @@ function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {}, named 
   for (const p of players) fs.writeFileSync(path.join(bin, `${p}.js`), STUB);
   for (const n of MAC_SOUNDS) fs.writeFileSync(path.join(sys, `${n}.aiff`), '');
   const log = path.join(root, 'stub.log');
-  const s = sandbox({ COLLAB_SOUND: '', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env });
+  // Decision reminders are off unless a test turns them on (no reminder process outlives a test).
+  const s = sandbox({ COLLAB_SOUND: '', COLLAB_DECIDE_REPEAT_SECS: '0', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env });
   if (named) {
     fs.mkdirSync(s.home, { recursive: true });
     fs.writeFileSync(path.join(s.home, 'config.json'), JSON.stringify({ sound: { voice: { name: true } } }));
@@ -3006,7 +3007,7 @@ function soundBox({ players = ALL_PLAYERS, platform = 'darwin', env = {}, named 
   const runAsync = (args, more = {}) => new Promise((resolve) => {
     const c = require('child_process').spawn(process.execPath, [CLI, ...args], {
       cwd: s.project, env: { ...process.env, COLLAB_HOME: s.home, COLLAB_POLL_SECS: '1', COLLAB_NOTIFY: '0', COLLAB_TASK: '', ...NO_AGENT, ...NO_ELEVENLABS,
-        COLLAB_SOUND: '', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env, ...more },
+        COLLAB_SOUND: '', COLLAB_DECIDE_REPEAT_SECS: '0', COLLAB_SOUND_BIN: bin, COLLAB_SOUND_PLATFORM: platform, COLLAB_SOUND_SYSTEM_DIR: sys, STUB_LOG: log, ...env, ...more },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -3142,6 +3143,167 @@ test('sound: --sound=tones plays no speech; decisions read out every option and 
   assert.match(decide, /Which DB\? Option 1: Postgres \(Recommended\) — solid\. Option 2: SQLite — simple\./);
   assert.match(decide, /Answer in the implementer's terminal, or run collab answer with the option number/);
   assert.match(said[said.length - 1], /decision recorded: option 2, SQLite — simple\. Back to the implementer/);
+});
+
+test('sound: a pending decision is said at once, then again every interval (once, however many agents wait) until answered', async () => {
+  const s = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '2' } });
+  s.run(['init', 'ask', '--sound=full'], { input: 'b' });
+  assert.equal(s.run(['submit', 'implementer', 'decide', '--self'], { input: '## Which DB?\n1. Postgres (Recommended) — solid\n2. SQLite — simple\n' }).code, 0);
+  const t0 = Date.now();
+  assert.equal(typeof s.state().decision.at, 'number');
+  // The presenter's AskUserQuestion hook (and Claude's idle prompt) don't sound a second "you're
+  // needed" during a decision; a permission prompt still does.
+  s.run(['phone', 'send'], { input: JSON.stringify({ tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'Which DB?' }] }, cwd: s.project }) });
+  s.run(['phone', 'send'], { input: JSON.stringify({ hook_event_name: 'Notification', notification_type: 'idle_prompt', message: 'Claude is waiting for your input', cwd: s.project }) });
+  s.run(['phone', 'send'], { input: JSON.stringify({ hook_event_name: 'Notification', message: 'Claude needs your permission to use Bash', cwd: s.project }) });
+  // Both agents poll the decision (with --self the asker waits too), and the reminder process the
+  // submit started runs as well: each reminder still plays once.
+  const [a, b] = await Promise.all([s.runAsync(['wait', 'reviewer', '--timeout', '5']), s.runAsync(['wait', 'implementer', '--timeout', '5'])]);
+  assert.deepEqual([a.code, b.code], [11, 11]);
+  s.run(['answer', '1']);
+  const elapsed = Date.now() - t0;
+  await s.settle();
+  const tones = s.tones();
+  assert.equal(tones[0], 'brief');
+  assert.equal(tones[1], 'decide', 'said at once, by the submit');
+  assert.equal(tones.filter((e) => e === 'agent-waiting').length, 1, `only the permission prompt: ${tones.join(' ')}`);
+  const repeats = s.started().filter((r) => r.event === 'decide-repeat');
+  const repeatTones = repeats.filter((r) => r.name !== 'say');
+  assert.ok(repeatTones.length >= 2 && repeatTones.length <= Math.floor(elapsed / 2000), `one reminder per 2 s interval over ${elapsed} ms, not one per agent: ${tones.join(' ')}`);
+  for (let i = 1; i < repeatTones.length; i++) assert.ok(repeatTones[i].at - repeatTones[i - 1].at >= 1500, 'about an interval apart, never doubled');
+  // The full style read the whole menu once; the reminder stays short.
+  for (const r of repeats.filter((x) => x.name === 'say')) {
+    assert.equal(r.argv[r.argv.length - 1], "ask: your decision is still needed. Answer in the implementer's terminal, or run collab answer");
+  }
+  const n = repeats.length;
+  assert.equal((await s.runAsync(['wait', 'reviewer', '--timeout', '3'])).code, 11);
+  await pause(1000);
+  await s.settle();
+  assert.equal(s.started().filter((r) => r.event === 'decide-repeat').length, n, 'no reminder once answered');
+
+  // No agent waiting at all: the reminder process alone repeats it, past COLLAB_STALL_SECS (a
+  // decision never stalls), and stops at the answer.
+  const w = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '1', COLLAB_STALL_SECS: '2' } });
+  w.run(['init', 'alone', '--sound=tones'], { input: 'b' });
+  w.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+  await pause(4700);
+  assert.equal(w.state().status, 'DECISION');
+  w.run(['answer', '2']);
+  await w.settle();
+  const m = w.tones().filter((e) => e === 'decide-repeat').length;
+  assert.ok(m >= 3 && m <= 4, w.tones().join(' '));
+  await pause(2000);
+  await w.settle();
+  assert.equal(w.tones().filter((e) => e === 'decide-repeat').length, m, 'the reminder process stopped at the answer');
+});
+
+test('sound: decision reminders for the round limit, from older decisions, muted, and dropped once the decision is gone', async () => {
+  const s = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '1' } });
+  s.run(['init', 'limit', '--max-rounds', '1', '--sound=tones'], { input: 'b' });
+  s.run(['submit', 'implementer', 'ready'], { input: 's' });
+  s.run(['submit', 'reviewer', 'changes'], { input: '1. [blocking] x\n' });
+  assert.equal(s.state().decision.kind, 'limit');
+  // A decision recorded before reminders existed has no 'at': it counts from turn_since.
+  const f = path.join(s.taskDir(), 'state.json');
+  const st = s.state();
+  delete st.decision.at;
+  st.turn_since -= 10;
+  fs.writeFileSync(f, JSON.stringify(st));
+  assert.equal((await s.runAsync(['wait', 'reviewer', '--timeout', '2'])).code, 11);
+  await s.settle();
+  assert.ok(s.tones().filter((e) => e === 'decide-repeat').length >= 1, s.tones().join(' '));
+  const seq = s.state().decision.seq;
+  // Reminder jobs queued by hand (events of their own, so the running reminders don't count):
+  // one that starts after its expiry (the next reminder is due: a busy queue never plays a
+  // cluster) is dropped, one in time plays; after the answer, a queued reminder is dropped.
+  const tone = path.join(s.sys, 'Sosumi.aiff');
+  const q = path.join(s.home, 'audio', 'queue');
+  let n = 0;
+  const job = (event, extra) => fs.writeFileSync(path.join(q, `000000000000001-${String(++n).padStart(9, '0')}-1-${n}.json`),
+    JSON.stringify({ at: Date.now(), task: st.id, steps: [{ event, tone }], volume: 100, voice: {}, ...extra }));
+  job('x-expired', { decision: seq, expires: Date.now() - 1 });
+  job('x-in-time', { decision: seq, expires: Date.now() + 60000 });
+  s.run(['sound', 'drain']);
+  await s.settle();
+  assert.ok(s.tones().includes('x-in-time') && !s.tones().includes('x-expired'), s.tones().join(' '));
+  s.run(['answer', '3']);
+  await s.settle();
+  job('x-answered', { decision: seq });
+  job('x-other');
+  s.run(['sound', 'drain']);
+  await s.settle();
+  assert.ok(s.tones().includes('x-other') && !s.tones().includes('x-answered'), s.tones().join(' '));
+
+  // A decision that starts muted (for the task, or everywhere) gets its reminders once sound is
+  // back on, with no agent waiting.
+  const m = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '1' } });
+  m.run(['init', 'quiet', '--sound=off'], { input: 'b' });
+  m.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+  const g = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '1' } });
+  g.run(['sound', 'off']);
+  g.run(['init', 'global', '--sound=tones'], { input: 'b' });
+  g.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+  const z = soundBox({ env: { COLLAB_DECIDE_REPEAT_SECS: '0' } });
+  z.run(['init', 'never'], { input: 'b' });
+  z.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+  await pause(1600);
+  assert.deepEqual([m.tones(), g.tones()], [[], []], 'muted: no reminders');
+  m.run(['sound', 'use', 'tones']);
+  g.run(['sound', 'on']);
+  await Promise.all([pause(2600), z.runAsync(['wait', 'reviewer', '--timeout', '3'])]);
+  m.run(['answer', '1']);
+  g.run(['answer', '1']);
+  await Promise.all([m.settle(), g.settle(), z.settle()]);
+  assert.ok(m.tones().includes('decide-repeat'), `task unmuted: ${m.tones().join(' ')}`);
+  assert.ok(g.tones().includes('decide-repeat'), `sound on again: ${g.tones().join(' ')}`);
+  assert.deepEqual(z.tones(), ['brief', 'decide'], 'COLLAB_DECIDE_REPEAT_SECS=0: said once');
+});
+
+test('elevenlabs: a decision reminder answered, or expired, while its audio is being made is not played, nor the system voice instead', async () => {
+  let release;
+  let held = new Promise((r) => { release = r; });
+  const api = await fakeElevenLabs((r) => (/still needed|held past expiry/.test((r.body || {}).text || '') ? { delay: held } : {}));
+  try {
+    const s = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY, COLLAB_DECIDE_REPEAT_SECS: '1' } });
+    s.run(['init', 'slow', '--sound=elevenlabs'], { input: 'b' });
+    s.run(['sound', 'use', 'full']);
+    s.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+    for (let t = 0; !api.reqs.some((r) => /still needed/.test((r.body || {}).text || '')); t++) {
+      assert.ok(t < 100, 'the reminder sentence was requested');
+      await pause(100);
+    }
+    s.run(['answer', '1']);
+    release();
+    await s.settle();
+    const rem = s.started().filter((r) => r.event === 'decide-repeat');
+    assert.ok(rem.every((r) => r.name !== 'say' && !/\.mp3$/.test(r.argv[r.argv.length - 1] || '')), JSON.stringify(rem));
+    assert.ok(rem.length <= 1, 'at most its tone, which played before the answer');
+
+    // Still pending, but the audio came back after the reminder's expiry (the next one is due):
+    // not played either, so a slow request never plays two reminders back to back.
+    const e = soundBox({ env: { COLLAB_ELEVENLABS_URL: api.url, ELEVENLABS_API_KEY: KEY } });
+    e.run(['init', 'late', '--sound=elevenlabs'], { input: 'b' });
+    e.run(['submit', 'implementer', 'decide', '--self'], { input: 'Pick\n1. a\n2. b\n' });
+    await e.settle();
+    held = new Promise((r) => { release = r; });
+    const expires = Date.now() + 800;
+    fs.writeFileSync(path.join(e.home, 'audio', 'queue', '000000000000001-000000001-1-0.json'), JSON.stringify({
+      at: Date.now(), task: e.state().id, decision: e.state().decision.seq, expires, volume: 100,
+      voice: { engine: 'elevenlabs', voice_id: '21m00Tcm4TlvDq8ikWAM', model_id: 'eleven_flash_v2_5' }, steps: [{ event: 'x-late', say: 'held past expiry' }],
+    }));
+    const drain = e.runAsync(['sound', 'drain']);
+    for (let t = 0; !api.reqs.some((r) => /held past expiry/.test((r.body || {}).text || '')); t++) {
+      assert.ok(t < 100, 'the late sentence was requested');
+      await pause(100);
+    }
+    await pause(Math.max(0, expires - Date.now()) + 200);
+    release();
+    await drain;
+    await e.settle();
+    assert.equal(e.state().status, 'DECISION');
+    assert.deepEqual(e.started().filter((r) => r.event === 'x-late'), [], 'expired while its audio was being made: not played');
+    e.run(['answer', '1']);
+  } finally { api.close(); }
 });
 
 test('sound: round-limit answers sound as their outcome, split parts sound when they start and end', async () => {
@@ -3515,8 +3677,11 @@ async function fakeElevenLabs(reply) {
       reqs.push(r);
       const a = reply(r);
       if (a === 'hang') return;
-      res.writeHead(a.status || 200, { 'Content-Type': a.type || 'audio/mpeg' });
-      res.end(a.body === undefined ? Buffer.from('ID3fake-mp3') : a.body);
+      // { delay: promise }: the reply waits for it (a slow synthesis the test controls).
+      Promise.resolve(a.delay).then(() => {
+        res.writeHead(a.status || 200, { 'Content-Type': a.type || 'audio/mpeg' });
+        res.end(a.body === undefined ? Buffer.from('ID3fake-mp3') : a.body);
+      });
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
